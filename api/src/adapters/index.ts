@@ -1,6 +1,6 @@
 import type { FeedAdapter } from "./types";
 import { gtfsRtAdapter } from "./gtfs_rt";
-import { NYCT_GROUPS, nyctAdapter } from "./nyct";
+import { NYCT_GROUPS, groupUrls, nyctAdapter } from "./nyct";
 
 const adapters: Record<string, FeedAdapter> = {
   gtfs_rt: gtfsRtAdapter,
@@ -22,6 +22,16 @@ export function getAdapter(name: string): FeedAdapter {
     throw new Error(`unknown feed adapter: ${name}`);
   }
   return adapter;
+}
+
+const groupUrlBuilders: Record<string, (baseUrl: string) => Record<string, string>> = {
+  nyct: (base) => ({ ...groupUrls(base) }),
+};
+
+/** Group-fanout URL map for an adapter, or null for non-group adapters. */
+export function groupUrlsFor(adapter: string, baseUrl: string): Record<string, string> | null {
+  const builder = groupUrlBuilders[adapter];
+  return builder ? builder(baseUrl) : null;
 }
 
 export { type Arrival, type FeedAdapter, ParseError } from "./types";

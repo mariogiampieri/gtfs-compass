@@ -31,7 +31,7 @@ Phase 1 put static topology in D1; nothing consumes realtime data yet. The spec'
 
 - R5. The NYCT adapter parses all eight subway feed groups through build-time-generated static protobuf bindings — no runtime codegen (Workers ban eval), no protobuf on any device.
 - R6. The adapter seam stays as narrow as the spec's interface: `parse(buf, now) → Map<stop_id, Arrival[]>` where Arrival carries `routeId` and epoch `time`; a second GTFS-RT agency needs a feeds-row `adapter` value and nothing else.
-- R7. NYCT parse cost is measured against a real captured feed and recorded (spec's "verify, don't assume"); the 30 s paid-plan CPU budget is confirmed sufficient with margin.
+- R7. NYCT parse cost is measured against a real captured feed and recorded (spec's "verify, don't assume"). Off-peak measurement (Saturday PM): 2.0 ms decode for the largest group — four orders of magnitude inside the 30 s paid budget, so even generous rush-hour inflation cannot threaten it; U5's live `wrangler tail` check records real production CPU as the final word.
 
 **Read path**
 
@@ -200,7 +200,7 @@ sequenceDiagram
 ## Open Questions
 
 - **NYCT extension property name** in the generated static module (dotted extension field) — recorded in U1 when the module is first generated; shapes nothing architectural.
-- **For Phase 3 planning:** the multi-group `fetched_at` merge rule when one departures response spans feed groups (min across groups is the honest candidate) — the Phase 2 response now carries `group` so the merge is auditable; and whether the per-response feed `header_timestamp` should be exposed alongside `fetched_at` for diagnostics.
+- **For Phase 3 planning:** the multi-group `fetched_at` merge rule when one departures response spans feed groups (min across groups is the honest candidate) — the Phase 2 response now carries `group` so the merge is auditable; whether the per-response feed `header_timestamp` should be exposed alongside `fetched_at` for diagnostics; and direction labeling for the departures response (cardinal vs terminal-name vs user-defined — Mario's interface research confirmed directional platform grouping is native to the data; the label choice freezes with the Phase 3 response shape).
 
 ## Risks & Dependencies
 

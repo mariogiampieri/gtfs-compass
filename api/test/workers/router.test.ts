@@ -111,4 +111,29 @@ describe("router", () => {
     expect((await get("/")).status).toBe(404);
     expect((await get("/internal/mta-subway/ace")).status).toBe(404);
   });
+
+  it("malformed percent-encoding returns JSON 404, not a 500", async () => {
+    const res = await get("/internal/mta-subway/ace/stop/%zz");
+    expect(res.status).toBe(404);
+    expect((await res.json<any>()).error).toBe("not found");
+    expect(upstreamCalls).toBe(0);
+  });
+});
+
+describe("rateLimited refill math", () => {
+  it("refills tokens over time at the configured rate", async () => {
+    const { rateLimited } = await import("../../src/index");
+    const ip = "192.0.2.99";
+    const t0 = 1_000_000;
+    for (let i = 0; i < 20; i++) {
+      expect(rateLimited(ip, t0)).toBe(false); // burst capacity
+    }
+    expect(rateLimited(ip, t0)).toBe(true); // depleted
+    expect(rateLimited(ip, t0 + 1000)).toBe(false); // 1s -> 5 tokens back
+    expect(rateLimited(ip, t0 + 1000)).toBe(false);
+    expect(rateLimited(ip, t0 + 1000)).toBe(false);
+    expect(rateLimited(ip, t0 + 1000)).toBe(false);
+    expect(rateLimited(ip, t0 + 1000)).toBe(false);
+    expect(rateLimited(ip, t0 + 1000)).toBe(true); // sixth within the second fails
+  });
 });

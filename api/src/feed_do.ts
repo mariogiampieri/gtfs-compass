@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrls } from "./adapters";
+import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrlsFor } from "./adapters";
 
 export const POLL_INTERVAL_MS = 20_000;
 export const IDLE_SUSPEND_MS = 10 * 60_000;
@@ -109,8 +109,12 @@ export class FeedDO extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(now + POLL_INTERVAL_MS); // reschedule-first
       await this.refresh();
     } catch (error) {
-      console.error("alarm cycle failed (loop already re-armed):", error);
+      console.error(`${this.tag()} alarm cycle failed (loop already re-armed):`, error);
     }
+  }
+
+  private tag(): string {
+    return this.identity ? `[${this.identity.feedId}:${this.identity.group}]` : "[unbound]";
   }
 
   /** Fetch + parse + store, single-flight, newer-only. Never throws. */
@@ -120,24 +124,28 @@ export class FeedDO extends DurableObject<Env> {
     const fetchStartMs = Date.now();
     try {
       const config = await this.loadConfig(this.identity.feedId);
-      const urls = groupUrls(config.rtTripUrl) as Record<string, string>;
-      const url = urls[this.identity.group];
-      if (!url) return;
+      this.configMissing = false; // a later-fixed feeds row must recover reads
+      const url = groupUrlsFor(config.adapter, config.rtTripUrl)?.[this.identity.group];
+      if (!url) {
+        console.warn(`${this.tag()} adapter ${config.adapter} has no group ${this.identity.group}`);
+        return;
+      }
 
       const upstream = await fetch(url, {
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!upstream.ok) {
-        console.warn(`upstream ${upstream.status} for ${this.identity.group}; keeping old snapshot`);
+        console.warn(`${this.tag()} upstream ${upstream.status}; keeping old snapshot`);
         return;
       }
       const buf = new Uint8Array(await upstream.arrayBuffer());
 
       const headerTimestamp = feedHeaderTimestamp(buf);
-      if (this.snapshot && headerTimestamp <= this.snapshot.headerTimestamp) {
-        // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
-        // failed fetch so staleness becomes visible (spec constraint #5).
-        console.warn(`feed header not advancing (${headerTimestamp}); keeping old snapshot`);
+      // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
+      // failed fetch so staleness becomes visible (spec constraint #5).
+      // Feeds that omit the optional header timestamp (0) skip this gate.
+      if (this.snapshot && headerTimestamp > 0 && headerTimestamp <= this.snapshot.headerTimestamp) {
+        console.warn(`${this.tag()} feed header not advancing (${headerTimestamp}); keeping old snapshot`);
         return;
       }
       if (this.snapshot && fetchStartMs <= this.snapshot.fetchedAtMs) {
@@ -151,15 +159,17 @@ export class FeedDO extends DurableObject<Env> {
         fetchedAtMs: fetchStartMs,
         headerTimestamp,
       };
-      this.snapshot = snapshot;
+      // Persist first, then flip memory: a failed put must not leave the live
+      // instance serving data that regresses on the next warm restart (R4).
       await this.ctx.storage.put("snapshot", snapshot);
+      this.snapshot = snapshot;
     } catch (error) {
       if (error instanceof MissingFeedError) {
         this.configMissing = true;
       } else if (error instanceof ParseError) {
-        console.warn("unparseable upstream feed; keeping old snapshot:", error.message);
+        console.warn(`${this.tag()} unparseable upstream feed; keeping old snapshot:`, error.message);
       } else {
-        console.warn("refresh failed; keeping old snapshot:", error);
+        console.warn(`${this.tag()} refresh failed; keeping old snapshot:`, error);
       }
     } finally {
       this.refreshInFlight = false;
@@ -193,7 +203,12 @@ export class FeedDO extends DurableObject<Env> {
       return Response.json({ fetched_at: null, group, arrivals: [] });
     }
     const nowSec = Math.floor(nowMs / 1000);
-    const arrivals = (this.snapshot.arrivals[stopId] ?? []).filter(
+    // hasOwn guard: stop ids are caller-controlled and storage round-trips
+    // restore Object.prototype, so "constructor" etc. must not hit the chain.
+    const stored = Object.hasOwn(this.snapshot.arrivals, stopId)
+      ? this.snapshot.arrivals[stopId]
+      : [];
+    const arrivals = stored.filter(
       (a) => a.time >= nowSec, // same boundary rule as the adapter's write-trim
     );
     return Response.json({
@@ -213,7 +228,7 @@ class MissingFeedError extends Error {
 
 /** Keep the next ARRIVALS_PER_ROUTE arrivals per (stop, route), merged sorted. */
 export function trimPerRoute(byStop: Map<string, Arrival[]>): Record<string, Arrival[]> {
-  const out: Record<string, Arrival[]> = {};
+  const out: Record<string, Arrival[]> = Object.create(null); // no prototype keys
   for (const [stopId, arrivals] of byStop) {
     const perRoute = new Map<string, number>();
     const kept: Arrival[] = [];

@@ -47,6 +47,7 @@ async function settleRefresh(stub: DurableObjectStub<FeedDO>) {
 type MockReply = { status: number; body: Uint8Array | string; delayMs: number };
 const pendingMocks = new Map<string, MockReply[]>();
 const realFetch = globalThis.fetch;
+let upstreamAttempts = 0; // counts every outbound try, even unmocked ones
 
 function mockFeedOnce(path: string, body: Uint8Array | string, delayMs = 0, status = 200) {
   const url = `${ORIGIN}${path}`;
@@ -62,7 +63,9 @@ function assertNoPendingMocks() {
 
 beforeEach(async () => {
   pendingMocks.clear();
+  upstreamAttempts = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, _init?: RequestInit) => {
+    upstreamAttempts++;
     const url = input instanceof Request ? input.url : String(input);
     const queue = pendingMocks.get(url);
     const reply = queue?.shift();
@@ -113,7 +116,9 @@ describe("FeedDO", () => {
     await read(stub, "S1");
     await read(stub, "S1"); // second read sees pending alarm, must not refetch
     await settleRefresh(stub);
-    assertNoPendingMocks(); // exactly the one mocked fetch consumed
+    // Attempt count (not just queue drain): a swallowed unmocked-fetch throw
+    // inside refresh() must not be able to hide a duplicate fetch.
+    expect(upstreamAttempts).toBe(1);
   });
 
   it("read during a slow in-flight refresh does not double-fetch or regress (race)", async () => {
@@ -222,12 +227,53 @@ describe("FeedDO", () => {
     await settleRefresh(stub);
 
     mockFeedOnce("/gtfs-ace", encodeFeed(nowSec() + 60, [["A", "S1", nowSec() + 600]]));
+    const before = upstreamAttempts;
     await runInDurableObject(stub, async (instance: FeedDO) => {
       await Promise.all([instance.alarm(), instance.alarm()]); // at-least-once duplicate
     });
-    // One interceptor consumed by exactly one of the two -> afterEach asserts none pending.
+    expect(upstreamAttempts - before).toBe(1); // single-flight: exactly one attempt
     const pending = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
     expect(pending).not.toBeNull();
+  });
+
+  it("stop ids colliding with Object.prototype keys are safe", async () => {
+    const stub = stubFor("mta-subway:ace#proto");
+    await runInDurableObject(stub, async (instance: FeedDO, state) => {
+      const snapshot = {
+        arrivals: { S1: [{ routeId: "A", time: nowSec() + 120 }] },
+        fetchedAtMs: Date.now(),
+        headerTimestamp: nowSec(),
+      };
+      (instance as any).snapshot = snapshot;
+      await state.storage.put("snapshot", snapshot);
+      await state.storage.setAlarm(Date.now() + 20_000);
+    });
+    for (const evil of ["constructor", "__proto__", "toString"]) {
+      const res = await read(stub, evil);
+      expect(res.status).toBe(200);
+      expect((await res.json<any>()).arrivals).toEqual([]);
+    }
+  });
+
+  it("configMissing recovers once the feeds row appears", async () => {
+    const stub = stubFor("late-feed:ace");
+    await read(stub, "S1", "late-feed"); // arms; refresh hits MissingFeedError
+    await settleRefresh(stub);
+    expect((await read(stub, "S1", "late-feed")).status).toBe(404); // pinned missing
+
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO feeds (id, rt_trip_url, adapter) VALUES ('late-feed', ?, 'nyct')",
+    )
+      .bind(BASE_URL)
+      .run();
+    mockFeedOnce("/gtfs-ace", encodeFeed(nowSec(), [["A", "S1", nowSec() + 300]]));
+    const ran = await runDurableObjectAlarm(stub); // alarm still armed; retries config
+    expect(ran).toBe(true);
+    await settleRefresh(stub);
+
+    const recovered = await read(stub, "S1", "late-feed");
+    expect(recovered.status).toBe(200); // sticky-404 bug would fail here
+    expect((await recovered.json<any>()).arrivals).toHaveLength(1);
   });
 
   it("unknown stop returns empty arrivals with real fetched_at (no-service fact)", async () => {
