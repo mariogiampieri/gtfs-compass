@@ -1,0 +1,20 @@
+# Secrets — never commit real environment files
+.env
+.env.*
+!.env.example
+
+# Cloudflare / wrangler local state
+.wrangler/
+api/node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+ingest/dist/
+
+# Editor / local tooling
+.obsidian/
+.DS_Store
