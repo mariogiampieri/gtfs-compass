@@ -7,9 +7,7 @@
     {
       "binding": "DB",
       "database_name": "gtfs-compass",
-      // Replace after `npx wrangler d1 create gtfs-compass` (see README).
-      // Local development (`--local`) works without a real id.
-      "database_id": "REPLACE_WITH_DATABASE_ID"
+      "database_id": "eb62cad4-cb64-4809-93c2-d1e3863737ce"
     }
   ]
 }
