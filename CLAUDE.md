@@ -95,6 +95,14 @@ This is an open-source project (MIT). On every task:
   `{"known": false}`. Must work with BeaconDB alone. Never Mapbox (no BSSID product), never
   Google.
 
+## Project knowledge
+
+- `docs/solutions/` — documented solutions and patterns from past work, organized by
+  category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when
+  implementing or debugging in documented areas.
+- `CONCEPTS.md` — shared domain vocabulary (entities, named processes, status
+  concepts). Relevant when orienting to the codebase or naming domain things.
+
 ## Definition of done for a phase
 
 Check the acceptance criteria list in the spec — each phase's tasks map to specific

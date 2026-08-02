@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 1 — data model and ingest"
 type: feat
-status: active
+status: completed
 date: 2026-08-02
 deepened: 2026-08-02
 ---
@@ -27,7 +27,7 @@ Everything downstream (feed DOs, the read API, the device) reads from D1. Phase 
 
 **Catalog**
 
-- R3. Catalog ingest seeds `feeds` from the full active Mobility Database catalog (~4,500 rows), carrying bounding boxes, license URLs, and status.
+- R3. Catalog ingest seeds `feeds` from the full active Mobility Database catalog (~2,800 active static-GTFS rows; the earlier ~4,500 estimate counted RT rows), carrying bounding boxes, license URLs, and status.
 - R4. A curated seed defines the v1 `mta-subway` feed row (adapter `nyct`, current static + RT URLs), applied after catalog rows so curated values win.
 
 **Static GTFS**
@@ -161,7 +161,7 @@ Scope declaration, not a constraint — per-unit file lists are authoritative.
   - Suppression: a catalog row whose id is on the suppression list ends non-active after a full catalog+seeds run.
   - Prune keep-set includes curated ids: a re-run with the same fixture leaves `mta-subway` in place.
   - Malformed row (missing id) skipped with a warning, run continues.
-- **Verification:** Live run loads ~4,500 rows into D1; `SELECT` for `mta-subway` shows adapter `nyct` and both URLs; the MDB NYC-subway catalog row is non-active; re-run writes zero rows (client-reported write counts, not just row counts).
+- **Verification:** Live run loads ~2,800 rows into D1; `SELECT` for `mta-subway` shows adapter `nyct` and both URLs; the MDB NYC-subway catalog row is non-active; re-run writes zero rows (client-reported write counts, not just row counts).
 
 ### U4. Static GTFS ingest for MTA subway
 
