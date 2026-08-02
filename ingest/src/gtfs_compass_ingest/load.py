@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any
 
 import requests
 
@@ -69,7 +70,7 @@ class D1Client:
         self._last_request_at = 0.0
 
     @classmethod
-    def from_env(cls) -> "D1Client":
+    def from_env(cls) -> D1Client:
         env = {}
         for var in (
             "CLOUDFLARE_ACCOUNT_ID",
@@ -174,33 +175,16 @@ def sync(
     ]
     delete_keys = [key for key in existing if key not in desired]
 
-    if prune and existing:
-        if not desired:
-            raise PruneRefused(
-                f"{table.name}: refusing to prune against an empty keep-set "
-                f"({len(existing)} existing rows); this usually means a truncated source"
-            )
-        if (
-            len(existing) >= PRUNE_GUARD_MIN_ROWS
-            and len(delete_keys) > PRUNE_GUARD_FRACTION * len(existing)
-            and not force
-        ):
-            raise PruneRefused(
-                f"{table.name}: prune would delete {len(delete_keys)} of "
-                f"{len(existing)} scoped rows; re-run with --force if intended"
-            )
+    if prune:
+        _check_prune_guards(table.name, len(existing), len(desired), len(delete_keys), force)
 
     for chunk in _chunked(to_write, max(1, MAX_PARAMS_PER_STATEMENT // len(columns))):
         client.query(*_upsert_statement(table.name, columns, pk_columns, chunk))
 
     if prune:
-        for chunk in _chunked(
-            delete_keys, max(1, MAX_PARAMS_PER_STATEMENT // len(pk_columns))
-        ):
-            sql, params = _delete_statement(
-                table.name, pk_columns, chunk, scope_where, scope_params
-            )
-            client.query(sql, params)
+        _delete_in_chunks(
+            client, table.name, pk_columns, delete_keys, scope_where, scope_params
+        )
 
     stats = SyncStats(
         written=len(to_write),
@@ -237,32 +221,47 @@ def prune_only(
     existing = [tuple(row[c] for c in pk_columns) for row in existing_result["results"]]
     delete_keys = [key for key in existing if key not in keep_keys]
 
-    if existing:
-        if not keep_keys:
-            raise PruneRefused(
-                f"{table.name}: refusing to prune against an empty keep-set "
-                f"({len(existing)} existing rows); this usually means a truncated source"
-            )
-        if (
-            len(existing) >= PRUNE_GUARD_MIN_ROWS
-            and len(delete_keys) > PRUNE_GUARD_FRACTION * len(existing)
-            and not force
-        ):
-            raise PruneRefused(
-                f"{table.name}: prune would delete {len(delete_keys)} of "
-                f"{len(existing)} scoped rows; re-run with --force if intended"
-            )
-
-    for chunk in _chunked(
-        delete_keys, max(1, MAX_PARAMS_PER_STATEMENT // len(pk_columns))
-    ):
-        sql, params = _delete_statement(
-            table.name, pk_columns, chunk, scope_where, scope_params
-        )
-        client.query(sql, params)
+    _check_prune_guards(table.name, len(existing), len(keep_keys), len(delete_keys), force)
+    _delete_in_chunks(client, table.name, pk_columns, delete_keys, scope_where, scope_params)
     if delete_keys:
         log.info("%s: %d pruned", table.name, len(delete_keys))
     return len(delete_keys)
+
+
+def _check_prune_guards(
+    name: str, existing_count: int, keep_count: int, delete_count: int, force: bool
+) -> None:
+    if not existing_count:
+        return
+    if not keep_count:
+        raise PruneRefused(
+            f"{name}: refusing to prune against an empty keep-set "
+            f"({existing_count} existing rows); this usually means a truncated source"
+        )
+    if (
+        existing_count >= PRUNE_GUARD_MIN_ROWS
+        and delete_count > PRUNE_GUARD_FRACTION * existing_count
+        and not force
+    ):
+        raise PruneRefused(
+            f"{name}: prune would delete {delete_count} of "
+            f"{existing_count} scoped rows; re-run with --force if intended"
+        )
+
+
+def _delete_in_chunks(
+    client: D1Client,
+    name: str,
+    pk_columns: list[str],
+    delete_keys: list[tuple],
+    scope_where: str,
+    scope_params: Sequence[Any],
+) -> None:
+    for chunk in _chunked(
+        delete_keys, max(1, MAX_PARAMS_PER_STATEMENT // len(pk_columns))
+    ):
+        sql, params = _delete_statement(name, pk_columns, chunk, scope_where, scope_params)
+        client.query(sql, params)
 
 
 def _upsert_statement(

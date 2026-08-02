@@ -1,10 +1,10 @@
 import io
 import zipfile
 
+from conftest import FakeSession
+
 from gtfs_compass_ingest.load import D1Client
 from gtfs_compass_ingest.static_gtfs import run_static
-
-from conftest import FakeSession
 
 STOPS = """stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station
 101,Jay St,40.69,-73.98,1,

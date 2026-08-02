@@ -1,6 +1,7 @@
 import pytest
+from conftest import FakeResponse, FakeSession, d1_body
 
-import gtfs_compass_ingest.load as load
+from gtfs_compass_ingest import load
 from gtfs_compass_ingest.load import (
     D1Client,
     D1Error,
@@ -10,8 +11,6 @@ from gtfs_compass_ingest.load import (
     sync,
 )
 from gtfs_compass_ingest.tables import STOP_ROUTES, TableSpec
-
-from conftest import FakeResponse, FakeSession, d1_body
 
 WIDE = TableSpec(
     name="wide",

@@ -1,11 +1,11 @@
 import csv
 import io
 
+from conftest import FakeSession
+
 from gtfs_compass_ingest import seeds
 from gtfs_compass_ingest.catalog import build_feed_rows, run_catalog
 from gtfs_compass_ingest.load import D1Client
-
-from conftest import FakeSession
 
 FIELDS = [
     "id",

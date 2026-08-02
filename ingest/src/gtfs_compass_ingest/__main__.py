@@ -83,7 +83,8 @@ def _run(args: argparse.Namespace) -> int:
 
     try:
         if not dry_run:
-            local_lock = open(lock_file_path(), "w")
+            # noqa-justified: the flock lives as long as the fd; closed in finally.
+            local_lock = open(lock_file_path(), "w")  # noqa: SIM115
             try:
                 fcntl.flock(local_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
