@@ -3,9 +3,21 @@
   "private": true,
   "scripts": {
     "migrate:local": "wrangler d1 migrations apply gtfs-compass --local",
-    "migrate:remote": "wrangler d1 migrations apply gtfs-compass --remote"
+    "migrate:remote": "wrangler d1 migrations apply gtfs-compass --remote",
+    "test": "vitest run",
+    "generate:proto": "./scripts/generate-proto.sh",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.1",
+    "protobufjs-cli": "^2.6.1",
+    "typescript": "^7.0.2",
+    "vitest": "4.1.10",
     "wrangler": "^4.0.0"
-  }
+  },
+  "dependencies": {
+    "protobufjs": "^8.7.1"
+  },
+  "type": "module"
 }
