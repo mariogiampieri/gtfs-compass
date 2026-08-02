@@ -1,8 +1,82 @@
+import { adapterGroups } from "./adapters";
+
 export { FeedDO } from "./feed_do";
 
-// Stub: real routing (allowlist, rate limit, debug route) lands with U4.
+/**
+ * Curated feeds reachable through the group-addressed route. The D1 feeds
+ * table also holds ~2,800 crowd-sourced catalog rows whose URLs must never
+ * be fetched on an anonymous caller's say-so — reachability is by explicit
+ * allowlist, not by what exists in the table.
+ */
+const CURATED_FEEDS: ReadonlySet<string> = new Set(["mta-subway"]);
+
+const RATE_CAPACITY = 20; // burst
+const RATE_REFILL_PER_SEC = 5;
+
+// In-isolate caches: best-effort (reset on isolate recycle), which is the
+// right cost/benefit for a debug surface ahead of Phase 3/5 auth.
+const adapterCache = new Map<string, string | null>();
+const rateBuckets = new Map<string, { tokens: number; lastMs: number }>();
+
+function rateLimited(ip: string, now: number): boolean {
+  const bucket = rateBuckets.get(ip) ?? { tokens: RATE_CAPACITY, lastMs: now };
+  bucket.tokens = Math.min(
+    RATE_CAPACITY,
+    bucket.tokens + ((now - bucket.lastMs) / 1000) * RATE_REFILL_PER_SEC,
+  );
+  bucket.lastMs = now;
+  if (bucket.tokens < 1) {
+    rateBuckets.set(ip, bucket);
+    return true;
+  }
+  bucket.tokens -= 1;
+  rateBuckets.set(ip, bucket);
+  return false;
+}
+
+async function feedAdapter(env: Env, feedId: string): Promise<string | null> {
+  if (adapterCache.has(feedId)) return adapterCache.get(feedId)!;
+  const row = await env.DB.prepare("SELECT adapter FROM feeds WHERE id = ?")
+    .bind(feedId)
+    .first<{ adapter: string | null }>();
+  const adapter = row?.adapter ?? null;
+  adapterCache.set(feedId, adapter);
+  return adapter;
+}
+
+const ROUTE = /^\/internal\/([^/]+)\/([^/]+)\/stop\/([^/]+)$/;
+
 export default {
-  async fetch(_request: Request, _env: Env): Promise<Response> {
-    return Response.json({ error: "not found" }, { status: 404 });
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const match = url.pathname.match(ROUTE);
+    if (!match || request.method !== "GET") {
+      return Response.json({ error: "not found" }, { status: 404 });
+    }
+
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (rateLimited(ip, Date.now())) {
+      return Response.json({ error: "rate limited" }, { status: 429 });
+    }
+
+    const [, feedId, group, stopId] = match.map(decodeURIComponent);
+
+    // Allowlist before any lookup: non-curated feeds are unreachable by design.
+    if (!CURATED_FEEDS.has(feedId)) {
+      return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+    }
+    const adapter = await feedAdapter(env, feedId);
+    const groups = adapter ? adapterGroups[adapter] : undefined;
+    if (!groups) {
+      return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+    }
+    if (!groups.includes(group)) {
+      return Response.json({ error: `unknown group: ${group}` }, { status: 404 });
+    }
+
+    const stub = env.FEED_DO.get(env.FEED_DO.idFromName(`${feedId}:${group}`));
+    return stub.fetch(
+      `https://do/stop/${encodeURIComponent(stopId)}?feed=${encodeURIComponent(feedId)}&group=${encodeURIComponent(group)}`,
+    );
   },
 } satisfies ExportedHandler<Env>;
