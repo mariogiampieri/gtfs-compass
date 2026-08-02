@@ -8,15 +8,17 @@
  * sanity bounds so clock noise can't flake CI.
  */
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
 
 const FIXTURES = ["nyct-1234567s.pb", "nyct-ace.pb", "nyct-si.pb"] as const;
+const here = dirname(fileURLToPath(import.meta.url));
 
 function fixture(name: string): Uint8Array {
-  return new Uint8Array(readFileSync(join(__dirname, "../fixtures", name)));
+  return new Uint8Array(readFileSync(join(here, "../fixtures", name)));
 }
 
 function toNumber(value: number | Long | null | undefined): number {

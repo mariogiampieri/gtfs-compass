@@ -28,12 +28,12 @@ function stubFor(name: string) {
   return env.FEED_DO.get(env.FEED_DO.idFromName(name));
 }
 
-function read(stub: DurableObjectStub, stopId: string, feed = "mta-subway", group = "ace") {
+function read(stub: DurableObjectStub<FeedDO>, stopId: string, feed = "mta-subway", group = "ace") {
   return stub.fetch(`https://do/stop/${stopId}?feed=${feed}&group=${group}`);
 }
 
 /** Wait until the DO's background refresh settles. */
-async function settleRefresh(stub: DurableObjectStub) {
+async function settleRefresh(stub: DurableObjectStub<FeedDO>) {
   await runInDurableObject(stub, async (instance: FeedDO) => {
     for (let i = 0; i < 200 && (instance as any).refreshInFlight; i++) {
       await new Promise((resolve) => setTimeout(resolve, 5));

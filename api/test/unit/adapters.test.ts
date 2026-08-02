@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
@@ -12,7 +13,7 @@ import {
 import { NYCT_GROUPS } from "../../src/adapters/nyct";
 
 const aceFixture = new Uint8Array(
-  readFileSync(join(__dirname, "../fixtures/nyct-ace.pb")),
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../fixtures/nyct-ace.pb")),
 );
 
 /** Build a minimal encoded feed for boundary tests. */
