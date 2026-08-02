@@ -83,7 +83,7 @@ def _run(args: argparse.Namespace) -> int:
 
     try:
         if not dry_run:
-            # noqa-justified: the flock lives as long as the fd; closed in finally.
+            # The flock lives as long as the fd, which is closed in `finally`.
             local_lock = open(lock_file_path(), "w")  # noqa: SIM115
             try:
                 fcntl.flock(local_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
