@@ -217,6 +217,54 @@ def sync(
     return stats
 
 
+def prune_only(
+    client: D1Client,
+    table,
+    keep_keys: set[tuple],
+    *,
+    scope_where: str = "",
+    scope_params: Sequence[Any] = (),
+    force: bool = False,
+) -> int:
+    """Delete scoped rows whose PK is not in keep_keys, with the same guards
+    as sync(). Used when prune must be deferred past other tables' writes
+    (children pruned before parents)."""
+    pk_columns = list(table.pk_columns)
+    where = f" WHERE {scope_where}" if scope_where else ""
+    existing_result = client.query(
+        f"SELECT {', '.join(pk_columns)} FROM {table.name}{where}", scope_params
+    )
+    existing = [tuple(row[c] for c in pk_columns) for row in existing_result["results"]]
+    delete_keys = [key for key in existing if key not in keep_keys]
+
+    if existing:
+        if not keep_keys:
+            raise PruneRefused(
+                f"{table.name}: refusing to prune against an empty keep-set "
+                f"({len(existing)} existing rows); this usually means a truncated source"
+            )
+        if (
+            len(existing) >= PRUNE_GUARD_MIN_ROWS
+            and len(delete_keys) > PRUNE_GUARD_FRACTION * len(existing)
+            and not force
+        ):
+            raise PruneRefused(
+                f"{table.name}: prune would delete {len(delete_keys)} of "
+                f"{len(existing)} scoped rows; re-run with --force if intended"
+            )
+
+    for chunk in _chunked(
+        delete_keys, max(1, MAX_PARAMS_PER_STATEMENT // len(pk_columns))
+    ):
+        sql, params = _delete_statement(
+            table.name, pk_columns, chunk, scope_where, scope_params
+        )
+        client.query(sql, params)
+    if delete_keys:
+        log.info("%s: %d pruned", table.name, len(delete_keys))
+    return len(delete_keys)
+
+
 def _upsert_statement(
     name: str, columns: list[str], pk_columns: list[str], rows: list[dict]
 ) -> tuple[str, list]:
