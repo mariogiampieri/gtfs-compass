@@ -1,0 +1,11 @@
+{
+  "name": "gtfs-compass-api",
+  "private": true,
+  "scripts": {
+    "migrate:local": "wrangler d1 migrations apply gtfs-compass --local",
+    "migrate:remote": "wrangler d1 migrations apply gtfs-compass --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

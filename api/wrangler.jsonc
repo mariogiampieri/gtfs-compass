@@ -1,0 +1,15 @@
+{
+  // Worker code lands in Phase 2; for now this project only owns the D1 database
+  // and its migrations. "main" is intentionally omitted.
+  "name": "gtfs-compass-api",
+  "compatibility_date": "2026-08-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gtfs-compass",
+      // Replace after `npx wrangler d1 create gtfs-compass` (see README).
+      // Local development (`--local`) works without a real id.
+      "database_id": "REPLACE_WITH_DATABASE_ID"
+    }
+  ]
+}
