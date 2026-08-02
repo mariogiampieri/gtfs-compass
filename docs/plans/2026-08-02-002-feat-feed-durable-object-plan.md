@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 2 — feed Durable Object and realtime layer"
 type: feat
-status: active
+status: completed
 date: 2026-08-02
 deepened: 2026-08-02
 ---
