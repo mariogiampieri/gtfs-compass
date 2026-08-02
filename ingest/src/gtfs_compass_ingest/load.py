@@ -18,10 +18,13 @@ from typing import Any
 
 import requests
 
+from .tables import TableSpec
+
 log = logging.getLogger(__name__)
 
 MAX_PARAMS_PER_STATEMENT = 100  # documented D1 limit
 DEFAULT_PACE_SECONDS = 0.25  # global API limit is 1,200 req / 5 min per token
+MAX_RETRY_DELAY_SECONDS = 60  # caps backoff so runs can't balloon past the lock TTL
 PRUNE_GUARD_FRACTION = 0.5  # refuse deleting more than this share without force
 PRUNE_GUARD_MIN_ROWS = 10  # guards only apply once a table has real data
 LOCK_TTL_SECONDS = 1800
@@ -92,16 +95,31 @@ class D1Client:
         payload = {"sql": sql, "params": list(params)}
         for attempt in range(self._max_retries + 1):
             self._pace()
-            resp = self._session.post(
-                self.url, json=payload, headers=self._headers, timeout=60
-            )
+            try:
+                resp = self._session.post(
+                    self.url, json=payload, headers=self._headers, timeout=60
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt == self._max_retries:
+                    raise D1Error(
+                        f"D1 request failed after {attempt + 1} attempts: {exc}"
+                    ) from exc
+                delay = min(2**attempt, MAX_RETRY_DELAY_SECONDS)
+                log.warning(
+                    "D1 connection error (%s), retrying in %.1fs (attempt %d)",
+                    exc.__class__.__name__,
+                    delay,
+                    attempt + 1,
+                )
+                time.sleep(delay)
+                continue
             if resp.status_code == 429 or resp.status_code >= 500:
                 if attempt == self._max_retries:
                     raise D1Error(
                         f"D1 request failed with HTTP {resp.status_code} "
                         f"after {attempt + 1} attempts"
                     )
-                delay = float(resp.headers.get("Retry-After", 0) or 0) or 2**attempt
+                delay = _retry_delay(resp.headers.get("Retry-After"), attempt)
                 log.warning(
                     "D1 HTTP %s, retrying in %.1fs (attempt %d)",
                     resp.status_code,
@@ -130,9 +148,22 @@ class D1Client:
         self._last_request_at = time.monotonic()
 
 
+def _retry_delay(retry_after: str | None, attempt: int) -> float:
+    """Honor a numeric Retry-After; fall back to capped exponential backoff.
+
+    RFC 7231 also allows Retry-After as an HTTP-date — parse defensively so a
+    date-formatted header stays a retry instead of crashing the run.
+    """
+    try:
+        delay = float(retry_after) if retry_after else 0.0
+    except (TypeError, ValueError):
+        delay = 0.0
+    return min(delay or float(2**attempt), MAX_RETRY_DELAY_SECONDS)
+
+
 def sync(
     client: D1Client,
-    table,
+    table: TableSpec,
     rows: Iterable[dict],
     *,
     scope_where: str = "",
@@ -203,7 +234,7 @@ def sync(
 
 def prune_only(
     client: D1Client,
-    table,
+    table: TableSpec,
     keep_keys: set[tuple],
     *,
     scope_where: str = "",
@@ -257,9 +288,9 @@ def _delete_in_chunks(
     scope_where: str,
     scope_params: Sequence[Any],
 ) -> None:
-    for chunk in _chunked(
-        delete_keys, max(1, MAX_PARAMS_PER_STATEMENT // len(pk_columns))
-    ):
+    # Scope params share the statement's 100-binding budget with the keys.
+    key_budget = MAX_PARAMS_PER_STATEMENT - len(list(scope_params))
+    for chunk in _chunked(delete_keys, max(1, key_budget // len(pk_columns))):
         sql, params = _delete_statement(name, pk_columns, chunk, scope_where, scope_params)
         client.query(sql, params)
 
@@ -319,6 +350,27 @@ def acquire_lock(client: D1Client, holder: str, ttl_seconds: int = LOCK_TTL_SECO
     )
     result = client.query("SELECT holder FROM ingest_lock WHERE id = 1")
     return bool(result["results"]) and result["results"][0]["holder"] == holder
+
+
+def renew_lock(client: D1Client, holder: str, ttl_seconds: int = LOCK_TTL_SECONDS) -> bool:
+    """Extend our claim between ingest phases; returns False if the lock was lost
+    (TTL expired and another host took it)."""
+    now = int(time.time())
+    client.query(
+        "UPDATE ingest_lock SET expires_at = ? WHERE id = 1 AND holder = ?",
+        [now + ttl_seconds, holder],
+    )
+    result = client.query("SELECT holder FROM ingest_lock WHERE id = 1")
+    return bool(result["results"]) and result["results"][0]["holder"] == holder
+
+
+def parse_optional_float(value: str | None) -> float | None:
+    """Shared optional-float parse: empty/malformed -> None."""
+    value = (value or "").strip()
+    try:
+        return float(value) if value else None
+    except ValueError:
+        return None
 
 
 def release_lock(client: D1Client, holder: str) -> None:

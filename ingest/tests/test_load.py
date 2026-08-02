@@ -122,9 +122,9 @@ def test_composite_key_prune_uses_row_values_within_param_limit():
     keep = existing[:5]
     sync(client, STOP_ROUTES, keep, scope_where="feed_id = ?", scope_params=["f"], force=True)
     deletes = statements(session, "DELETE")
-    assert len(deletes) == 2  # 35 keys at 33 keys/statement (3 params each + scope)
+    assert len(deletes) == 2  # 35 keys at 33 keys/statement (99 key + 1 scope param)
     assert "(feed_id, stop_id, route_id) IN (VALUES" in deletes[0]["sql"]
-    assert all(len(s["params"]) <= 101 for s in deletes)  # 100 key params + 1 scope param
+    assert all(len(s["params"]) <= 100 for s in deletes)  # scope shares the budget
 
 
 def test_unchanged_rows_write_nothing_even_with_new_timestamp():
@@ -186,3 +186,122 @@ def test_lock_acquire_and_release():
     # expired lock is claimable
     state.update(holder="host-b", expires_at=1)
     assert acquire_lock(client, "host-a") is True
+
+
+def test_scoped_two_column_pk_prune_stays_within_param_budget():
+    # Regression for the 101-binding DELETE: 2-col PK + 1 scope param must
+    # chunk at 49 keys (98 + 1 = 99 params), never 50 (101).
+    from gtfs_compass_ingest.load import prune_only
+    from gtfs_compass_ingest.tables import STOPS
+
+    existing = [
+        {"feed_id": "f", "stop_id": f"s{i}"} for i in range(120)
+    ]
+    client, session = make_client(
+        lambda sql, params: existing if sql.startswith("SELECT") else []
+    )
+    keep = {("f", f"s{i}") for i in range(60)}
+    deleted = prune_only(
+        client, STOPS, keep, scope_where="feed_id = ?", scope_params=["f"]
+    )
+    deletes = statements(session, "DELETE")
+    assert deleted == 60
+    assert len(deletes) == 2  # 49 + 11 keys
+    assert all(len(s["params"]) <= 100 for s in deletes)
+    # After the scope param, keys flatten as (feed_id, stop_id) pairs.
+    deleted_ids = [p for s in deletes for p in s["params"][1:][1::2]]
+    assert sorted(deleted_ids) == sorted(f"s{i}" for i in range(60, 120))
+
+
+def test_connection_error_retried_then_succeeds(monkeypatch):
+    import requests as requests_lib
+
+    monkeypatch.setattr(load.time, "sleep", lambda s: None)
+    client, session = make_client(lambda sql, params: [])
+    session.queue = [requests_lib.ConnectionError("reset"), FakeResponse(body=d1_body([]))]
+    result = client.query("SELECT 1")
+    assert result["results"] == []
+    assert len(session.calls) == 2
+
+
+def test_connection_error_exhaustion_raises(monkeypatch):
+    import requests as requests_lib
+
+    monkeypatch.setattr(load.time, "sleep", lambda s: None)
+    session = FakeSession()
+    client = D1Client("a", "d", "t", session=session, pace_seconds=0, max_retries=2)
+    session.queue = [requests_lib.ConnectionError("reset")] * 3
+    with pytest.raises(D1Error):
+        client.query("SELECT 1")
+    assert len(session.calls) == 3
+
+
+def test_http_date_retry_after_does_not_crash(monkeypatch):
+    slept = []
+    monkeypatch.setattr(load.time, "sleep", lambda s: slept.append(s))
+    client, session = make_client(lambda sql, params: [])
+    session.queue = [
+        FakeResponse(status_code=429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+        FakeResponse(body=d1_body([])),
+    ]
+    result = client.query("SELECT 1")
+    assert result["results"] == []
+    assert slept and slept[0] <= load.MAX_RETRY_DELAY_SECONDS
+
+
+def test_retry_exhaustion_on_repeated_429(monkeypatch):
+    monkeypatch.setattr(load.time, "sleep", lambda s: None)
+    session = FakeSession()
+    client = D1Client("a", "d", "t", session=session, pace_seconds=0, max_retries=2)
+    session.queue = [FakeResponse(status_code=429)] * 3
+    with pytest.raises(D1Error, match="after 3 attempts"):
+        client.query("SELECT 1")
+    assert len(session.calls) == 3
+
+
+def test_non_retryable_status_raises_immediately():
+    client, session = make_client(lambda sql, params: [])
+    session.queue = [FakeResponse(status_code=404, body={"success": False, "errors": []})]
+    with pytest.raises(D1Error):
+        client.query("SELECT 1")
+    assert len(session.calls) == 1
+
+
+def test_from_env_happy_path(monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("CLOUDFLARE_D1_DATABASE_ID", "db")
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
+    monkeypatch.setenv("D1_PACE_SECONDS", "0.5")
+    client = D1Client.from_env()
+    assert "acct" in client.url and "db" in client.url
+    assert client._pace_seconds == 0.5
+
+
+def test_from_env_missing_var_exits(monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
+    monkeypatch.setenv("CLOUDFLARE_D1_DATABASE_ID", "db")
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    with pytest.raises(SystemExit, match="CLOUDFLARE_API_TOKEN"):
+        D1Client.from_env()
+
+
+def test_renew_lock_extends_and_detects_loss():
+    from gtfs_compass_ingest.load import renew_lock
+
+    state = {"holder": "host-a", "expires_at": 100}
+
+    def handler(sql, params):
+        if sql.startswith("UPDATE ingest_lock SET expires_at"):
+            new_expiry, holder = params
+            if state["holder"] == holder:
+                state["expires_at"] = new_expiry
+            return []
+        if sql.startswith("SELECT holder"):
+            return [{"holder": state["holder"]}]
+        raise AssertionError(f"unexpected sql: {sql}")
+
+    client, _ = make_client(handler)
+    assert renew_lock(client, "host-a") is True
+    assert state["expires_at"] > 100
+    state["holder"] = "host-b"  # lock stolen after expiry
+    assert renew_lock(client, "host-a") is False

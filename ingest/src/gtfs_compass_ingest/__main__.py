@@ -18,7 +18,7 @@ import time
 
 from . import seeds
 from .catalog import run_catalog
-from .load import D1Client, PruneRefused, acquire_lock, release_lock
+from .load import D1Client, PruneRefused, acquire_lock, release_lock, renew_lock
 from .static_gtfs import run_static
 
 log = logging.getLogger("gtfs_compass_ingest")
@@ -101,6 +101,11 @@ def _run(args: argparse.Namespace) -> int:
         if args.command in ("static", "all"):
             cli_ids = getattr(args, "feed_ids", None)
             for feed_id in static_feed_ids(cli_ids):
+                # Re-extend the D1 lock before each phase so a long run
+                # (backoff, slow network) can never outlive its claim.
+                if not dry_run and not renew_lock(client, holder):
+                    log.error("lost the D1 ingest lock mid-run; aborting")
+                    return EXIT_FAILURE
                 run_static(client, feed_id, dry_run=dry_run, force=args.force)
         return EXIT_OK
     except PruneRefused as exc:

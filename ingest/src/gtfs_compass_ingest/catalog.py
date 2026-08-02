@@ -15,7 +15,7 @@ import os
 import requests
 
 from . import seeds
-from .load import D1Client, SyncStats, sync
+from .load import D1Client, SyncStats, parse_optional_float, sync
 from .tables import FEEDS
 
 log = logging.getLogger(__name__)
@@ -30,7 +30,9 @@ def csv_url() -> str:
 def fetch_catalog(url: str, session: requests.Session | None = None) -> str:
     resp = (session or requests).get(url, timeout=120)
     resp.raise_for_status()
-    return resp.text
+    # Decode explicitly (BOM-tolerant): the server sends no charset, and
+    # requests' guessing would leave a BOM glued to the first header name.
+    return resp.content.decode("utf-8-sig")
 
 
 def build_feed_rows(catalog_text: str, now: int) -> list[dict]:
@@ -92,11 +94,7 @@ def build_feed_rows(catalog_text: str, now: int) -> list[dict]:
 
 
 def _coord(row: dict, column: str) -> float | None:
-    value = (row.get(column) or "").strip()
-    try:
-        return float(value) if value else None
-    except ValueError:
-        return None
+    return parse_optional_float(row.get(column))
 
 
 def run_catalog(

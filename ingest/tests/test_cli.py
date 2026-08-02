@@ -23,6 +23,7 @@ def recorder(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "run_static", rec.run_static)
     monkeypatch.setattr(cli.D1Client, "from_env", classmethod(lambda cls: object()))
     monkeypatch.setattr(cli, "acquire_lock", lambda client, holder: True)
+    monkeypatch.setattr(cli, "renew_lock", lambda client, holder: True)
     released = []
     monkeypatch.setattr(cli, "release_lock", lambda client, holder: released.append(holder))
     monkeypatch.setenv("INGEST_LOCK_FILE", str(tmp_path / "lock"))
@@ -95,3 +96,17 @@ def test_cli_feed_ids_override_env(recorder, monkeypatch):
 def test_force_flag_propagates(recorder):
     assert cli.main(["--force", "catalog"]) == 0
     assert recorder.calls[0][1]["force"] is True
+
+
+def test_release_lock_failure_does_not_mask_exit_code(recorder, monkeypatch):
+    def boom_release(client, holder):
+        raise RuntimeError("network blip during release")
+
+    monkeypatch.setattr(cli, "release_lock", boom_release)
+    assert cli.main(["all"]) == 0  # containment in finally keeps the real code
+
+
+def test_lost_d1_lock_mid_run_aborts_before_static(recorder, monkeypatch):
+    monkeypatch.setattr(cli, "renew_lock", lambda client, holder: False)
+    assert cli.main(["all"]) == 1
+    assert not [c for c in recorder.calls if c[0] == "static"]

@@ -1,6 +1,7 @@
 import io
 import zipfile
 
+import pytest
 from conftest import FakeSession
 
 from gtfs_compass_ingest.load import D1Client
@@ -157,3 +158,23 @@ def test_dry_run_makes_no_d1_calls():
     stats = run_static(None, "mta-subway", dry_run=True, http_session=FakeHTTP(make_zip()))
     assert session.calls == []
     assert stats.stops_written == 0
+
+
+def test_unknown_stop_id_in_stop_times_produces_no_edge():
+    stop_times = STOP_TIMES + "t1,GHOST,09:30:00,09:30:00,3\nt1,E01,09:31:00,09:31:00,4\n"
+    stats, session = run(make_zip(stop_times=stop_times))
+    edges = {(r["stop_id"], r["route_id"]) for r in inserted_rows(session, "stop_routes")}
+    assert not any(stop in ("GHOST", "E01") for stop, _ in edges)
+    assert stats.edges_written == 3  # unchanged from the clean fixture
+
+
+def test_missing_static_url_in_d1_raises():
+    session = FakeSession(lambda sql, params: [])  # no feeds row exists
+    client = D1Client("a", "d", "t", session=session, pace_seconds=0)
+    with pytest.raises(ValueError, match="catalog"):
+        run_static(client, "mystery-feed", http_session=FakeHTTP(make_zip()))
+
+
+def test_unknown_feed_without_client_raises():
+    with pytest.raises(ValueError, match="unknown"):
+        run_static(None, "not-a-feed", dry_run=True, http_session=FakeHTTP(make_zip()))

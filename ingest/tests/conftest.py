@@ -40,7 +40,10 @@ class FakeSession:
     def post(self, url, json=None, headers=None, timeout=None):
         self.calls.append({"url": url, "payload": json, "headers": headers})
         if self.queue:
-            return self.queue.pop(0)
+            item = self.queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
         results = self.handler(json["sql"], json["params"])
         return FakeResponse(body=d1_body(results))
 

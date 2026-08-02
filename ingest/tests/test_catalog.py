@@ -157,7 +157,7 @@ def run_with_fixture(csv_text, existing_rows):
     class FakeHTTP:
         def get(self, url, timeout=None):
             class R:
-                text = csv_text
+                content = csv_text.encode("utf-8")
 
                 def raise_for_status(self):
                     pass
@@ -188,3 +188,18 @@ def test_full_run_includes_curated_row_and_never_prunes_it():
     assert "mta-subway" not in deleted_ids  # keep-set includes curated ids
     assert deleted_ids == ["mdb-stale"]
     assert stats.deleted == 1
+
+
+def test_dry_run_makes_no_d1_calls():
+    class FakeHTTP:
+        def get(self, url, timeout=None):
+            class R:
+                content = make_csv([gtfs_row("mdb-1")]).encode()
+
+                def raise_for_status(self):
+                    pass
+
+            return R()
+
+    stats = run_catalog(None, now=1000, dry_run=True, session=FakeHTTP())
+    assert stats.unchanged == 2  # mdb-1 + curated mta-subway, nothing written

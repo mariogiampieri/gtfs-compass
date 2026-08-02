@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import requests
 
 from . import seeds
-from .load import D1Client, prune_only, sync
+from .load import D1Client, parse_optional_float, prune_only, sync
 from .tables import ROUTES, STOP_ROUTES, STOPS
 
 log = logging.getLogger(__name__)
@@ -131,8 +131,8 @@ def _parse_stops(zf: zipfile.ZipFile, feed_id: str) -> tuple[list[dict], int]:
                 "feed_id": feed_id,
                 "stop_id": stop_id,
                 "name": (row.get("stop_name") or "").strip() or None,
-                "lat": _number(row.get("stop_lat")),
-                "lon": _number(row.get("stop_lon")),
+                "lat": parse_optional_float(row.get("stop_lat")),
+                "lon": parse_optional_float(row.get("stop_lon")),
                 "parent_station": (row.get("parent_station") or "").strip() or None,
             }
         )
@@ -203,11 +203,3 @@ def _derive_edges(
         {"feed_id": feed_id, "stop_id": stop_id, "route_id": route_id}
         for stop_id, route_id in sorted(edges)
     ]
-
-
-def _number(value: str | None) -> float | None:
-    value = (value or "").strip()
-    try:
-        return float(value) if value else None
-    except ValueError:
-        return None
