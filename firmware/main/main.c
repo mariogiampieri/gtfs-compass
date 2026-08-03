@@ -175,7 +175,21 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(nvs_err);
 
-  lv_display_t *disp = bsp_display_start();
+  /* The BSP's default LVGL task stack (7168) overflows during the first
+   * full board render — deep flex layout over 8 trunks — corrupting the
+   * TCB and panicking the scheduler (LoadProhibited in vTaskSwitchContext,
+   * seen on first live fetch). The lvgl_port_cfg member is the one part of
+   * this struct bsp_display_start_with_config actually honors; the buffer
+   * fields below are ignored by the BSP (gc_use_dma_draw_buffer fixes the
+   * buffer after init instead). */
+  bsp_display_cfg_t disp_cfg = {
+      .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+      .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT,
+      .double_buffer = 0,
+      .flags = {.buff_dma = false, .buff_spiram = true},
+  };
+  disp_cfg.lvgl_port_cfg.task_stack = 16384;
+  lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
   gc_use_dma_draw_buffer(disp);
   bsp_display_backlight_on();
 
