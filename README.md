@@ -330,11 +330,27 @@ cd firmware/sim && cmake -B build -G Ninja . && cmake --build build
 ./build/sim                          # renders fixtures/live-jay-st.json
 ```
 
-Keys: `1`–`5` cycle loading/live/stale/offline/no-location, `j`/`k` cycle
-stops, `f` toggles the refresh flash. The mouse drives the same gesture
-tracker as the device touch panel (tap / swipe / scroll); resolved gestures
-print as `input: ...` lines. Capture a fresh live fixture with
+Keys (routed through the same navigation code the device gestures use):
+
+| Key       | Action                                              |
+| --------- | --------------------------------------------------- |
+| `h` / `l` | previous / next system (rail ↔ bus ↔ bike, clamped) |
+| `j` / `k` | next / previous stop (rail board)                   |
+| `Enter`   | open the trunk detail for the first trunk           |
+| `Esc`/`b` | back to the board                                   |
+| `d`       | flip direction (global)                             |
+| `1`–`5`   | loading / live / stale / offline / no-location      |
+| `f`       | toggle the refresh flash · `q` quit                 |
+
+The mouse drives the same gesture tracker and tap/swipe routing as the
+device touch panel: swipe left/right for systems, up/down for stops, tap a
+trunk row for detail, tap the `⇅` pill to flip, tap the bike screen for the
+nearby list. Capture a fresh live fixture with
 `curl <worker>/v1/nearby?lat=..&lon=.. > firmware/fixtures/name.json`.
+
+Headless capture: `GC_DUMP=/tmp/f.ppm ./build/sim` renders one frame and
+exits; `GC_VIEW=detail[:N] | bike | bus | nearby` sets the view first, so
+every screen is reachable without a window.
 
 The sim build also produces `./build/test_input`, a headless scripted-pointer
 suite for the gesture tracker (run in CI).

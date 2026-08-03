@@ -30,5 +30,28 @@ target_compile_definitions(test_model PRIVATE
   UNITY_INCLUDE_DOUBLE
 )
 
+# Navigation transitions (plan U3): ui_nav.c is LVGL-free by design, so the
+# carousel clamp / pop-before-sys-change / identity-write rules are host
+# facts, tested next to the reconciler they cooperate with.
+add_executable(test_nav
+  test_nav.c
+  unity/unity.c
+  ${FW}/components/model/model.c
+  ${FW}/components/ui/ui_state.c
+  ${FW}/components/ui/ui_nav.c
+  ${FW}/third_party/cjson/cJSON.c
+)
+target_include_directories(test_nav PRIVATE
+  unity
+  ${FW}/components/model/include
+  ${FW}/components/ui/include
+  ${FW}/third_party/cjson
+)
+target_compile_definitions(test_nav PRIVATE
+  FIXTURE_DIR="${FW}/fixtures"
+  CJSON_NESTING_LIMIT=48
+)
+
 enable_testing()
 add_test(NAME model COMMAND test_model)
+add_test(NAME nav COMMAND test_nav)

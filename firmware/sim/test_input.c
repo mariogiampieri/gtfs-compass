@@ -16,6 +16,8 @@
  *   5. mixed-axis 40 px down (scroll-latched) then 60 px right never swipes
  *   6. tap after >15 px wander (out and back) is suppressed
  *   7. 44 px hit-region pad resolves a near-miss on a ~25 px target
+ *   8. (U3) ui_input_busy() is true mid-press and false after release —
+ *      the gate main.c's render-request deferral path stands on (R6)
  */
 #include <stdio.h>
 #include <string.h>
@@ -233,6 +235,20 @@ int main(void) {
   CHECK(!ui_input_hit(pill, 140, 472, UI_INPUT_HIT_MIN_PX),
         "beyond the 44 px pad misses");
   CHECK(!ui_input_hit(pill, 130, 472, 0), "unpadded near-miss misses");
+
+  printf("scenario 8: ui_input_busy tracks the press (deferral gate)\n");
+  reset_recorder();
+  CHECK(!ui_input_busy(), "idle: not busy");
+  step(20, 470, true);
+  CHECK(ui_input_busy(), "mid-press: busy (renders must defer)");
+  step(24, 472, true);
+  CHECK(ui_input_busy(), "still busy while the finger wanders");
+  step(24, 472, false);
+  CHECK(!ui_input_busy(), "after release: not busy (deferred work applies)");
+  ui_input_set_animating(true);
+  CHECK(ui_input_busy(), "transition animation counts as busy (U7 hook)");
+  ui_input_set_animating(false);
+  CHECK(!ui_input_busy(), "animation over: not busy");
 
   if (g_failures) {
     printf("%d FAILURE(S)\n", g_failures);
