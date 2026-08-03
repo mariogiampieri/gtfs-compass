@@ -24,6 +24,7 @@ add_executable(sim
   main.c
   ${FW}/components/model/model.c
   ${FW}/components/ui/ui_board.c
+  ${FW}/components/ui/ui_input.c
   ${FW}/third_party/cjson/cJSON.c
 )
 target_include_directories(sim PRIVATE
@@ -36,3 +37,15 @@ target_include_directories(sim PRIVATE
 target_link_libraries(sim lvgl ${SDL2_LIBRARIES})
 target_compile_definitions(sim PRIVATE FIXTURE_DIR="${FW}/fixtures"
   CJSON_NESTING_LIMIT=48)
+
+# U2 gesture-tracker tests: headless (no SDL window) — a scripted pointer
+# indev driven through the real LVGL machinery. Run: ./build/test_input
+add_executable(test_input
+  test_input.c
+  ${FW}/components/ui/ui_input.c
+)
+target_include_directories(test_input PRIVATE
+  ${FW}/components/ui/include
+  ${SDL2_INCLUDE_DIRS}
+)
+target_link_libraries(test_input lvgl ${SDL2_LIBRARIES})

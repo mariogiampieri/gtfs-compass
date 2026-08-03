@@ -49,3 +49,5 @@ jobs:
           cd firmware/sim
           cmake -B build -G "Unix Makefiles" .
           cmake --build build
+      - name: Run gesture tracker tests (headless, no window)
+        run: ./firmware/sim/build/test_input

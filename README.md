@@ -331,8 +331,13 @@ cd firmware/sim && cmake -B build -G Ninja . && cmake --build build
 ```
 
 Keys: `1`–`5` cycle loading/live/stale/offline/no-location, `j`/`k` cycle
-stops, `f` toggles the refresh flash. Capture a fresh live fixture with
+stops, `f` toggles the refresh flash. The mouse drives the same gesture
+tracker as the device touch panel (tap / swipe / scroll); resolved gestures
+print as `input: ...` lines. Capture a fresh live fixture with
 `curl <worker>/v1/nearby?lat=..&lon=.. > firmware/fixtures/name.json`.
+
+The sim build also produces `./build/test_input`, a headless scripted-pointer
+suite for the gesture tracker (run in CI).
 
 ### Device build, flash, provision
 
