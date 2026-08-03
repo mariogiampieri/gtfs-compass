@@ -42,6 +42,11 @@ typedef struct {
 } tracker_t;
 
 static tracker_t g_trk;
+static bool g_animating; /* U7 slide transitions; always false in U3 */
+
+bool ui_input_busy(void) { return g_trk.active || g_animating; }
+
+void ui_input_set_animating(bool animating) { g_animating = animating; }
 
 static void fire_swipe(ui_swipe_t dir) {
   g_trk.swipe_fired = true;

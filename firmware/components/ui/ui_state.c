@@ -113,3 +113,12 @@ void ui_reconcile(ui_state_t *st, const model_nearby_t *model) {
     }
   }
 }
+
+void ui_reconcile_deferred(ui_state_t *st, const model_nearby_t *model, int32_t defer_s) {
+  ui_reconcile(st, model);
+  if (defer_s <= 0) return;
+  /* Only the systems this reconcile seeded (present, known age) aged in the
+   * stash; absent/cold systems keep their old 1 Hz-ticked counters. */
+  if (model->rail.present && st->age_s[UI_SYS_RAIL] >= 0) st->age_s[UI_SYS_RAIL] += defer_s;
+  if (model->bike.present && st->age_s[UI_SYS_BIKE] >= 0) st->age_s[UI_SYS_BIKE] += defer_s;
+}

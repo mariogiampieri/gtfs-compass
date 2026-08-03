@@ -19,10 +19,12 @@
 extern "C" {
 #endif
 
+/* Transport status only (KTD-7): what fetches are doing. STALE is not a
+ * transport fact — it is derived per system from age_s[] at render time
+ * (fetches can succeed while one system's upstream data ages past 90 s). */
 typedef enum {
   UI_CONN_LOADING = 0, /* skeleton: no data yet */
   UI_CONN_LIVE,
-  UI_CONN_STALE,       /* fetches succeed, data age > 90 s (amber chip) */
   UI_CONN_OFFLINE,     /* fetches failing (red chip) */
   UI_CONN_NO_LOCATION, /* API 422 — the R10 screen */
 } ui_conn_t;
@@ -48,9 +50,12 @@ typedef enum {
 typedef struct {
   /* Transport status is global (KTD-7): fetch outcomes, not data age. */
   ui_conn_t conn;
-  uint32_t secs_since_fetch; /* M1 chip counter; migrates to age_s in U3.
-                                (uint32: an overnight offline device must
-                                not wrap at 18.2h and re-age from zero) */
+  uint32_t secs_since_fetch; /* transport-level: seconds since the last
+                                successful fetch landed — feeds "offline · Xm"
+                                and the chip fallback for systems with no
+                                data (age_s = -1, R3). (uint32: an overnight
+                                offline device must not wrap at 18.2h and
+                                re-age from zero) */
   int8_t battery_pct;        /* -1 = unknown (sim default feeds a constant) */
   bool flash_now;            /* 1.4 s green "now" flash after a fetch lands */
 
@@ -92,6 +97,13 @@ void ui_state_init(ui_state_t *state);
  *   - absent or cold (no_data) systems are left untouched — connectivity
  *     failures change treatment, never the view (R6). */
 void ui_reconcile(ui_state_t *state, const model_nearby_t *model);
+
+/* ui_reconcile for a model whose apply was deferred (R6 deferral contract):
+ * the message sat staged for defer_s seconds while a press/animation was in
+ * progress, so each system seeded this reconcile gets its age bumped by
+ * defer_s — staleness is never under-reported. defer_s <= 0 is plain
+ * reconcile. Pure like ui_reconcile (the caller supplies the elapsed time). */
+void ui_reconcile_deferred(ui_state_t *state, const model_nearby_t *model, int32_t defer_s);
 
 #ifdef __cplusplus
 }

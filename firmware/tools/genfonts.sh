@@ -53,8 +53,9 @@ BOLD="$PLEX_DIR/IBMPlexSans-Bold.ttf"         # 700 (Plex has no 800/ExtraBold)
 
 # Printable ASCII plus the non-ASCII glyphs the UI actually draws:
 # ° 0xB0 (compass tags), · 0xB7 (chip separator), — 0x2014 (placeholders),
-# … 0x2026 (loading chip), ‹ 0x2039 (back affordance).
-TEXT_RANGE="0x20-0x7E,0xB0,0xB7,0x2014,0x2026,0x2039"
+# … 0x2026 (loading chip), ‹ 0x2039 (back affordance),
+# ← → 0x2190/0x2192 (§7 empty-mode swipe hints, U3 — present in Plex).
+TEXT_RANGE="0x20-0x7E,0xB0,0xB7,0x2014,0x2026,0x2039,0x2190,0x2192"
 # 84 px hero is digits-only: 0-9, colon, hyphen, em-dash (KTD-5).
 HERO_RANGE="0x2D,0x30-0x3A,0x2014"
 

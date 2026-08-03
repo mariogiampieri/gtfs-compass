@@ -53,6 +53,16 @@ typedef struct {
  * dead zone and starts the mid-press poll. Call once per build. */
 void ui_input_attach(lv_indev_t *indev, const ui_input_callbacks_t *cbs);
 
+/* True while a press is being tracked or a transition animation is running
+ * (plan U3, R6 deferral contract): full renders must not rebuild the tree
+ * under a finger or a slide — callers route render requests through a
+ * deferral path gated on this. */
+bool ui_input_busy(void);
+
+/* Transition-animation flag feeding ui_input_busy() — U3 navigation is
+ * instant so nothing sets it yet; U7's slide transitions own it. */
+void ui_input_set_animating(bool animating);
+
 /* Hit-region test: obj's on-screen rect, each edge padded out to at least
  * min_px (UI_INPUT_HIT_MIN_PX for the small chrome targets; visual spec
  * unchanged — padding is hit-area only). */

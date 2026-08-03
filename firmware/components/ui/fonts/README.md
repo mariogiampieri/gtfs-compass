@@ -2,7 +2,8 @@
 
 LVGL 4-bpp bitmap faces (`gc_plex_<px>.c`) rendered from **IBM Plex Sans**
 (Regular 400 / SemiBold 600 / Bold 700) at the design handoff's true type ramp
-— 14–40 px ASCII+punctuation, plus an 84 px digits-only hero face; Plex digits
+— 14–40 px ASCII+punctuation (plus `° · — … ‹ ← →` — the arrows carry the §7
+empty-mode swipe hints), and an 84 px digits-only hero face; Plex digits
 are tabular by default, which is the handoff's hard requirement. The 15/16/20 px
 faces merge the `⇅` (U+21C5) flip-direction glyph from DejaVu Sans, which Plex
 lacks. Regenerate with `../../../tools/genfonts.sh` (needs node + curl; every

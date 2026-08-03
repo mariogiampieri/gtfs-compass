@@ -51,6 +51,7 @@
 /* Chrome */
 #define TK_CHIP_Y 18
 #define TK_CHIP_GAP 16
+#define TK_PARTIAL_DOT 5 /* R3 partial-data marker beside the chip (amber) */
 #define TK_MODE_DOT 6
 #define TK_MODE_DOT_GAP 9
 #define TK_MODE_DOTS_BOTTOM 16
@@ -68,6 +69,17 @@
 #define TK_BULLET_OVERLAP 12
 #define TK_BULLET_RING 3
 #define TK_ROW_GAP 14
+
+/* Empty mode (handoff §7): ring / title / body vertical anchors */
+#define TK_EMPTY_RING_Y 150
+#define TK_EMPTY_TITLE_Y 230
+#define TK_EMPTY_BODY_Y 270
+
+/* Detail / nearby stubs (U3; U4/U5 own the full §2/§4 geometry) */
+#define TK_DETAIL_HEADER_TOP 44 /* §2 header top */
+#define TK_NEARBY_HEADER_TOP 48 /* §4 header top */
+#define TK_NEARBY_ROWS_TOP 120
+#define TK_NEARBY_ROW_H 72
 
 /* Jitter (spec burn-in requirement) */
 #define TK_JITTER_PX 4

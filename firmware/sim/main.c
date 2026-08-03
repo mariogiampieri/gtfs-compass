@@ -3,12 +3,24 @@
  *
  *   ./sim [fixture.json]         (default: live-jay-st.json)
  *
- * Keys: 1 loading · 2 live · 3 stale · 4 offline · 5 no-location
- *       j/k next/prev stop · f toggle "now" flash · q quit
+ * Keys (plan U3 — routed through the SAME ui_nav transitions the device's
+ * gesture callbacks use, so the two input paths cannot drift):
+ *   h/l   system prev/next (carousel, clamped)
+ *   j/k   stop next/prev (rail board)
+ *   Enter open detail for the first trunk · Esc/b back · d direction flip
+ *   1-5   loading/live/stale/offline/no-location · f "now" flash · q quit
  *
- * Mouse (plan U2, R10): the SDL pointer drives the same LVGL indev machinery
- * and ui_input gesture tracker the device touch uses; resolved gestures
- * print as "input: ..." lines (U3 consumes them as navigation).
+ * Mouse (plan U2/U3): the SDL pointer drives the same LVGL indev machinery,
+ * ui_input gesture tracker, and ui_views tap/swipe routing the device uses.
+ *
+ * Env:
+ *   GC_DUMP=/path/frame.ppm   headless one-frame capture, then exit
+ *   GC_VIEW=detail[:N] | bike | bus | nearby
+ *       set the view/system before the GC_DUMP settle loop (R10: headless
+ *       capture reaches every screen); also works windowed
+ *
+ * No render deferral here: the sim has no async model source — fixtures
+ * apply synchronously, so the R6 deferral path lives in main/main.c only.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +32,7 @@
 #include "ui_input.h"
 
 static model_nearby_t g_model;
-static ui_state_t g_state = {
-    .conn = UI_CONN_LIVE, .secs_since_fetch = 12, .battery_pct = 82};
+static ui_state_t g_state;
 
 static char *read_fixture(const char *arg, size_t *len) {
   char path[512];
@@ -43,62 +54,88 @@ static char *read_fixture(const char *arg, size_t *len) {
   return buf;
 }
 
-static void rerender(void) { ui_board_show(&g_model, &g_state); }
+static void rerender(void) { ui_render(&g_model, &g_state); }
 
 static void key_cb(lv_event_t *e) {
   uint32_t key = lv_event_get_key(e);
+  bool changed = true;
   switch (key) {
     case '1': g_state.conn = UI_CONN_LOADING; break;
-    case '2': g_state.conn = UI_CONN_LIVE; g_state.secs_since_fetch = 12; break;
-    case '3': g_state.conn = UI_CONN_STALE; g_state.secs_since_fetch = 130; break;
+    case '2':
+      g_state.conn = UI_CONN_LIVE;
+      g_state.age_s[g_state.sys] = 12;
+      break;
+    case '3': /* per-system staleness (KTD-7): age the CURRENT system */
+      g_state.conn = UI_CONN_LIVE;
+      g_state.age_s[g_state.sys] = 130;
+      break;
     case '4': g_state.conn = UI_CONN_OFFLINE; g_state.secs_since_fetch = 130; break;
     case '5': g_state.conn = UI_CONN_NO_LOCATION; break;
-    case 'j':
-      if (g_model.rail.stop_count)
-        g_state.stop_idx[UI_SYS_RAIL] =
-            (uint8_t)((g_state.stop_idx[UI_SYS_RAIL] + 1) % g_model.rail.stop_count);
-      break;
-    case 'k':
-      if (g_model.rail.stop_count)
-        g_state.stop_idx[UI_SYS_RAIL] =
-            (uint8_t)((g_state.stop_idx[UI_SYS_RAIL] + g_model.rail.stop_count - 1) %
-                      g_model.rail.stop_count);
-      break;
     case 'f': g_state.flash_now = !g_state.flash_now; break;
+    /* navigation: the same ui_nav transitions the gesture router calls */
+    case 'h': changed = ui_nav_swipe(&g_state, &g_model, UI_NAV_RIGHT); break;
+    case 'l': changed = ui_nav_swipe(&g_state, &g_model, UI_NAV_LEFT); break;
+    case 'j': changed = ui_nav_swipe(&g_state, &g_model, UI_NAV_UP); break;
+    case 'k': changed = ui_nav_swipe(&g_state, &g_model, UI_NAV_DOWN); break;
+    case LV_KEY_ENTER: changed = ui_nav_open_detail(&g_state, &g_model, 0); break;
+    case LV_KEY_ESC:
+    case 'b': changed = ui_nav_back(&g_state); break;
+    case 'd': changed = ui_nav_flip_dir(&g_state); break;
     case 'q': exit(0);
     default: return;
   }
-  rerender();
+  if (changed) rerender();
 }
 
-/* U2: gesture debug prints, wired exactly as the device wires them (U3
- * replaces these with view navigation). */
+/* U3: mouse gestures route through the shared view/nav layer, exactly as
+ * the device's tracker callbacks do in main/main.c. */
 static void input_press(int32_t x, int32_t y, void *user) {
+  (void)x;
+  (void)y;
   (void)user;
-  printf("input: press %d,%d\n", (int)x, (int)y);
-  fflush(stdout);
 }
 
 static void input_tap(int32_t x, int32_t y, void *user) {
   (void)user;
-  printf("input: tap %d,%d\n", (int)x, (int)y);
-  fflush(stdout);
+  if (ui_views_on_tap(x, y, &g_model, &g_state)) rerender();
 }
 
 static void input_swipe(ui_swipe_t dir, void *user) {
   (void)user;
-  static const char *names[] = {"left", "right", "up", "down"};
-  printf("input: swipe %s\n", names[dir]);
-  fflush(stdout);
+  if (ui_views_on_swipe(dir, &g_model, &g_state)) rerender();
 }
 
 static void tick_timer(lv_timer_t *t) {
   (void)t;
-  if (g_state.conn == UI_CONN_LIVE || g_state.conn == UI_CONN_STALE ||
-      g_state.conn == UI_CONN_OFFLINE) {
+  if (g_state.conn == UI_CONN_LIVE || g_state.conn == UI_CONN_OFFLINE) {
     g_state.secs_since_fetch++;
   }
-  ui_board_tick(&g_state);
+  for (int i = 0; i < UI_SYS_COUNT; i++) {
+    if (g_state.age_s[i] >= 0) g_state.age_s[i]++;
+  }
+  ui_tick(&g_state);
+}
+
+/* GC_VIEW: place the state machine before first render/capture. */
+static void apply_view_env(const char *view) {
+  if (strncmp(view, "detail", 6) == 0) {
+    uint8_t n = view[6] == ':' ? (uint8_t)atoi(view + 7) : 0;
+    g_state.sys = UI_SYS_RAIL;
+    if (!ui_nav_open_detail(&g_state, &g_model, n)) {
+      fprintf(stderr, "GC_VIEW: no trunk %u to open\n", n);
+    }
+  } else if (strcmp(view, "bus") == 0) {
+    g_state.sys = UI_SYS_BUS;
+  } else if (strcmp(view, "bike") == 0) {
+    g_state.sys = UI_SYS_BIKE;
+  } else if (strcmp(view, "nearby") == 0) {
+    g_state.sys = UI_SYS_BIKE;
+    if (!ui_nav_open_nearby(&g_state, &g_model)) {
+      fprintf(stderr, "GC_VIEW: no bike stations for nearby\n");
+    }
+  } else {
+    fprintf(stderr, "GC_VIEW: unknown view '%s'\n", view);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -113,6 +150,13 @@ int main(int argc, char **argv) {
   printf("fixture: %u rail stops, bike %s, units=%s\n", g_model.rail.stop_count,
          g_model.bike.present ? "present" : "absent", g_model.units);
 
+  /* Adopt identities + seed per-system ages exactly as the device does on
+   * its first apply (defer 0: the fixture applies synchronously). */
+  ui_state_init(&g_state);
+  ui_reconcile_deferred(&g_state, &g_model, 0);
+  g_state.conn = UI_CONN_LIVE;
+  g_state.battery_pct = 82;
+
   lv_init();
   lv_display_t *disp = lv_sdl_window_create(410, 502);
   lv_sdl_window_set_title(disp, "gtfs-compass");
@@ -124,6 +168,9 @@ int main(int argc, char **argv) {
   ui_input_attach(mouse, &(ui_input_callbacks_t){.on_press = input_press,
                                                  .on_tap = input_tap,
                                                  .on_swipe = input_swipe});
+
+  const char *view_env = getenv("GC_VIEW");
+  if (view_env) apply_view_env(view_env);
 
   ui_init();
   rerender();
