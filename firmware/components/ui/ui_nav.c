@@ -24,17 +24,32 @@ static bool sys_delta(ui_state_t *st, int delta) {
   return true;
 }
 
-/* Rail-only in U3 (bike selection changes via the nearby list, U5; bus has
- * no entities, KTD-6). Wraps, matching the M1 j/k behavior. */
+/* Vertical swipe cycles the current system's entities: rail stops AND bike
+ * stations (handoff "swipe ↑/↓ = next/prev stop, board only" — Mario
+ * expected station cycling on the bike board, on-device 2026-08-03; the
+ * nearby list remains the compare/jump path). Bus has no entities (KTD-6).
+ * Wraps, matching the M1 j/k behavior. */
 static bool stop_delta(ui_state_t *st, const model_nearby_t *model, int delta) {
-  if (st->sys != UI_SYS_RAIL || model == NULL) return false;
-  const model_rail_system_t *rail = &model->rail;
-  if (!rail->present || rail->stop_count < 2) return false;
-  int n = rail->stop_count;
-  int next = ((int)st->stop_idx[UI_SYS_RAIL] + delta + n) % n;
-  st->stop_idx[UI_SYS_RAIL] = (uint8_t)next;
-  id_copy(st->stop_id[UI_SYS_RAIL], UI_STOP_ID_LEN, rail->stops[next].id);
-  return true;
+  if (model == NULL) return false;
+  if (st->sys == UI_SYS_RAIL) {
+    const model_rail_system_t *rail = &model->rail;
+    if (!rail->present || rail->stop_count < 2) return false;
+    int n = rail->stop_count;
+    int next = ((int)st->stop_idx[UI_SYS_RAIL] + delta + n) % n;
+    st->stop_idx[UI_SYS_RAIL] = (uint8_t)next;
+    id_copy(st->stop_id[UI_SYS_RAIL], UI_STOP_ID_LEN, rail->stops[next].id);
+    return true;
+  }
+  if (st->sys == UI_SYS_BIKE) {
+    const model_bike_system_t *bike = &model->bike;
+    if (!bike->present || bike->no_data || bike->station_count < 2) return false;
+    int n = bike->station_count;
+    int next = ((int)st->stop_idx[UI_SYS_BIKE] + delta + n) % n;
+    st->stop_idx[UI_SYS_BIKE] = (uint8_t)next;
+    id_copy(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, bike->stations[next].id);
+    return true;
+  }
+  return false;
 }
 
 bool ui_nav_swipe(ui_state_t *st, const model_nearby_t *model, ui_nav_dir_t dir) {

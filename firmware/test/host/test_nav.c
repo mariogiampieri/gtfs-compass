@@ -112,7 +112,14 @@ static void test_stop_cycling_is_rail_board_only(void) {
   TEST_ASSERT_TRUE(ui_nav_swipe(&g_state, &g_model, UI_NAV_UP));
   uint8_t rail_idx = g_state.stop_idx[UI_SYS_RAIL];
   g_state.sys = UI_SYS_BIKE;
-  TEST_ASSERT_FALSE(ui_nav_swipe(&g_state, &g_model, UI_NAV_UP)); /* U5 owns bike selection */
+  /* Bike stations cycle too (Mario, on-device 2026-08-03) — identity-based */
+  uint8_t bike_before = g_state.stop_idx[UI_SYS_BIKE];
+  TEST_ASSERT_TRUE(ui_nav_swipe(&g_state, &g_model, UI_NAV_UP));
+  TEST_ASSERT_NOT_EQUAL(bike_before, g_state.stop_idx[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL_STRING(g_model.bike.stations[g_state.stop_idx[UI_SYS_BIKE]].id,
+                           g_state.stop_id[UI_SYS_BIKE]);
+  g_state.stop_idx[UI_SYS_BIKE] = bike_before; /* restore for later tests */
+  strcpy(g_state.stop_id[UI_SYS_BIKE], g_model.bike.stations[bike_before].id);
   g_state.sys = UI_SYS_BUS;
   TEST_ASSERT_FALSE(ui_nav_swipe(&g_state, &g_model, UI_NAV_UP)); /* no entities (KTD-6) */
   /* remembered per system: rail position untouched by the excursion */

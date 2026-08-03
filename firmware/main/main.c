@@ -65,6 +65,7 @@ static ui_state_t g_state; /* ui_state_init() in app_main: LOADING, ages -1 */
 static int64_t g_flash_until_ms;
 static int64_t g_last_success_ms;
 static int64_t g_last_minute_ms;
+static int64_t g_last_touch_ms; /* 0 at boot: a never-touched device drifts */
 static bool g_dimmed;
 
 /* Staged net message (by value, latest-wins — R6 deferral contract). */
@@ -234,10 +235,12 @@ static void tick_cb(lv_timer_t *t) {
        * preserved, so no press/animation gate is needed (U4) */
       ui_detail_minute_tick(g_ui_model, &g_state);
     }
-    /* bus / bike / detail: long-dwell views
-     * get the burn-in nudge instead of a rebuild (R7) — skipped while
-     * pressed (a moving tree under a finger shifts hit targets) */
-    if (!ui_input_busy()) ui_jitter_nudge();
+    /* Burn-in drift, parked-device only (Mario: visible jitter was too
+     * distracting): one ±1 px step per minute, and only after 5 min with
+     * no touch — active use never moves. */
+    if (!ui_input_busy() && now_ms() - g_last_touch_ms > 5 * 60 * 1000) {
+      ui_jitter_nudge();
+    }
   }
 
   /* M1 brightness placeholder: dim after long no-data — boot time counts as
@@ -351,6 +354,7 @@ static lv_indev_t *gc_touch_start(lv_display_t *disp) {
  */
 static void gc_input_press(int32_t x, int32_t y, void *user) {
   (void)user;
+  g_last_touch_ms = now_ms(); /* holds the burn-in drift while in active use */
   ESP_LOGD(TAG, "input: press %ld,%ld", (long)x, (long)y);
 }
 

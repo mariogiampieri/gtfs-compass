@@ -379,17 +379,28 @@ void ui_init(void) {
   g_jitter = NULL;
 }
 
-static void jitter_roll(void) {
-  /* spec burn-in requirement: whole-layout jitter, re-rolled per render */
-  int jx = (rand() % (2 * TK_JITTER_PX + 1)) - TK_JITTER_PX;
-  int jy = (rand() % (2 * TK_JITTER_PX + 1)) - TK_JITTER_PX;
-  lv_obj_set_pos(g_jitter, jx, jy);
+/*
+ * Burn-in defense, invisible edition (Mario, on-device 2026-08-03: the
+ * per-render ±4 px re-roll was "very distracting"). Renders no longer
+ * shift; instead the layout takes a single ±1 px random-walk step, clamped
+ * to ±TK_JITTER_PX, ONLY when main.c decides the device is parked (no
+ * touch for minutes — the actual burn-in case). One pixel per minute is
+ * imperceptible; hours of idle still sweep the full jitter box.
+ */
+static int g_jx, g_jy;
+
+static int walk1(int v) {
+  v += (rand() % 3) - 1; /* -1, 0, +1 */
+  if (v > TK_JITTER_PX) v = TK_JITTER_PX;
+  if (v < -TK_JITTER_PX) v = -TK_JITTER_PX;
+  return v;
 }
 
 void ui_jitter_nudge(void) {
-  /* R7: label-only minute ticks in long-dwell views move the whole layout
-   * without a rebuild — same burn-in defense, no re-layout */
-  if (g_jitter) jitter_roll();
+  if (!g_jitter) return;
+  g_jx = walk1(g_jx);
+  g_jy = walk1(g_jy);
+  lv_obj_set_pos(g_jitter, g_jx, g_jy);
 }
 
 void ui_render(const model_nearby_t *model, const ui_state_t *state) {
@@ -403,7 +414,7 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
   g_jitter = lv_obj_create(g_root);
   ui_style_plain(g_jitter);
   lv_obj_set_size(g_jitter, TK_SCREEN_W, TK_SCREEN_H);
-  jitter_roll();
+  lv_obj_set_pos(g_jitter, g_jx, g_jy); /* keep the current (idle-drift) offset */
 
   build_chrome(state, sys_partial(state, model));
 
