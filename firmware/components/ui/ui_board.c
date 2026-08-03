@@ -7,8 +7,9 @@
  * layout hangs off one jitter container so the spec's ±4 px burn-in offset
  * is a single position change on full renders.
  *
- * Known M1 approximations (documented, deliberate):
- *  - Fonts: built-in Montserrat mapped 15→14, 17→16, 25→24, 27→26.
+ * Fonts are IBM Plex Sans at the handoff's true ramp with tabular numerals
+ * (TK_FONT_* tokens in ui_tokens.h; plan U6). Known approximations
+ * (documented, deliberate):
  *  - The empty-state "dashed" ring renders as a solid 2 px ring (LVGL
  *    borders don't dash); revisit in the font/polish pass.
  *  - Offline banner copy says "retrying automatically" (shake lands in M2).
@@ -94,7 +95,7 @@ static void build_chrome(const ui_state_t *st) {
 
   char buf[24];
   chip_text(buf, sizeof(buf), st);
-  g_chip_label = make_label(fresh, buf, &lv_font_montserrat_16, chip_color(st));
+  g_chip_label = make_label(fresh, buf, TK_FONT_CHIP, chip_color(st));
   lv_obj_set_style_bg_color(g_chip_dot, hex(chip_color(st)), 0);
 
   /* battery: outline glyph approximated as a bordered rect + fill bar */
@@ -122,7 +123,7 @@ static void build_chrome(const ui_state_t *st) {
   }
   if (st->battery_pct >= 0) snprintf(buf, sizeof(buf), "%d%%", st->battery_pct);
   else snprintf(buf, sizeof(buf), "--%%");
-  g_batt_label = make_label(batt, buf, &lv_font_montserrat_16, TK_TEXT_BATTERY);
+  g_batt_label = make_label(batt, buf, TK_FONT_CHIP, TK_TEXT_BATTERY);
 }
 
 static void build_mode_dots(uint8_t active_idx) {
@@ -164,10 +165,10 @@ static void build_stop_dots(uint8_t count, uint8_t active) {
 
 static const lv_font_t *header_font(size_t name_len, bool *two_line) {
   *two_line = false;
-  if (name_len <= 12) return &lv_font_montserrat_30;
-  if (name_len <= 18) return &lv_font_montserrat_26; /* handoff 27 → 26 */
+  if (name_len <= 12) return TK_FONT_TITLE_LG;
+  if (name_len <= 18) return TK_FONT_TITLE_MD;
   *two_line = true;
-  return &lv_font_montserrat_24;
+  return TK_FONT_TITLE_SM;
 }
 
 static void build_header(const model_rail_system_t *rail, const model_stop_t *stop,
@@ -199,10 +200,12 @@ static void build_header(const model_rail_system_t *rail, const model_stop_t *st
   lv_obj_set_style_pad_ver(pill, 5, 0);
   char pill_text[40];
   const char *dir0 = rail->direction_labels[0][0] ? rail->direction_labels[0] : "Dir 0";
-  snprintf(pill_text, sizeof(pill_text), "%s  " LV_SYMBOL_SHUFFLE, dir0);
-  make_label(pill, pill_text, &lv_font_montserrat_14, TK_TEXT_MUTED); /* 15 → 14 */
+  /* real ⇅ (U+21C5, merged from DejaVu) — the Plex faces carry no
+   * FontAwesome symbols, so LV_SYMBOL_* would render as fallback boxes */
+  snprintf(pill_text, sizeof(pill_text), "%s  \xE2\x87\x85", dir0);
+  make_label(pill, pill_text, TK_FONT_PILL, TK_TEXT_MUTED);
 
-  make_label(sub, stop->distance_label, &lv_font_montserrat_14, TK_TEXT_MUTED);
+  make_label(sub, stop->distance_label, TK_FONT_SUB, TK_TEXT_MUTED);
 }
 
 static void build_bullet(lv_obj_t *cluster, const model_route_t *route, uint32_t color,
@@ -226,9 +229,9 @@ static void build_bullet(lv_obj_t *cluster, const model_route_t *route, uint32_t
   if (!pill && idx > 0) {
     lv_obj_set_style_margin_left(b, -TK_BULLET_OVERLAP, 0);
   }
-  const lv_font_t *f = pill ? (strlen(route->label) > 4 ? &lv_font_montserrat_16
-                                                        : &lv_font_montserrat_20)
-                            : &lv_font_montserrat_24; /* 25 → 24 */
+  const lv_font_t *f = pill ? (strlen(route->label) > 4 ? TK_FONT_CHIP
+                                                        : TK_FONT_DIRECTION)
+                            : TK_FONT_BULLET;
   lv_obj_t *l = make_label(b, route->label, f, text_color);
   lv_obj_center(l);
 }
@@ -277,7 +280,7 @@ static void build_row(lv_obj_t *parent, const model_trunk_t *t, int row_h) {
     lv_obj_set_style_border_color(badge, hex(TK_BG), 0);
     lv_obj_add_flag(badge, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_obj_align_to(badge, cluster, LV_ALIGN_OUT_TOP_RIGHT, -6, 6);
-    lv_obj_t *bang = make_label(badge, "!", &lv_font_montserrat_14, TK_BG);
+    lv_obj_t *bang = make_label(badge, "!", TK_FONT_SUB, TK_BG);
     lv_obj_center(bang);
   }
 
@@ -291,11 +294,11 @@ static void build_row(lv_obj_t *parent, const model_trunk_t *t, int row_h) {
   int cluster_w = t->route_count * (TK_BULLET_D - TK_BULLET_OVERLAP) + TK_BULLET_OVERLAP;
   lv_obj_align(mid, LV_ALIGN_LEFT_MID, cluster_w + TK_ROW_GAP, 0);
   lv_obj_t *hs = make_label(mid, a && a->headsign[0] ? a->headsign : "—",
-                            &lv_font_montserrat_18, TK_TEXT_BODY);
+                            TK_FONT_HEADSIGN, TK_TEXT_BODY);
   lv_obj_set_width(hs, 160);
   lv_label_set_long_mode(hs, LV_LABEL_LONG_DOT);
   if (alerted && t->alert.text[0]) {
-    lv_obj_t *sub = make_label(mid, t->alert.text, &lv_font_montserrat_14,
+    lv_obj_t *sub = make_label(mid, t->alert.text, TK_FONT_SUB,
                                delay ? TK_ALERT : TK_TEXT_MUTED);
     lv_obj_set_width(sub, 160);
     lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
@@ -313,8 +316,8 @@ static void build_row(lv_obj_t *parent, const model_trunk_t *t, int row_h) {
    * estimates, never presented as live (spec constraint #4 / R6). */
   char num[12] = "—";
   if (a) snprintf(num, sizeof(num), "%s%d", g_degraded_at_show ? "~" : "", a->eta_min);
-  make_label(cd, num, &lv_font_montserrat_36, delay ? TK_ALERT : TK_TEXT_PRIMARY);
-  if (a) make_label(cd, "min", &lv_font_montserrat_14, TK_TEXT_MUTED);
+  make_label(cd, num, TK_FONT_COUNTDOWN, delay ? TK_ALERT : TK_TEXT_PRIMARY);
+  if (a) make_label(cd, "min", TK_FONT_SUB, TK_TEXT_MUTED);
 }
 
 static void build_rows(const model_stop_t *stop, bool two_line) {
@@ -350,7 +353,7 @@ static void build_rows(const model_stop_t *stop, bool two_line) {
       lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
       lv_obj_set_style_bg_color(b, hex(t->color), 0);
       if (t->route_count > 0) {
-        lv_obj_t *l = make_label(b, t->routes[0].label, &lv_font_montserrat_14, t->text_color);
+        lv_obj_t *l = make_label(b, t->routes[0].label, TK_FONT_SUB, t->text_color);
         lv_obj_center(l);
       }
     }
@@ -416,10 +419,10 @@ static void build_no_location(void) {
   lv_obj_set_style_border_color(ring, hex(TK_EMPTY_RING), 0);
   lv_obj_align(ring, LV_ALIGN_TOP_MID, 0, 150);
 
-  lv_obj_t *title = make_label(g_content, "Can't find you", &lv_font_montserrat_24, TK_EMPTY_TITLE);
+  lv_obj_t *title = make_label(g_content, "Can't find you", TK_FONT_TITLE_SM, TK_EMPTY_TITLE);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 230);
   lv_obj_t *body = make_label(g_content, "No known WiFi networks nearby.\nRetrying automatically.",
-                              &lv_font_montserrat_16, TK_TEXT_MUTED); /* 17 → 16 */
+                              TK_FONT_BODY, TK_TEXT_MUTED);
   lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 270);
 }
@@ -428,7 +431,7 @@ static void build_offline_banner(const ui_state_t *st) {
   char text[64];
   snprintf(text, sizeof(text), "last fetch %lum ago — retrying automatically",
            (unsigned long)(st->secs_since_fetch / 60u));
-  lv_obj_t *banner = make_label(g_jitter, text, &lv_font_montserrat_14, TK_OFFLINE); /* 15→14 */
+  lv_obj_t *banner = make_label(g_jitter, text, TK_FONT_PILL, TK_OFFLINE);
   lv_obj_align(banner, LV_ALIGN_BOTTOM_MID, 0, -40);
 }
 
@@ -476,13 +479,13 @@ void ui_board_show(const model_nearby_t *model, const ui_state_t *state) {
   uint8_t idx = state->stop_idx < rail->stop_count ? state->stop_idx : 0;
   if (rail->stop_count == 0) {
     /* empty-but-live: handoff empty-mode with nearest distance */
-    lv_obj_t *title = make_label(g_content, "No trains nearby", &lv_font_montserrat_24,
+    lv_obj_t *title = make_label(g_content, "No trains nearby", TK_FONT_TITLE_SM,
                                  TK_EMPTY_TITLE);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 210);
     if (rail->nearest_distance_label[0]) {
       char body[64];
       snprintf(body, sizeof(body), "Closest station is %s away.", rail->nearest_distance_label);
-      lv_obj_t *b = make_label(g_content, body, &lv_font_montserrat_16, TK_TEXT_MUTED);
+      lv_obj_t *b = make_label(g_content, body, TK_FONT_BODY, TK_TEXT_MUTED);
       lv_obj_align(b, LV_ALIGN_TOP_MID, 0, 250);
     }
   } else {
