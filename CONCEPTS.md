@@ -14,7 +14,13 @@ A hand-maintained Feed definition that always wins over catalog data and keeps a
 Marking a catalog Feed non-active because a Curated Seed already covers the same transit system, so location queries never return the same system twice. Suppressed rows stay in the database as a record of the decision; the suppression list is maintained alongside the Curated Seeds.
 
 ### Adapter
-The named strategy for parsing a Feed's realtime data (e.g., plain GTFS-RT vs. the NYCT-extended variant). Stored per Feed so adding an agency is configuration, not code.
+The named strategy for parsing a Feed's realtime data (e.g., plain GTFS-RT vs. the NYCT-extended variant). Stored per Feed so adding an agency is configuration, not code. Group-capable Adapters additionally know how to fan a Feed out into its Feed Groups.
+
+### Feed Group
+An independently fetched slice of a Feed's realtime data (NYC subway publishes eight, split by route family). Each Feed Group is polled and cached in isolation, so one broken group cannot stale the others; a Feed with no such split is a single group.
+
+### Snapshot
+The cached, reduced realtime state for one Feed Group: upcoming arrivals per Platform plus the freshness stamp consumers judge staleness by. Snapshots are replaced whole, only ever by strictly newer data, and survive the poller's sleep so a waking reader is served instantly — a Snapshot that has never existed is a distinct fact ("no data yet") from an empty one ("no service").
 
 ### Station and Platform
 A Station is the parent place riders name ("Jay St–MetroTech"); Platforms are its directional children where vehicles actually stop. Realtime and schedule data reference Platforms; user-facing grouping happens by rolling Platforms up to their parent Station at query time.
