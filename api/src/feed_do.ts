@@ -46,12 +46,16 @@ interface FeedConfig {
   rtNeedsKey: boolean;
 }
 
-async function gzipBytes(data: Uint8Array, mode: "gzip" | "gunzip"): Promise<Uint8Array> {
-  const stream = new Blob([data.slice().buffer as ArrayBuffer]).stream().pipeThrough(
-    mode === "gzip" ? new CompressionStream("gzip") : new DecompressionStream("gzip"),
-  );
+async function pipeBytes(
+  data: Uint8Array,
+  transform: CompressionStream | DecompressionStream,
+): Promise<Uint8Array> {
+  const stream = new Blob([data.slice().buffer as ArrayBuffer]).stream().pipeThrough(transform);
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
+
+const gzip = (data: Uint8Array) => pipeBytes(data, new CompressionStream("gzip"));
+const gunzip = (data: Uint8Array) => pipeBytes(data, new DecompressionStream("gzip"));
 
 /** RT_FEED_KEYS secret (JSON feed id → key), parsed once per isolate. A
  * malformed secret degrades exactly like a missing one — the parse error is
@@ -152,7 +156,7 @@ export class FeedDO extends DurableObject<Env> {
         joined.set(part, offset);
         offset += part.byteLength;
       }
-      const json = new TextDecoder().decode(await gzipBytes(joined, "gunzip"));
+      const json = new TextDecoder().decode(await gunzip(joined));
       return JSON.parse(json) as Snapshot;
     } catch (error) {
       console.warn(`${doTag(this.identity)} chunked snapshot restore failed; clearing:`, error);
@@ -360,7 +364,7 @@ export class FeedDO extends DurableObject<Env> {
       return;
     }
 
-    const gz = await gzipBytes(jsonBytes, "gzip");
+    const gz = await gzip(jsonBytes);
     const chunkCount = Math.ceil(gz.length / CHUNK_BYTES);
     if (chunkCount > MAX_CHUNKS) {
       // Refusal, not a throw: memory serves fresh, persisted state stays at
