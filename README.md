@@ -9,7 +9,9 @@ in under a second.
 **Project status: early.** Phase 1 (data model + ingest), Phase 2 (realtime
 Durable Objects), and Phase 3 (the `/v1/nearby` read API, the `/v1/departures`
 leave-by timer endpoint with server-side walk times, WiFi geolocation,
-and Citi Bike GBFS) are built. Firmware and the config UI are specified in
+and Citi Bike GBFS) are built, with all three NYC systems live — subway,
+**MTA Bus** (six static GTFS sources + the citywide Bus Time realtime feed),
+and Citi Bike. Firmware and the config UI are specified in
 [`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md) and land in
 later phases.
 
@@ -86,8 +88,10 @@ uv run gtfs-compass-ingest all             # catalog + subway static + Citi Bike
 ```
 
 A full run seeds the feeds catalog, then loads ~1,500 subway stops,
-29 routes, ~2,000 stop-route edges, per-direction headsigns, and ~2,000+
-Citi Bike stations with dock capacity. Verify with:
+29 routes, ~2,000 stop-route edges, per-direction headsigns, the MTA bus
+network (~12–16k stops and several hundred routes merged from six borough
+zips into the single `mta-bus` feed), and ~2,000+ Citi Bike stations with
+dock capacity. Verify with:
 
 ```bash
 cd ../api
@@ -156,11 +160,23 @@ One endpoint does the thinking; the device is a dumb renderer.
 
 **`GET /v1/nearby?lat=&lon=&modes=rail,bus,bike`** — nearby stations with
 realtime arrivals, grouped into color trunks with per-train headsigns,
-direction labels, pre-formatted distance labels, and bike station counts:
+direction labels, pre-formatted distance labels, and bike station counts.
+All three modes are live: bus stops split arrivals by the trip's
+`direction_id` (curb stops have no platform suffixes) with headsigns from
+the static schedule's dominant per-direction labels, and render with
+`direction_labels: null` — the device shows compass tags:
 
 ```bash
-curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/v1/nearby?lat=40.6923&lon=-73.9873&modes=rail,bike"
+curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/v1/nearby?lat=40.6923&lon=-73.9873&modes=rail,bus,bike"
 ```
+
+**MTA Bus Time key:** MTA
+[documents](https://bustime.mta.info/wiki/Developers/GTFSRt) an API key as
+required for the bus realtime feed but does not currently enforce it
+(verified live 2026-08-03). The Worker polls keyless until a key is
+installed as the `RT_FEED_KEYS` secret (see `.env.example`); a keyless
+401/403 logs a distinct warning so enforcement onset is visible, and the
+feed then degrades to labeled staleness — never wrong data.
 
 **`POST /v1/nearby`** — the device path: one round trip from WiFi scan to
 board. The body carries the scan; the Worker resolves a position and
@@ -374,7 +390,7 @@ cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 This project redistributes transit data published by agencies under their
 own terms. The catalog stores each feed's license URL (`feeds.license_url`)
 precisely because terms vary — surface it wherever feed data is shown.
-NYC subway data comes from the
+NYC subway and bus data come from the
 [MTA's developer feeds](https://www.mta.info/developers). Citi Bike station
 data is used under the
 [Citi Bike data sharing policy](https://citibikenyc.com/data-sharing-policy).
