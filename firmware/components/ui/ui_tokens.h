@@ -75,8 +75,19 @@
 #define TK_EMPTY_TITLE_Y 230
 #define TK_EMPTY_BODY_Y 270
 
-/* Detail / nearby stubs (U3; U4/U5 own the full §2/§4 geometry) */
-#define TK_DETAIL_HEADER_TOP 44 /* §2 header top */
+/* Trunk detail (handoff §2, plan U4) */
+#define TK_DETAIL_HEADER_TOP 44    /* §2 header top */
+#define TK_DETAIL_HEADER_PAD_B 14  /* header bottom pad above the hairline */
+#define TK_DETAIL_BULLET_D 52      /* header bullet cluster diameter */
+#define TK_DETAIL_BULLET_OVERLAP 13
+#define TK_DETAIL_ROW_BULLET_D 44  /* arrivals-row bullet (24 px label) */
+#define TK_DETAIL_ROWS_TOP 144     /* arrivals list: top=144 → bottom=64 */
+#define TK_DETAIL_ROWS_BOTTOM 64
+#define TK_DETAIL_ROW_H 86
+#define TK_DETAIL_HINT_BOTTOM 36   /* footer hint center */
+#define TK_TEXT_FLIP_GLYPH 0x68686E /* ⇅ in the detail header */
+
+/* Nearby stub (U3; U5 owns the full §4 geometry) */
 #define TK_NEARBY_HEADER_TOP 48 /* §4 header top */
 #define TK_NEARBY_ROWS_TOP 120
 #define TK_NEARBY_ROW_H 72
