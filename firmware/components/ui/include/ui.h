@@ -46,6 +46,13 @@ void ui_tick(const ui_state_t *state);
  * minute ticks in long-dwell views). */
 void ui_jitter_nudge(void);
 
+/* R7 minute-decrement hook for the detail view: the caller has already
+ * decremented the model's etas; this rewrites the visible countdown labels
+ * in place — no tree rebuild, scroll offset untouched, so it needs no
+ * press/animation gate. No-op unless the last full render was this detail
+ * view. */
+void ui_detail_minute_tick(const model_nearby_t *model, const ui_state_t *state);
+
 /* Tap router: resolve (x, y) against the current view's tap targets (pill,
  * trunk rows, ‹ back, bike board) and apply the navigation. Returns true
  * when state changed and a re-render is due. */

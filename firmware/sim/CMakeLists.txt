@@ -25,6 +25,7 @@ add_executable(sim
   ${FW}/components/model/model.c
   ${FW}/components/ui/ui_board.c
   ${FW}/components/ui/ui_views.c
+  ${FW}/components/ui/ui_detail.c
   ${FW}/components/ui/ui_state.c
   ${FW}/components/ui/ui_nav.c
   ${FW}/components/ui/ui_input.c

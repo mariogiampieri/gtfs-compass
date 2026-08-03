@@ -23,8 +23,8 @@
  * between press and release, so press-time and release-time hit-testing
  * see the same objects (KTD-2's snapshot requirement).
  *
- * DETAIL and BIKE_NEARBY render minimal honest stubs (station/trunk facts +
- * back affordance) that U4/U5 replace; navigation to/from them is real.
+ * DETAIL is the real §2 renderer (ui_detail.c, plan U4); BIKE_NEARBY still
+ * renders a minimal honest stub that U5 replaces.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,8 +41,9 @@ static lv_obj_t *g_jitter;  /* full-screen container carrying the offset */
 static lv_obj_t *g_content; /* everything below the chip */
 static lv_obj_t *g_chip_dot;
 static lv_obj_t *g_chip_label;
-static lv_obj_t *g_back;         /* ‹ back affordance of detail/nearby stubs */
+static lv_obj_t *g_back;         /* ‹ back affordance of the nearby stub */
 static ui_board_hits_t g_hits;   /* rail board tap targets */
+static ui_detail_hits_t g_detail_hits; /* trunk detail tap targets (U4) */
 static bool g_skeleton_shown;    /* skeleton owns content opacity (its shimmer
                                     anim would fight the 60% degraded set) */
 
@@ -369,45 +370,12 @@ static const sys_render_fn k_sys_render[UI_SYS_COUNT] = {
     [UI_SYS_BIKE] = render_bike_board,
 };
 
-/* ---------- detail / nearby stubs (replaced by U4/U5) ---------- */
+/* ---------- nearby stub (replaced by U5) ---------- */
 
 static lv_obj_t *build_back(lv_obj_t *content) {
   lv_obj_t *back = ui_make_label(content, "\xE2\x80\xB9 back", TK_FONT_SUB, TK_TEXT_FAINT);
   lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -TK_SIDE_INSET, TK_DETAIL_HEADER_TOP);
   return back;
-}
-
-static void render_detail_stub(lv_obj_t *content, const model_nearby_t *model,
-                               const ui_state_t *state) {
-  const model_rail_system_t *rail = &model->rail;
-  uint8_t sidx = state->stop_idx[UI_SYS_RAIL] < rail->stop_count
-                     ? state->stop_idx[UI_SYS_RAIL]
-                     : 0;
-  const model_stop_t *stop = &rail->stops[sidx];
-  uint8_t tidx = state->trunk_idx < stop->trunk_count ? state->trunk_idx : 0;
-  const model_trunk_t *trunk = &stop->trunks[tidx];
-
-  g_back = build_back(content);
-
-  lv_obj_t *station = ui_make_label(content, stop->name, TK_FONT_SUB, TK_TEXT_MUTED);
-  lv_obj_set_width(station, TK_SCREEN_W - 2 * TK_SIDE_INSET - 70);
-  lv_label_set_long_mode(station, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(station, TK_SIDE_INSET, TK_DETAIL_HEADER_TOP);
-
-  const char *dir_label = rail->direction_labels[state->dir][0]
-                              ? rail->direction_labels[state->dir]
-                              : "";
-  lv_obj_t *dir = ui_make_label(content, dir_label, TK_FONT_DIRECTION, TK_TEXT_BODY);
-  lv_obj_set_pos(dir, TK_SIDE_INSET, TK_DETAIL_HEADER_TOP + 24);
-
-  char routes[64] = "";
-  size_t off = 0;
-  for (int i = 0; i < trunk->route_count && off < sizeof(routes) - 8; i++) {
-    off += (size_t)snprintf(routes + off, sizeof(routes) - off, "%s%s", i ? " " : "",
-                            trunk->routes[i].label);
-  }
-  lv_obj_t *r = ui_make_label(content, routes, TK_FONT_TITLE_LG, trunk->color);
-  lv_obj_align(r, LV_ALIGN_TOP_MID, 0, 200);
 }
 
 static void render_nearby_stub(lv_obj_t *content, const model_nearby_t *model,
@@ -456,6 +424,8 @@ void ui_jitter_nudge(void) {
 
 void ui_render(const model_nearby_t *model, const ui_state_t *state) {
   memset(&g_hits, 0, sizeof(g_hits));
+  memset(&g_detail_hits, 0, sizeof(g_detail_hits));
+  ui_detail_prepare(state); /* countdown labels are about to dangle (U4) */
   g_back = NULL;
   g_skeleton_shown = false;
 
@@ -490,7 +460,9 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
       k_sys_render[state->sys < UI_SYS_COUNT ? state->sys : 0](g_content, model, state,
                                                                degraded);
       break;
-    case UI_VIEW_DETAIL: render_detail_stub(g_content, model, state); break;
+    case UI_VIEW_DETAIL:
+      ui_detail_render(g_content, model, state, degraded, &g_detail_hits);
+      break;
     case UI_VIEW_BIKE_NEARBY: render_nearby_stub(g_content, model, state); break;
   }
   build_mode_dots(state->sys);
@@ -532,8 +504,17 @@ bool ui_views_on_tap(int32_t x, int32_t y, const model_nearby_t *model, ui_state
       }
       return false;
     case UI_VIEW_DETAIL:
+      /* §2: ⇅ cluster flips in place, ‹ back pops; anywhere else — nothing
+       * (both targets 44 px padded, KTD-2) */
+      if (g_detail_hits.flip && ui_input_hit(g_detail_hits.flip, x, y, UI_INPUT_HIT_MIN_PX)) {
+        return ui_nav_flip_dir(state);
+      }
+      if (g_detail_hits.back && ui_input_hit(g_detail_hits.back, x, y, UI_INPUT_HIT_MIN_PX)) {
+        return ui_nav_back(state);
+      }
+      return false;
     case UI_VIEW_BIKE_NEARBY:
-      /* stubs: only the back affordance is live (rows/flip land in U4/U5) */
+      /* stub: only the back affordance is live (rows land in U5) */
       if (g_back && ui_input_hit(g_back, x, y, UI_INPUT_HIT_MIN_PX)) {
         return ui_nav_back(state);
       }

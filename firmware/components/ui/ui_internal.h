@@ -37,4 +37,25 @@ typedef struct {
 void ui_board_render(lv_obj_t *content, const model_rail_system_t *rail,
                      const ui_state_t *state, bool degraded, ui_board_hits_t *hits);
 
+/* Trunk-detail tap targets (plan U4; same 44 px padded hit-region rules). */
+typedef struct {
+  lv_obj_t *flip; /* header direction cluster incl. ⇅ — tap flips dir */
+  lv_obj_t *back; /* ‹ back */
+} ui_detail_hits_t;
+
+/* The trunk detail renderer (ui_detail.c, handoff §2): header cluster,
+ * alert banner, the ONLY LVGL-scrollable object (arrivals list), footer
+ * hint. Renders directions[state->dir] of the open trunk into content;
+ * fills *hits. Restores the previous scroll offset when re-rendering the
+ * same (trunk_key, dir), clamped to the new content. */
+void ui_detail_render(lv_obj_t *content, const model_nearby_t *model,
+                      const ui_state_t *state, bool degraded, ui_detail_hits_t *hits);
+
+/* Called by ui_render() before every tree teardown: drops the countdown
+ * label pointers of the last detail render (they are about to dangle) and,
+ * when the view being rendered is not DETAIL, forgets the remembered scroll
+ * offset — so reopening a trunk starts at the top while same-trunk
+ * refreshes preserve it. */
+void ui_detail_prepare(const ui_state_t *state);
+
 #endif /* GTFS_COMPASS_UI_INTERNAL_H */

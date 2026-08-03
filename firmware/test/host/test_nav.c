@@ -192,6 +192,20 @@ static void test_flip_dir_is_global_toggle(void) {
   TEST_ASSERT_EQUAL(0, g_state.dir);
 }
 
+/* U4/R4: the detail-header ⇅ flips IN PLACE — the view and the open trunk
+ * identity are untouched, so the renderer swaps the arrival set without a
+ * pop (and its scroll memory resets on the dir change, an LVGL fact the
+ * GC_DUMP captures cover). */
+static void test_flip_in_detail_keeps_view_and_trunk(void) {
+  fresh_board();
+  TEST_ASSERT_TRUE(ui_nav_open_detail(&g_state, &g_model, 1));
+  TEST_ASSERT_TRUE(ui_nav_flip_dir(&g_state));
+  TEST_ASSERT_EQUAL(UI_VIEW_DETAIL, g_state.view);
+  TEST_ASSERT_EQUAL_STRING("k2", g_state.trunk_key);
+  TEST_ASSERT_EQUAL(1, g_state.trunk_idx);
+  TEST_ASSERT_EQUAL(1, g_state.dir);
+}
+
 /* ---------- per-system ages + deferred apply (KTD-7, R6) ---------- */
 
 static void test_ages_seed_per_system(void) {
@@ -225,6 +239,7 @@ int main(void) {
   RUN_TEST(test_nav_identity_survives_shuffled_reconcile);
   RUN_TEST(test_nearby_open_and_back_keep_selection);
   RUN_TEST(test_flip_dir_is_global_toggle);
+  RUN_TEST(test_flip_in_detail_keeps_view_and_trunk);
   RUN_TEST(test_ages_seed_per_system);
   RUN_TEST(test_deferred_apply_seeds_age_with_defer_time);
   return UNITY_END();

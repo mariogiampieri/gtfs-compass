@@ -18,6 +18,7 @@
  *   GC_VIEW=detail[:N] | bike | bus | nearby
  *       set the view/system before the GC_DUMP settle loop (R10: headless
  *       capture reaches every screen); also works windowed
+ *   GC_DIR=1   flip the global direction before GC_VIEW applies (U4)
  *
  * No render deferral here: the sim has no async model source — fixtures
  * apply synchronously, so the R6 deferral path lives in main/main.c only.
@@ -169,6 +170,10 @@ int main(int argc, char **argv) {
                                                  .on_tap = input_tap,
                                                  .on_swipe = input_swipe});
 
+  /* GC_DIR=1 flips the global direction before GC_VIEW runs — headless
+   * capture of the dir-flipped board/detail (plan U4 verification). */
+  const char *dir_env = getenv("GC_DIR");
+  if (dir_env && atoi(dir_env) == 1) g_state.dir = 1;
   const char *view_env = getenv("GC_VIEW");
   if (view_env) apply_view_env(view_env);
 

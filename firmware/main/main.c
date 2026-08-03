@@ -207,10 +207,15 @@ static void tick_cb(lv_timer_t *t) {
       }
     }
     if (g_state.view == UI_VIEW_BOARD && g_state.sys == UI_SYS_RAIL) {
-      gc_request_render(); /* the only view whose labels change in U3 */
+      gc_request_render(); /* full render through the deferral gate */
       return;
     }
-    /* detail stub (U4 adds label updates) / bus / bike: long-dwell views
+    if (g_state.view == UI_VIEW_DETAIL) {
+      /* R7: countdown labels rewritten in place — no rebuild, scroll
+       * preserved, so no press/animation gate is needed (U4) */
+      ui_detail_minute_tick(g_ui_model, &g_state);
+    }
+    /* bus / bike / detail: long-dwell views
      * get the burn-in nudge instead of a rebuild (R7) — skipped while
      * pressed (a moving tree under a finger shifts hit targets) */
     if (!ui_input_busy()) ui_jitter_nudge();
