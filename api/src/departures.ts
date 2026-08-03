@@ -1,5 +1,4 @@
-import { FETCH_TIMEOUT_MS } from "./do_shared";
-import { groupForRoute } from "./nearby";
+import { fetchGroupSnapshots, groupForRoute } from "./nearby";
 import { normalizeColor, paletteColor, textColorFor } from "./presentation";
 import { type WalkOrigin, computeWalk, walkMaxAccuracyM } from "./walk";
 
@@ -64,11 +63,6 @@ interface StopRouteRow {
   color: string | null;
   text_color: string | null;
   route_type: number | null;
-}
-
-interface SnapshotArrival {
-  routeId: string;
-  time: number;
 }
 
 export async function composeDepartures(
@@ -189,11 +183,12 @@ async function composeFeed(
     console.warn(`[departures] ${feedId}: ${unmappedRoutes} route(s) with no feed-group mapping`);
   }
 
-  const { results: snapshots, anyFailed } = await fetchGroupSnapshots(
+  const { results: snapshots, anySourceFailed: anyFailed } = await fetchGroupSnapshots(
     env,
     feedId,
     [...new Set(groupByRoute.values())],
     stopIds,
+    "[departures]",
   );
 
   const entries = new Map<string, DepartureEntry[]>();
@@ -245,46 +240,4 @@ async function composeFeed(
     .map((s) => s.fetchedAt)
     .filter((t): t is number => t !== null);
   return { feedId, entries, walk, stamps, anyFailed };
-}
-
-/** One batch snapshot read per needed group, concurrent, failure-isolated
- * (nearby.ts precedent: a failed or cold group degrades to never-fetched
- * semantics and flips `partial`, never a 500). */
-async function fetchGroupSnapshots(
-  env: Env,
-  feedId: string,
-  neededGroups: string[],
-  stopIds: string[],
-): Promise<{
-  results: Map<string, { fetchedAt: number | null; stops: Record<string, SnapshotArrival[]> }>;
-  anyFailed: boolean;
-}> {
-  const results = new Map<string, { fetchedAt: number | null; stops: Record<string, SnapshotArrival[]> }>();
-  let anyFailed = false;
-  const settled = await Promise.allSettled(
-    neededGroups.map(async (group) => {
-      const stub = env.FEED_DO.get(env.FEED_DO.idFromName(`${feedId}:${group}`));
-      const res = await stub.fetch(
-        `https://do/stops?ids=${stopIds.map(encodeURIComponent).join(",")}&feed=${encodeURIComponent(feedId)}&group=${encodeURIComponent(group)}`,
-        { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
-      );
-      if (!res.ok) throw new Error(`group ${group}: ${res.status}`);
-      const body = await res.json<{
-        fetched_at: number | null;
-        stops: Record<string, SnapshotArrival[]>;
-      }>();
-      return { group, body };
-    }),
-  );
-  for (const [i, result] of settled.entries()) {
-    if (result.status === "fulfilled") {
-      const { fetched_at, stops } = result.value.body;
-      results.set(result.value.group, { fetchedAt: fetched_at, stops });
-      if (fetched_at === null) anyFailed = true; // cold group: no data yet
-    } else {
-      console.warn(`[departures] ${feedId}:${neededGroups[i]} snapshot fetch failed:`, result.reason);
-      anyFailed = true;
-    }
-  }
-  return { results, anyFailed };
 }
