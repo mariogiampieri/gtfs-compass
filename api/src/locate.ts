@@ -19,10 +19,17 @@ export interface LocateFix {
   provider: string;
 }
 
+/**
+ * "not-found": the provider answered authoritatively that it cannot place
+ * this set (cacheable negative). "unavailable": timeout/network/5xx/garbage —
+ * says nothing about the set, so it must never be cached as a negative.
+ */
+export type ProviderOutcome = LocateFix | "not-found" | "unavailable";
+
 export type LocateProvider = (
   bssids: WifiAccessPoint[],
   env: Env,
-) => Promise<LocateFix | null>;
+) => Promise<ProviderOutcome>;
 
 export type ResolvedLocation =
   | { known: true; lat: number; lon: number; accuracy: number; provider: string }
@@ -71,24 +78,25 @@ const beacondb: LocateProvider = async (bssids, env) => {
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
-    return null; // timeout or network error → chain degrades, never throws
+    return "unavailable"; // timeout or network error → chain degrades, never throws
   }
-  if (res.status !== 200) return null; // includes the structured 404 notFound
+  if (res.status === 404) return "not-found"; // structured notFound: authoritative miss
+  if (res.status !== 200) return "unavailable";
   let body: unknown;
   try {
     body = await res.json();
   } catch {
-    return null;
+    return "unavailable";
   }
-  if (typeof body !== "object" || body === null) return null;
+  if (typeof body !== "object" || body === null) return "unavailable";
   // Defensive: a fallback-derived fix (e.g. {"fallback":"ipf"}) is never a position.
-  if ("fallback" in body) return null;
+  if ("fallback" in body) return "not-found";
   const b = body as { location?: { lat?: unknown; lng?: unknown }; accuracy?: unknown };
   const lat = b.location?.lat;
   const lon = b.location?.lng;
   const accuracy = b.accuracy;
   if (typeof lat !== "number" || typeof lon !== "number" || typeof accuracy !== "number") {
-    return null;
+    return "unavailable";
   }
   return { lat, lon, accuracy, provider: "beacondb" };
 };
@@ -107,17 +115,31 @@ const providers: LocateProvider[] = [
 /**
  * Run the chain: first provider fix wins, then the accuracy gate is applied
  * AFTER the providers (the gate lives in the chain, not in any provider).
+ * `definitive` is false only when a transient provider failure means the
+ * negative says nothing about this BSSID set.
  */
-async function runChain(bssids: WifiAccessPoint[], env: Env): Promise<LocateFix | null> {
+async function runChain(
+  bssids: WifiAccessPoint[],
+  env: Env,
+): Promise<{ fix: LocateFix | null; definitive: boolean }> {
   let fix: LocateFix | null = null;
+  let sawTransient = false;
   for (const provider of providers) {
-    fix = await provider(bssids, env);
-    if (fix) break;
+    const outcome = await provider(bssids, env);
+    if (outcome === "unavailable") {
+      sawTransient = true;
+      continue;
+    }
+    if (outcome === "not-found") continue;
+    fix = outcome;
+    break;
   }
-  if (!fix) return null;
+  if (!fix) return { fix: null, definitive: !sawTransient };
   const maxAccuracy = intVar(env.LOCATE_MAX_ACCURACY_M, DEFAULT_MAX_ACCURACY_M);
-  if (fix.accuracy > maxAccuracy) return null; // never pass a too-coarse fix through
-  return fix;
+  if (fix.accuracy > maxAccuracy) {
+    return { fix: null, definitive: true }; // never pass a too-coarse fix through
+  }
+  return { fix, definitive: true };
 }
 
 /** Lowercase, drop malformed entries, dedupe by MAC (first observation wins). */
@@ -126,7 +148,9 @@ function normalizeBssids(raw: unknown[]): WifiAccessPoint[] {
   for (const entry of raw) {
     if (typeof entry !== "object" || entry === null) continue;
     const { macAddress, signalStrength } = entry as Record<string, unknown>;
-    if (typeof macAddress !== "string" || macAddress.length === 0) continue;
+    if (typeof macAddress !== "string" || macAddress.length === 0 || macAddress.length > 64) {
+      continue; // length cap: a MAC is 17 chars; oversized strings are junk or abuse
+    }
     const mac = macAddress.toLowerCase();
     if (byMac.has(mac)) continue;
     byMac.set(mac, {
@@ -166,14 +190,47 @@ export async function resolveLocation(bssids: unknown[], env: Env): Promise<Reso
   }
   console.log("[locate-cache] miss");
 
-  const fix = await runChain(normalized, env);
+  const { fix, definitive } = await runChain(normalized, env);
   const value: ResolvedLocation = fix
     ? { known: true, lat: fix.lat, lon: fix.lon, accuracy: fix.accuracy, provider: fix.provider }
     : { known: false };
 
-  if (locateCache.size > 5000) locateCache.clear(); // crude bound, mirrors rateBuckets
-  locateCache.set(key, { expiresMs: now + CACHE_TTL_MS, value });
+  // A provider outage must not pin {known:false} for the TTL — the next scan
+  // should retry the chain the moment the provider recovers.
+  if (fix || definitive) {
+    if (locateCache.size > 5000) locateCache.clear(); // crude bound, mirrors rateBuckets
+    locateCache.set(key, { expiresMs: now + CACHE_TTL_MS, value });
+  }
   return value;
+}
+
+/**
+ * Shared request-body validation for the two endpoints that accept a WiFi
+ * scan (/v1/locate and POST /v1/nearby): JSON parse, array check, size cap —
+ * one implementation so the rules can never drift apart. Returns the parsed
+ * body on success, or a ready 400 Response.
+ */
+export async function readWifiScanBody(
+  request: Request,
+): Promise<{ body: Record<string, unknown>; wifiAccessPoints: unknown[] } | Response> {
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) ?? {};
+  } catch {
+    return Response.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+  const wifiAccessPoints = body.wifiAccessPoints;
+  if (!Array.isArray(wifiAccessPoints)) {
+    return Response.json({ error: "wifiAccessPoints must be an array" }, { status: 400 });
+  }
+  // Reject oversized sets before any hashing or provider call.
+  if (wifiAccessPoints.length > MAX_BSSIDS) {
+    return Response.json(
+      { error: `wifiAccessPoints capped at ${MAX_BSSIDS} entries` },
+      { status: 400 },
+    );
+  }
+  return { body, wifiAccessPoints };
 }
 
 /** Great-circle distance in meters — the geo primitive lives with proximity. */

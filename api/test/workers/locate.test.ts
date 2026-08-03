@@ -517,3 +517,39 @@ describe("haversineM", () => {
     expect(haversineM(40, -73.95, 40.001, -73.95)).toBeCloseTo(111.2, 0);
   });
 });
+
+describe("negative caching (transient vs definitive)", () => {
+  it("does not cache a transient provider failure as {known:false}", async () => {
+    const aps = uniqueAps();
+    beaconHandler = () => new Response("", { status: 500 });
+    expect(await resolveLocation(aps, env)).toEqual({ known: false });
+
+    // Provider recovers: the SAME set must re-consult the chain immediately.
+    const callsBefore = beaconCalls;
+    beaconOk(40.6923, -73.9873, 40);
+    const second = await resolveLocation(aps, env);
+    expect(beaconCalls).toBe(callsBefore + 1);
+    expect(second.known).toBe(true);
+  });
+
+  it("caches the authoritative notFound negative for the TTL", async () => {
+    const aps = uniqueAps();
+    beaconNotFound();
+    expect(await resolveLocation(aps, env)).toEqual({ known: false });
+
+    const callsBefore = beaconCalls;
+    expect(await resolveLocation(aps, env)).toEqual({ known: false });
+    expect(beaconCalls).toBe(callsBefore); // served from cache, no provider call
+  });
+
+  it("drops oversized macAddress strings during normalization", async () => {
+    const aps = [{ macAddress: "aa".repeat(100) }, ...uniqueAps()];
+    beaconOk(40.6923, -73.9873, 40);
+    const result = await resolveLocation(aps, env);
+    expect(result.known).toBe(true);
+    const sent = JSON.parse(String(lastBeaconInit?.body)) as {
+      wifiAccessPoints: unknown[];
+    };
+    expect(sent.wifiAccessPoints).toHaveLength(2); // junk entry never forwarded
+  });
+});

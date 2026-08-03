@@ -380,3 +380,37 @@ describe("batch stop reads", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("batch read hardening", () => {
+  it("keeps prototype-named stop ids as own keys", async () => {
+    const now = nowSec();
+    mockFeedOnce("/gtfs-ace", encodeFeed(now, [["A", "__proto__", now + 120]]));
+    const stub = stubFor("mta-subway:ace-proto");
+    await read(stub, "__proto__");
+    await settleRefresh(stub);
+
+    const res = await stub.fetch(
+      "https://do/stops?ids=__proto__,constructor&feed=mta-subway&group=ace",
+    );
+    const body = await res.json<any>();
+    expect(Array.isArray(body.stops.__proto__)).toBe(true);
+    expect(body.stops.__proto__).toHaveLength(1);
+    expect(body.stops.constructor).toEqual([]); // own key, not Object's
+    assertNoPendingMocks();
+  });
+
+  it("round-trips a stop id containing the ',' separator", async () => {
+    const now = nowSec();
+    mockFeedOnce("/gtfs-ace", encodeFeed(now, [["A", "odd,idN", now + 90]]));
+    const stub = stubFor("mta-subway:ace-comma");
+    await read(stub, "x");
+    await settleRefresh(stub);
+
+    const res = await stub.fetch(
+      `https://do/stops?ids=${encodeURIComponent("odd,idN")}&feed=mta-subway&group=ace`,
+    );
+    const body = await res.json<any>();
+    expect(body.stops["odd,idN"]).toHaveLength(1);
+    assertNoPendingMocks();
+  });
+});

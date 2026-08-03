@@ -7,7 +7,7 @@
  * different fact from empty-but-located systems (200 with empty stops).
  */
 
-import { MAX_BSSIDS, resolveLocation } from "../locate";
+import { readWifiScanBody, resolveLocation } from "../locate";
 import { type FeedInfo, MODES, composeNearby } from "../nearby";
 
 export async function routeNearby(
@@ -30,23 +30,9 @@ export async function routeNearby(
       return Response.json({ error: "lat and lon required" }, { status: 400 });
     }
   } else if (request.method === "POST") {
-    let body: Record<string, unknown>;
-    try {
-      body = (await request.json()) ?? {};
-    } catch {
-      return Response.json({ error: "invalid JSON body" }, { status: 400 });
-    }
-    const wifiAccessPoints = body.wifiAccessPoints;
-    if (!Array.isArray(wifiAccessPoints)) {
-      return Response.json({ error: "wifiAccessPoints must be an array" }, { status: 400 });
-    }
-    if (wifiAccessPoints.length > MAX_BSSIDS) {
-      return Response.json(
-        { error: `wifiAccessPoints capped at ${MAX_BSSIDS} entries` },
-        { status: 400 },
-      );
-    }
-    const located = await resolveLocation(wifiAccessPoints, env);
+    const parsed = await readWifiScanBody(request);
+    if (parsed instanceof Response) return parsed;
+    const located = await resolveLocation(parsed.wifiAccessPoints, env);
     if (!located.known) {
       // The device's designed "can't find you" state — not an empty board.
       return Response.json({ error: "location unknown" }, { status: 422 });
@@ -59,6 +45,9 @@ export async function routeNearby(
   }
 
   const modes = parseModes(url.searchParams.get("modes"));
+  if (modes === null) {
+    return Response.json({ error: "unknown modes" }, { status: 400 });
+  }
   const feeds = await loadFeedInfo(env, curatedFeeds);
   const body = await composeNearby(env, feeds, { lat, lon, modes });
   return Response.json({ location: { lat, lon, accuracy }, ...body });
@@ -70,12 +59,16 @@ function validCoords(lat: number, lon: number): boolean {
   );
 }
 
-/** modes= is honored as a filter (contract pin); unknown names are ignored. */
-function parseModes(raw: string | null): string[] {
+/**
+ * modes= is honored as a filter (contract pin); unknown names are ignored.
+ * An explicit list with NO known mode is a caller error (null → 400) — a
+ * typo must not silently return the full payload.
+ */
+function parseModes(raw: string | null): string[] | null {
   if (!raw) return [...MODES];
   const requested = raw.split(",").map((m) => m.trim());
   const known = MODES.filter((m) => requested.includes(m));
-  return known.length ? known : [...MODES];
+  return known.length ? known : null;
 }
 
 async function loadFeedInfo(env: Env, curatedFeeds: ReadonlySet<string>): Promise<FeedInfo[]> {

@@ -58,7 +58,9 @@ function stationStatus(station: Record<string, unknown>): StationStatus {
   const docks = count(station.num_docks_available);
   // A station that isn't renting has no bikes to offer, whatever the counts
   // claim; docks stay real — a disabled-rental station still accepts returns.
-  if (station.is_renting === 0) {
+  // Lyft sends numeric 0/1 today, but the GBFS 2.x spec mandates booleans —
+  // accept both so a spec-compliance or 3.0 migration can't defeat the gate.
+  if (station.is_renting === 0 || station.is_renting === false) {
     return { classic: 0, electric: 0, docks };
   }
   let classic = 0;

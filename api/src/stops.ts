@@ -184,9 +184,10 @@ async function attachRoutes(db: D1Database, groups: StopGroup[]): Promise<void> 
 }
 
 /**
- * Distance to the closest stop of a feed regardless of radius — feeds the
- * empty-mode screen's "Closest station is 2.4 mi away." Coarse two-stage
- * widening search keeps it a bbox query rather than a full scan.
+ * Distance to the closest stop of a feed — feeds the empty-mode screen's
+ * "Closest station is 2.4 mi away." Two-stage widening bbox search, capped
+ * at 100 km: beyond that "nearest station" is meaningless to a pedestrian
+ * and the bbox would scan most of the table on every far-away request.
  */
 export async function nearestBeyond(
   db: D1Database,
@@ -195,7 +196,7 @@ export async function nearestBeyond(
   feedIds: string[],
   units: string | null,
 ): Promise<string | null> {
-  for (const radiusM of [10_000, 100_000, 1_000_000]) {
+  for (const radiusM of [10_000, 100_000]) {
     const found = await nearbyStops(
       db,
       { lat, lon, radiusM, feedIds, limit: 1 },

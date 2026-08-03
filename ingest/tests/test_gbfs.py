@@ -133,3 +133,23 @@ def test_unknown_feed_without_client_raises():
         run_gbfs_static(
             None, "not-a-feed", dry_run=True, http_session=FakeHTTP(make_payload())
         )
+
+
+def test_non_dict_station_entry_is_skipped_not_fatal():
+    """A malformed (non-dict) entry in data.stations is counted and skipped."""
+    from gtfs_compass_ingest.gbfs import _parse_stations
+
+    payload = {
+        "data": {
+            "stations": [
+                "garbage-string",
+                {"station_id": "ok-1", "name": "Real", "lat": 40.0, "lon": -73.9, "capacity": 10},
+            ]
+        },
+        "last_updated": 1700000000,
+        "ttl": 60,
+        "version": "2.3",
+    }
+    rows, skipped = _parse_stations(payload, "citibike")
+    assert skipped == 1
+    assert [r["stop_id"] for r in rows] == ["ok-1"]

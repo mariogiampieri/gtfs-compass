@@ -123,11 +123,16 @@ npm test                 # unit + workerd-pool suites
 npm run deploy
 ```
 
-Then poke it (this is a debug surface — the public `/v1` API is Phase 3):
+Then poke it (this is an operator debug surface; the public `/v1` API is
+documented below):
 
 ```bash
 curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/mta-subway/ace/stop/A32N"
+curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/citibike/all/station/<station-id>"
 ```
+
+`npm run deploy` applies any pending D1 migrations first — new Worker code
+never runs against an unmigrated database.
 
 The first call returns `{"fetched_at":null,...}` (no data yet) and wakes the
 poll loop; within ~20 seconds the same call returns live arrivals as epoch
@@ -169,11 +174,35 @@ An unresolvable location returns `422 {"error": "location unknown"}` —
 distinct from a located-but-empty board. Each system carries `fetched_at`
 (the oldest upstream snapshot consulted, `null` when never fetched) and
 `partial: true` while any feed group is still cold, so the device never
-shows stale data as live.
+shows stale data as live. When the bike status source is unavailable,
+`bikes_classic`/`bikes_electric`/`docks_open` are `null` (capacity stays
+real) — `null` means "no data", `0` means "actually empty".
 
 **`POST /v1/locate`** — the bare geolocation step, for diagnostics and the
-config UI. `POST /v1/locate/ref` and `GET /v1/locate/log` (both
-`DIAG_TOKEN`-gated) support the accuracy walk described in the spec.
+config UI:
+
+```bash
+curl -X POST "https://<worker-host>/v1/locate" -H 'content-type: application/json' \
+  -d '{"wifiAccessPoints": [{"macAddress": "aa:bb:cc:dd:ee:ff", "signalStrength": -60}, ...]}'
+```
+
+`POST /v1/locate/ref` and `GET /v1/locate/log` support the accuracy walk
+described in the spec. They — and `log: true` on `/v1/locate` — require the
+`DIAG_TOKEN` secret as a Bearer header (query-param tokens are rejected):
+
+```bash
+# 1. log an estimate for a device (within 60 s of step 2)
+curl -X POST "https://<worker-host>/v1/locate" \
+  -H "Authorization: Bearer $DIAG_TOKEN" -H 'content-type: application/json' \
+  -d '{"wifiAccessPoints": [...], "log": true, "device_id": "<opaque-id>", "label": "platform"}'
+# 2. pair the phone's reference position; the API computes delta_m
+curl -X POST "https://<worker-host>/v1/locate/ref" \
+  -H "Authorization: Bearer $DIAG_TOKEN" -H 'content-type: application/json' \
+  -d '{"device_id": "<opaque-id>", "lat": 40.6923, "lon": -73.9873, "accuracy": 5}'
+# 3. read the paired rows
+curl "https://<worker-host>/v1/locate/log?device_id=<opaque-id>" \
+  -H "Authorization: Bearer $DIAG_TOKEN"
+```
 
 ### Location privacy
 

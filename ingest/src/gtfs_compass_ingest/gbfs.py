@@ -70,6 +70,9 @@ def _parse_stations(payload: dict, feed_id: str) -> tuple[list[dict], int]:
 
     rows, skipped = [], 0
     for station in stations:
+        if not isinstance(station, dict):
+            skipped += 1  # non-dict entry: skip-and-count, never crash the run
+            continue
         station_id = str(station.get("station_id") or "").strip()
         if not station_id:
             skipped += 1

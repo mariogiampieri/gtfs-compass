@@ -673,3 +673,63 @@ describe("payload budget", () => {
     expect(size).toBeLessThan(25_000);
   });
 });
+
+describe("review-driven regressions", () => {
+  it("carries nearest_distance_label on an empty bike system", async () => {
+    const feed = await seedBikeFeed();
+    // ~3.9 km north — outside the 1200 m radius, inside the widening search.
+    await seedBikeStation(feed.id, "far-dock", "Far Dock", JAY.lat + 0.035, JAY.lon, 20);
+    const body: any = await compose([feed], ["bike"]);
+    const system = body.systems.find((s: any) => s.mode === "bike");
+    expect(system.stations).toEqual([]);
+    expect(system.fetched_at).toBeNull();
+    expect(system.nearest_distance_label).toBe("2.4 mi");
+  });
+
+  it("returns null nearest_distance_label when the bike feed has no stations at all", async () => {
+    const feed = await seedBikeFeed();
+    const body: any = await compose([feed], ["bike"]);
+    const system = body.systems.find((s: any) => s.mode === "bike");
+    expect(system.nearest_distance_label).toBeNull();
+  });
+
+  it("rejects a modes= list with no known mode instead of returning everything", async () => {
+    const res = await SELF.fetch(
+      `https://api/v1/nearby?lat=${JAY.lat}&lon=${JAY.lon}&modes=scooter`,
+      { headers: { "CF-Connecting-IP": "10.44.44.1" } },
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "unknown modes" });
+  });
+
+  it("defaults to all three systems when modes= is absent", async () => {
+    const res = await SELF.fetch(`https://api/v1/nearby?lat=${JAY.lat}&lon=${JAY.lon}`, {
+      headers: { "CF-Connecting-IP": "10.44.44.2" },
+    });
+    expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.systems.map((s: any) => s.mode)).toEqual(["rail", "bus", "bike"]);
+  });
+
+  it("composes a generic single-group (non-NYCT) rail adapter through group 'all'", async () => {
+    const id = `generic-${Date.now() % 100000}`;
+    await env.DB.prepare(
+      "INSERT INTO feeds (id, rt_trip_url, adapter, units) VALUES (?, ?, 'gtfs_rt', 'imperial')",
+    )
+      .bind(id, `${ORIGIN}/${id}`)
+      .run();
+    const feed: FeedInfo = { id, adapter: "gtfs_rt", directionLabels: null, units: "imperial" };
+    const now = nowSec();
+    await seedStation(id, "G1", "Generic Stop", JAY.lat, JAY.lon, { G1N: ["R1"] });
+    await seedRoute(id, "R1", "R1", "3E86C0");
+    // gtfs_rt is single-group: the base rt_trip_url IS the "all" group URL.
+    respondWith(`${ORIGIN}/${id}`, () => ({
+      status: 200,
+      body: encodeTrips(now, [{ routeId: "R1", stops: [["G1N", now + 120]] }]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    const system = railSystem(body);
+    expect(system.fetched_at).toBeGreaterThan(0);
+    expect(system.stops[0].trunks[0].directions[0].arrivals).toHaveLength(1);
+  });
+});

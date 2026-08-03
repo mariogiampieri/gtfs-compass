@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 
 import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrlsFor } from "./adapters";
 import {
+  batchIdsParam,
   type DoIdentity,
   FETCH_TIMEOUT_MS,
   IDLE_SUSPEND_MS,
@@ -66,9 +67,7 @@ export class FeedDO extends DurableObject<Env> {
     if (this.configMissing) {
       return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
     }
-    const stopIds = single
-      ? [decodeURIComponent(single[1])]
-      : (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
+    const stopIds = single ? [decodeURIComponent(single[1])] : (batchIdsParam(url) ?? []);
     const now = Date.now();
 
     // Input-gated sequence: storage awaits only, no interleaving point.
@@ -147,7 +146,13 @@ export class FeedDO extends DurableObject<Env> {
       }
       const buf = new Uint8Array(await upstream.arrayBuffer());
 
-      const headerTimestamp = feedHeaderTimestamp(buf);
+      let headerTimestamp = feedHeaderTimestamp(buf);
+      // A far-future header timestamp must never become the persisted
+      // high-water mark — it would reject every correct feed forever.
+      if (headerTimestamp > Math.floor(fetchStartMs / 1000) + 300) {
+        console.warn(`${this.tag()} implausible header timestamp ${headerTimestamp}; ignoring`);
+        headerTimestamp = 0;
+      }
       // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
       // failed fetch so staleness becomes visible (spec constraint #5).
       // Feeds that omit the optional header timestamp (0) skip this gate.
@@ -231,13 +236,15 @@ export class FeedDO extends DurableObject<Env> {
    * single-stop route; every requested id is present (empty when unknown).
    */
   private stopsResponse(stopIds: string[], group: string, nowMs: number): Response {
+    // Object.create(null): stop ids are caller-controlled; "__proto__" etc.
+    // must land as own keys, mirroring trimPerRoute and GbfsDO.
     if (!this.snapshot) {
-      const empty: Record<string, Arrival[]> = {};
+      const empty: Record<string, Arrival[]> = Object.create(null);
       for (const id of stopIds) empty[id] = [];
       return Response.json({ fetched_at: null, group, stops: empty });
     }
     const nowSec = Math.floor(nowMs / 1000);
-    const stops: Record<string, Arrival[]> = {};
+    const stops: Record<string, Arrival[]> = Object.create(null);
     for (const id of stopIds) {
       const stored = Object.hasOwn(this.snapshot.arrivals, id) ? this.snapshot.arrivals[id] : [];
       stops[id] = stored.filter((a) => a.time >= nowSec);

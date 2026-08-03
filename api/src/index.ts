@@ -77,6 +77,10 @@ async function feedAdapter(env: Env, feedId: string): Promise<string | null> {
 }
 
 const ROUTE = /^\/internal\/([^/]+)\/([^/]+)\/stop\/([^/]+)$/;
+// GBFS feeds are single-group ("all") and keyed by station, not stop — the
+// operator debug surface mirrors FeedDO's so a stuck bike poll is inspectable
+// without composing a full /v1/nearby response.
+const STATION_ROUTE = /^\/internal\/([^/]+)\/all\/station\/([^/]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -110,6 +114,28 @@ async function route(request: Request, env: Env): Promise<Response> {
         return routeNearby(request, env, url, curatedFeeds(env));
       }
       return routeLocate(request, env, url);
+    }
+
+    const stationMatch = url.pathname.match(STATION_ROUTE);
+    if (stationMatch && request.method === "GET") {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (rateLimited(ip, Date.now())) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      let feedId: string;
+      let stationId: string;
+      try {
+        [, feedId, stationId] = stationMatch.map(decodeURIComponent) as [string, string, string];
+      } catch {
+        return Response.json({ error: "not found" }, { status: 404 });
+      }
+      if (!curatedFeeds(env).has(feedId) || (await feedAdapter(env, feedId)) !== "gbfs") {
+        return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+      }
+      const stub = env.GBFS_DO.get(env.GBFS_DO.idFromName(`${feedId}:all`));
+      return stub.fetch(
+        `https://do/station/${encodeURIComponent(stationId)}?feed=${encodeURIComponent(feedId)}&group=all`,
+      );
     }
 
     const match = url.pathname.match(ROUTE);

@@ -9,7 +9,7 @@
  * cap so a rotating device_id cannot grow locate_log unbounded.
  */
 
-import { MAX_BSSIDS, haversineM, resolveLocation } from "../locate";
+import { haversineM, readWifiScanBody, resolveLocation } from "../locate";
 
 const DAILY_LOG_CAP = 500;
 const REF_PAIR_WINDOW_S = 60;
@@ -37,24 +37,9 @@ export async function routeLocate(request: Request, env: Env, url: URL): Promise
 
 /** POST /v1/locate — {wifiAccessPoints, device_id?, log?, label?} */
 async function handleLocate(request: Request, env: Env): Promise<Response> {
-  let body: Record<string, unknown>;
-  try {
-    body = (await request.json()) ?? {};
-  } catch {
-    return Response.json({ error: "invalid JSON body" }, { status: 400 });
-  }
-
-  const wifiAccessPoints = body.wifiAccessPoints;
-  if (!Array.isArray(wifiAccessPoints)) {
-    return Response.json({ error: "wifiAccessPoints must be an array" }, { status: 400 });
-  }
-  // Reject oversized sets before any hashing or provider call.
-  if (wifiAccessPoints.length > MAX_BSSIDS) {
-    return Response.json(
-      { error: `wifiAccessPoints capped at ${MAX_BSSIDS} entries` },
-      { status: 400 },
-    );
-  }
+  const parsed = await readWifiScanBody(request);
+  if (parsed instanceof Response) return parsed;
+  const { body, wifiAccessPoints } = parsed;
 
   const deviceId = typeof body.device_id === "string" && body.device_id ? body.device_id : null;
   const wantsLog = body.log === true;

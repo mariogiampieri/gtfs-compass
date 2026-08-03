@@ -23,3 +23,18 @@ export class MissingFeedError extends Error {
     this.name = "MissingFeedError";
   }
 }
+
+/**
+ * Batch `?ids=` parsing: split the RAW query value on ',' and then decode
+ * each segment — the exact inverse of `map(encodeURIComponent).join(",")`,
+ * so an id containing a comma survives the round trip. (URLSearchParams
+ * decodes before we could split, corrupting such ids.) Null when absent.
+ */
+export function batchIdsParam(url: URL): string[] | null {
+  const match = /[?&]ids=([^&]*)/.exec(url.search);
+  if (!match) return null;
+  return match[1]
+    .split(",")
+    .filter((segment) => segment !== "")
+    .map(decodeURIComponent);
+}

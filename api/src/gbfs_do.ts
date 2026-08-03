@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 import { ParseError } from "./adapters";
 import { type StationStatus, parseStationStatus } from "./adapters/gbfs";
 import {
+  batchIdsParam,
   type DoIdentity,
   FETCH_TIMEOUT_MS,
   IDLE_SUSPEND_MS,
@@ -61,7 +62,7 @@ export class GbfsDO extends DurableObject<Env> {
     const feedId = url.searchParams.get("feed");
     const group = url.searchParams.get("group");
     const single = url.pathname.match(/^\/station\/([^/]+)$/);
-    const batchIds = url.pathname === "/stations" ? url.searchParams.get("ids") : null;
+    const batchIds = url.pathname === "/stations" ? batchIdsParam(url) : null;
     if ((!single && batchIds === null) || !feedId || !group) {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
@@ -90,7 +91,7 @@ export class GbfsDO extends DurableObject<Env> {
 
     const response = single
       ? this.stationResponse(decodeURIComponent(single[1]))
-      : this.stationsResponse(batchIds ?? "");
+      : this.stationsResponse(batchIds ?? []);
     if (arming) {
       this.ctx.waitUntil(this.refresh());
     }
@@ -140,6 +141,14 @@ export class GbfsDO extends DurableObject<Env> {
         return;
       }
       const parsed = parseStationStatus(await upstream.text());
+
+      // A far-future last_updated (ms-instead-of-s glitch, clock skew) must
+      // never become the persisted high-water mark — it would reject every
+      // correct body forever, with no recovery even across restarts.
+      if (parsed.lastUpdated > Math.floor(fetchStartMs / 1000) + 300) {
+        console.warn(`${this.tag()} implausible last_updated ${parsed.lastUpdated}; ignoring timestamp`);
+        parsed.lastUpdated = 0;
+      }
 
       // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
       // failed fetch so staleness becomes visible (spec constraint #5).
@@ -215,8 +224,7 @@ export class GbfsDO extends DurableObject<Env> {
     });
   }
 
-  private stationsResponse(idsParam: string): Response {
-    const ids = idsParam.split(",").filter((id) => id !== "");
+  private stationsResponse(ids: string[]): Response {
     if (!this.snapshot) {
       return Response.json({ fetched_at: null, stations: {} });
     }

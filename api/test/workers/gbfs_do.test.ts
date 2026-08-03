@@ -420,3 +420,38 @@ describe("GbfsDO", () => {
     expect((await stub.fetch("https://do/nope?feed=citibike&group=all")).status).toBe(400); // unknown path
   });
 });
+
+describe("timestamp clamping", () => {
+  it("ignores an implausible far-future last_updated instead of poisoning the watermark", async () => {
+    const stub = stubFor("citibike:clamp");
+    const t = nowSec();
+    // Milliseconds-instead-of-seconds glitch: ~1000x the real epoch.
+    mockStatusOnce(encodeStatus(t * 1000, [station({ station_id: "s1", classic: 3, docks: 5 })]));
+    await readStation(stub, "s1");
+    await settleRefresh(stub);
+
+    // A later CORRECT body must still be accepted — the glitch value must
+    // not have become the persisted high-water mark.
+    mockStatusOnce(encodeStatus(t + 60, [station({ station_id: "s1", classic: 7, docks: 1 })]));
+    await runDurableObjectAlarm(stub);
+    await settleRefresh(stub);
+    const body = await (await readStation(stub, "s1")).json<any>();
+    expect(body.station).toEqual({ classic: 7, electric: 0, docks: 1 });
+  });
+});
+
+describe("batch id round-tripping", () => {
+  it("round-trips a station id containing the ',' separator", async () => {
+    const stub = stubFor("citibike:comma");
+    const weird = "weird,id";
+    mockStatusOnce(encodeStatus(nowSec(), [station({ station_id: weird, classic: 2, docks: 4 })]));
+    await readStation(stub, "anything");
+    await settleRefresh(stub);
+
+    const res = await stub.fetch(
+      `https://do/stations?ids=${encodeURIComponent(weird)},plain&feed=citibike&group=all`,
+    );
+    const body = await res.json<any>();
+    expect(body.stations[weird]).toEqual({ classic: 2, electric: 0, docks: 4 });
+  });
+});
