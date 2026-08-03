@@ -127,8 +127,9 @@ export function modeForFeed(feed: FeedInfo): (typeof MODES)[number] {
   return feed.adapter === "gbfs" ? "bike" : "rail";
 }
 
-/** route_id → feed group, per-adapter strategy (plan KTD). Null = unmapped. */
-function groupForRoute(adapter: string, routeId: string): string | null {
+/** route_id → feed group, per-adapter strategy (plan KTD). Null = unmapped.
+ * Shared with departures.ts — single source of truth for the mapping. */
+export function groupForRoute(adapter: string, routeId: string): string | null {
   if (adapter === "nyct") return NYCT_ROUTE_GROUP[routeId] ?? null;
   return "all"; // single-group adapters: one full-dataset feed
 }
@@ -175,13 +176,13 @@ export async function composeNearby(
   };
 }
 
-interface SnapshotArrival {
+export interface SnapshotArrival {
   routeId: string;
   time: number;
   terminalStopId?: string;
 }
 
-interface GroupSnapshots {
+export interface GroupSnapshots {
   results: Map<string, { fetchedAt: number | null; stops: Record<string, SnapshotArrival[]> }>;
   anySourceFailed: boolean;
 }
@@ -392,12 +393,15 @@ function truncateAtWhitespace(text: string, max: number): string {
   return `${cut.slice(0, lastSpace > max / 2 ? lastSpace : max)}…`;
 }
 
-/** One batch snapshot read per needed group, concurrent, failure-isolated. */
-async function fetchGroupSnapshots(
+/** One batch snapshot read per needed group, concurrent, failure-isolated.
+ * Shared with departures.ts — same degrade semantics (a failed or cold group
+ * flips `anySourceFailed`, never a throw). */
+export async function fetchGroupSnapshots(
   env: Env,
   feedId: string,
   neededGroups: string[],
   platformIds: string[],
+  logTag = "[nearby]",
 ): Promise<GroupSnapshots> {
   const results: GroupSnapshots["results"] = new Map();
   let anySourceFailed = false;
@@ -423,7 +427,7 @@ async function fetchGroupSnapshots(
       if (fetched_at === null) anySourceFailed = true; // cold group: no data yet
     } else {
       // Failed group degrades to never-fetched semantics (plan KTD).
-      console.warn(`[nearby] ${feedId}:${neededGroups[i]} snapshot fetch failed:`, result.reason);
+      console.warn(`${logTag} ${feedId}:${neededGroups[i]} snapshot fetch failed:`, result.reason);
       anySourceFailed = true;
     }
   }

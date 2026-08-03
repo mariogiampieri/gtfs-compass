@@ -7,7 +7,8 @@ normalizing GTFS-Realtime and GBFS feeds into tiny JSON the device can render
 in under a second.
 
 **Project status: early.** Phase 1 (data model + ingest), Phase 2 (realtime
-Durable Objects), and Phase 3 (the `/v1/nearby` read API, WiFi geolocation,
+Durable Objects), and Phase 3 (the `/v1/nearby` read API, the `/v1/departures`
+leave-by timer endpoint with server-side walk times, WiFi geolocation,
 and Citi Bike GBFS) are built. Firmware and the config UI are specified in
 [`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md) and land in
 later phases.
@@ -229,8 +230,81 @@ experimental (no SLA) — an unavailable provider degrades to
 `{"known": false}` and the device falls back to its favorite-stop behavior.
 
 > Note: the guiding spec's 500-byte payload budget applies to the
-> favorites-departures endpoint (a later phase); `/v1/nearby` is a richer
+> favorites-departures endpoint below; `/v1/nearby` is a richer
 > explore-first payload (~15–25 KB) fetched over WiFi.
+
+## The leave-by timer endpoint
+
+**`GET /v1/departures`** — the favorites poll: server-computed arrival and
+leave-by minutes for device-held stops, in the spec's compact shape. Until
+Phase 5 lands accounts, favorites live on the device and the request carries
+everything the server needs:
+
+```bash
+# Arrivals only
+curl "https://<worker-host>/v1/departures?stops=mta-subway:A41N,mta-subway:A41S&n=3"
+# With hand-tuned walk seconds per stop (the manual tier — always wins)
+curl "https://<worker-host>/v1/departures?stops=mta-subway:A41N,mta-subway:A41S&walk=mta-subway:A41N:420,mta-subway:A41S:420"
+# With an origin fix for the heuristic tier (all three params required together)
+curl "https://<worker-host>/v1/departures?stops=mta-subway:A41N&lat=40.6923&lon=-73.9873&acc=30"
+```
+
+Parameters: `stops=` is a comma list of **namespaced refs** `<feed_id>:<stop_id>`
+(max 20 — this diverges deliberately from the spec's bare-id sketch so
+mixed-agency favorites work in one call); `n=` is arrivals per stop+route
+(1–8, default 3); `walk=` carries `<feed>:<stop>:<seconds>` triplets
+(0–7200, each ref must appear in `stops=`); `lat`/`lon`/`acc` supply an
+origin for the walk heuristic — `acc` (accuracy, meters) is required, and an
+origin coarser than `LOCATE_MAX_ACCURACY_M` (default 500) is ignored, never
+trusted silently. Validation is fail-loud: any malformed ref, unknown or
+non-rail feed, or out-of-range value rejects the whole request with 400 and
+a specific error. Bike favorites are `/v1/nearby` territory.
+
+```json
+{"ts":1754236082,"fetched_at":1754236075,
+ "d":[{"s":"mta-subway:A41N","r":"A","c":"0039A6","t":"FFFFFF","m":[3,11,18],"l":[-5,3,10]},
+      {"s":"mta-subway:A41S","r":"A","c":"0039A6","t":"FFFFFF","m":[6,14],"l":[-3,5]}],
+ "w":{"mta-subway:A41N":{"s":510,"src":"manual"},
+      "mta-subway:A41S":{"s":510,"src":"manual"}}}
+```
+
+Response semantics the device renders directly (no time math beyond
+decrementing between polls):
+
+- `d` has one entry per (stop, static route); `s` is the namespaced ref,
+  `r` the route label, `c`/`t` bare `RRGGBB` colors from the feed (palette
+  fallback when the feed omits them).
+- `m` is arrival minutes, clamped at 0, ascending. **Empty `m` means no
+  upcoming service** (render a dash) — a different fact from a 0-minute
+  arrival.
+- `l` (present only when walk context exists) is leave-by minutes aligned
+  index-for-index with `m`, computed as `floor((arrival − walk_s − now)/60)`
+  and **unclamped — negative means you've missed that train**, which renders
+  differently from both 0 ("leave now") and no data.
+- `w` reports the walk seconds actually applied per stop and their `src`
+  (`"manual"` or `"heuristic"`). Every walk value already includes the entry
+  buffer (90 s for rail, 0 for bus/bikeshare) — the street-entrance-to-
+  platform seconds no router models.
+- `fetched_at` is the oldest realtime snapshot consulted (`null` when never
+  fetched); `partial: true` appears while any needed feed group is cold or
+  failing. The staleness contract is unchanged: data older than 90 s renders
+  as stale.
+
+Payload size: the representative favorites poll (two platforms, two routes
+each, `n=3`, walk overlay) is pinned under **500 bytes** by a test. That is
+a target for the typical case, not a maximum — at the caps (20 refs, busy
+multi-route platforms, `n=8`) the worst case is on the order of **15 KB**,
+so firmware should size receive buffers to the worst case and treat 500 B
+as the norm.
+
+Origin coordinates and walk parameters are request-scoped only: never
+persisted, never logged (the same posture as BSSIDs on `/v1/locate`).
+
+One request may consult every feed group its stops span (up to all eight
+NYCT groups); each read arms that group's 20-second poll loop, which
+self-suspends after 10 idle minutes. That wake amplification is the
+accepted pre-auth cost posture — bounded by the per-IP rate limit and the
+curated-feed allowlist, and closed properly by Phase 5 device tokens.
 
 ## Firmware (Phase 4)
 
