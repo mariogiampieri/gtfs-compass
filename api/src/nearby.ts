@@ -127,8 +127,9 @@ export function modeForFeed(feed: FeedInfo): (typeof MODES)[number] {
   return feed.adapter === "gbfs" ? "bike" : "rail";
 }
 
-/** route_id → feed group, per-adapter strategy (plan KTD). Null = unmapped. */
-function groupForRoute(adapter: string, routeId: string): string | null {
+/** route_id → feed group, per-adapter strategy (plan KTD). Null = unmapped.
+ * Shared with departures.ts — single source of truth for the mapping. */
+export function groupForRoute(adapter: string, routeId: string): string | null {
   if (adapter === "nyct") return NYCT_ROUTE_GROUP[routeId] ?? null;
   return "all"; // single-group adapters: one full-dataset feed
 }
