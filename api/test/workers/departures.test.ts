@@ -1,4 +1,4 @@
-import { env } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
@@ -428,5 +428,149 @@ describe("composeDepartures — contract", () => {
     // t0+300 arrival: 4 or 5 depending on elapsed warm-up time.
     expect(body.d[0].m[0]).toBeGreaterThanOrEqual(4);
     expect(body.d[0].m[0]).toBeLessThanOrEqual(5);
+  });
+});
+
+// ---------- route surface (through the real worker: allowlist + rate limit) ----------
+
+let ipSerial = 0;
+
+function get(path: string, ip?: string): Promise<Response> {
+  return SELF.fetch(`https://worker.example${path}`, {
+    headers: { "CF-Connecting-IP": ip ?? `10.9.${++ipSerial}.1` },
+  });
+}
+
+describe("/v1/departures route", () => {
+  beforeEach(async () => {
+    // Curated ids come from wrangler vars (mta-subway, citibike); seed their rows.
+    await env.DB.prepare(
+      "INSERT INTO feeds (id, rt_trip_url, adapter, units) VALUES ('mta-subway', ?, 'nyct', 'imperial')",
+    )
+      .bind(`${ORIGIN}/mta`)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO feeds (id, rt_trip_url, adapter, units) VALUES ('citibike', ?, 'gbfs', 'imperial')",
+    )
+      .bind(`${ORIGIN}/citibike/status.json`)
+      .run();
+  });
+
+  it("rejects a request without stops", async () => {
+    const res = await get("/v1/departures");
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("stops");
+  });
+
+  it("rejects malformed refs, naming the offender", async () => {
+    for (const bad of ["A41N", "mta-subway%3A", "%3AA41N"]) {
+      const res = await get(`/v1/departures?stops=${bad}`);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("malformed stop ref");
+    }
+  });
+
+  it("rejects non-curated feeds and gbfs feeds (bike favorites are /v1/nearby territory)", async () => {
+    const bogus = await get("/v1/departures?stops=bogus:A41N");
+    expect(bogus.status).toBe(400);
+    expect(((await bogus.json()) as { error: string }).error).toBe("unknown feed: bogus");
+
+    const bike = await get("/v1/departures?stops=citibike:305231");
+    expect(bike.status).toBe(400);
+    expect(((await bike.json()) as { error: string }).error).toBe("unknown feed: citibike");
+  });
+
+  it("bounds n at 1..8 and defaults to 3", async () => {
+    for (const bad of ["0", "9", "abc", "2.5"]) {
+      const res = await get(`/v1/departures?stops=mta-subway:X1&n=${bad}`);
+      expect(res.status).toBe(400);
+    }
+    // Valid bounds pass validation (unknown stop id → clean 200, no DO consulted).
+    for (const ok of ["1", "8", ""]) {
+      const res = await get(`/v1/departures?stops=mta-subway:X1&n=${ok}`);
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it("rejects malformed walk triplets and walk refs not present in stops", async () => {
+    for (const bad of ["mta-subway:X1:abc", "mta-subway:X1:-1", "mta-subway:X1:7201", "600"]) {
+      const res = await get(`/v1/departures?stops=mta-subway:X1&walk=${bad}`);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("walk");
+    }
+    const stray = await get("/v1/departures?stops=mta-subway:X1&walk=mta-subway:X2:300");
+    expect(stray.status).toBe(400);
+    expect(((await stray.json()) as { error: string }).error).toBe(
+      "walk ref not in stops: mta-subway:X2",
+    );
+  });
+
+  it("requires a complete gated origin: lat+lon+acc together, in range", async () => {
+    for (const bad of [
+      "lat=40.69",
+      "lat=40.69&lon=-73.98",
+      "lat=91&lon=-73.98&acc=30",
+      "lat=40.69&lon=-181&acc=30",
+      "lat=40.69&lon=-73.98&acc=0",
+      "lat=40.69&lon=-73.98&acc=abc",
+      "lon=-73.98&acc=30",
+    ]) {
+      const res = await get(`/v1/departures?stops=mta-subway:X1&${bad}`);
+      expect(res.status).toBe(400);
+    }
+    const ok = await get("/v1/departures?stops=mta-subway:X1&lat=40.69&lon=-73.98&acc=30");
+    expect(ok.status).toBe(200);
+  });
+
+  it("caps stop refs at 20", async () => {
+    const make = (count: number) =>
+      Array.from({ length: count }, (_, i) => `mta-subway:X${i}`).join(",");
+    expect((await get(`/v1/departures?stops=${make(21)}`)).status).toBe(400);
+    expect((await get(`/v1/departures?stops=${make(20)}`)).status).toBe(200);
+  });
+
+  it("serves only GET", async () => {
+    const res = await SELF.fetch("https://worker.example/v1/departures?stops=mta-subway:X1", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "10.8.0.1" },
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("shares the standard rate bucket, not the tighter locate bucket", async () => {
+    const ip = "10.7.0.1";
+    const statuses: number[] = [];
+    for (let i = 0; i < 21; i++) {
+      statuses.push((await get("/v1/departures?stops=mta-subway:X1", ip)).status);
+    }
+    // Locate bucket would 429 from request 11; the standard bucket allows 20.
+    expect(statuses.slice(0, 20).every((s) => s === 200)).toBe(true);
+    expect(statuses[20]).toBe(429);
+  });
+
+  it("returns the full contract end to end: entries, walk overlay, staleness stamp", async () => {
+    await seedRoute("mta-subway", "A", "A", "0039A6", "FFFFFF");
+    await seedPlatform("mta-subway", "A41N", ["A"]);
+    const t0 = nowSec();
+    respondWith(`${ORIGIN}/mta-ace`, () => ({
+      status: 200,
+      body: encodeTrips(t0, [{ routeId: "A", stops: [["A41N", t0 + 600]] }]),
+    }));
+
+    const cold = await get("/v1/departures?stops=mta-subway:A41N&walk=mta-subway:A41N:120");
+    expect(cold.status).toBe(200); // never blocks on upstream — cold read arms the poller
+    await new Promise((r) => setTimeout(r, 150));
+
+    const warm = await get("/v1/departures?stops=mta-subway:A41N&walk=mta-subway:A41N:120");
+    const body = (await warm.json()) as {
+      fetched_at: number | null;
+      d: { s: string; r: string; m: number[]; l?: number[] }[];
+      w?: Record<string, { s: number; src: string }>;
+    };
+    expect(body.fetched_at).toBeGreaterThanOrEqual(t0);
+    expect(body.d[0].s).toBe("mta-subway:A41N");
+    expect(body.d[0].m).toHaveLength(1);
+    expect(body.d[0].l).toHaveLength(1);
+    expect(body.w).toEqual({ "mta-subway:A41N": { s: 210, src: "manual" } });
   });
 });
