@@ -44,6 +44,11 @@ bool ui_nav_open_detail(ui_state_t *st, const model_nearby_t *model, uint8_t tru
 /* Bike board tap: open the nearby-compare list (handoff §4). */
 bool ui_nav_open_nearby(ui_state_t *st, const model_nearby_t *model);
 
+/* Nearby row tap: stations[idx] becomes the current station (identity
+ * written to stop_id[bike], R6) and the view pops to the bike board — the
+ * ONLY transition that changes the bike selection (R2). */
+bool ui_nav_select_station(ui_state_t *st, const model_nearby_t *model, uint8_t idx);
+
 /* ‹ back (or first horizontal swipe): pop to the board. Never touches the
  * bike station selection — only a nearby-row tap changes it (R2). */
 bool ui_nav_back(ui_state_t *st);

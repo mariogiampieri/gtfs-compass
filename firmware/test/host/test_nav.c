@@ -178,6 +178,26 @@ static void test_nearby_open_and_back_keep_selection(void) {
   TEST_ASSERT_FALSE(ui_nav_open_nearby(&g_state, &g_model));
 }
 
+static void test_nearby_row_tap_selects_station(void) {
+  /* U5: a row tap is the ONLY transition that changes the bike selection —
+   * it writes identity + index and pops to the board (R2/R6) */
+  fresh_board();
+  g_state.sys = UI_SYS_BIKE;
+  TEST_ASSERT_TRUE(ui_nav_open_nearby(&g_state, &g_model));
+  TEST_ASSERT_TRUE(ui_nav_select_station(&g_state, &g_model, 1));
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL(1, g_state.stop_idx[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL_STRING("b2", g_state.stop_id[UI_SYS_BIKE]);
+  /* select is nearby-view-only: inert from the board… */
+  TEST_ASSERT_FALSE(ui_nav_select_station(&g_state, &g_model, 0));
+  TEST_ASSERT_EQUAL_STRING("b2", g_state.stop_id[UI_SYS_BIKE]);
+  /* …and out-of-range rows never write */
+  TEST_ASSERT_TRUE(ui_nav_open_nearby(&g_state, &g_model));
+  TEST_ASSERT_FALSE(ui_nav_select_station(&g_state, &g_model, 9));
+  TEST_ASSERT_EQUAL(UI_VIEW_BIKE_NEARBY, g_state.view);
+  TEST_ASSERT_EQUAL_STRING("b2", g_state.stop_id[UI_SYS_BIKE]);
+}
+
 /* ---------- direction flip (global, R2) ---------- */
 
 static void test_flip_dir_is_global_toggle(void) {
@@ -238,6 +258,7 @@ int main(void) {
   RUN_TEST(test_horizontal_swipe_in_detail_pops_to_board);
   RUN_TEST(test_nav_identity_survives_shuffled_reconcile);
   RUN_TEST(test_nearby_open_and_back_keep_selection);
+  RUN_TEST(test_nearby_row_tap_selects_station);
   RUN_TEST(test_flip_dir_is_global_toggle);
   RUN_TEST(test_flip_in_detail_keeps_view_and_trunk);
   RUN_TEST(test_ages_seed_per_system);
