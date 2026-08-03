@@ -16,6 +16,9 @@ declare global {
     LOCATE_TIMEOUT_MS?: string;
     /** Shared secret gating the locate diagnostics surfaces (wrangler secret). */
     DIAG_TOKEN?: string;
+    /** JSON map of feed id → realtime API key for rt_needs_key feeds
+     * (wrangler secret, e.g. {"mta-bus": "..."}). */
+    RT_FEED_KEYS?: string;
   }
   // `cloudflare:test`'s env (and workers-types' import { env }) are typed as
   // Cloudflare.Env; bridge the project Env into it.

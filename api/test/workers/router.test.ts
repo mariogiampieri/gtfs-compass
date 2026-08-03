@@ -33,7 +33,7 @@ beforeEach(async () => {
   }) as typeof fetch;
 
   await env.DB.prepare(
-    "CREATE TABLE IF NOT EXISTS feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, adapter TEXT)",
+    "CREATE TABLE IF NOT EXISTS feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, adapter TEXT, rt_needs_key INTEGER)",
   ).run();
   await env.DB.prepare(
     "INSERT OR REPLACE INTO feeds (id, rt_trip_url, adapter) VALUES ('mta-subway', ?, 'nyct')",
