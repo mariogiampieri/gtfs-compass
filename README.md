@@ -306,6 +306,69 @@ self-suspends after 10 idle minutes. That wake amplification is the
 accepted pre-auth cost posture — bounded by the per-IP rate limit and the
 curated-feed allowlist, and closed properly by Phase 5 device tokens.
 
+## Firmware (Phase 4)
+
+The device is a Waveshare ESP32-S3-Touch-AMOLED-2.06 running the explore
+board as a dumb renderer: WiFi scan → one `POST /v1/nearby` → LVGL. Code
+lives in `firmware/` — `components/model` and `components/ui` are
+platform-free (shared with the desktop simulator), `main/` is the device
+glue on the vendor BSP.
+
+### Prerequisites (macOS)
+
+```bash
+brew install cmake ninja dfu-util sdl2
+git clone -b v5.5.5 --recursive https://github.com/espressif/esp-idf.git ~/esp/esp-idf
+~/esp/esp-idf/install.sh esp32s3
+```
+
+### Simulator (no hardware needed)
+
+```bash
+git submodule update --init          # LVGL 9.5, pinned
+cd firmware/sim && cmake -B build -G Ninja . && cmake --build build
+./build/sim                          # renders fixtures/live-jay-st.json
+```
+
+Keys: `1`–`5` cycle loading/live/stale/offline/no-location, `j`/`k` cycle
+stops, `f` toggles the refresh flash. Capture a fresh live fixture with
+`curl <worker>/v1/nearby?lat=..&lon=.. > firmware/fixtures/name.json`.
+
+### Device build, flash, provision
+
+```bash
+cd firmware
+. ~/esp/esp-idf/export.sh
+idf.py build
+idf.py -p /dev/cu.usbmodem* flash monitor
+```
+
+WiFi credentials are stored in the device's NVS, never in the repo. Two
+ways to provision:
+
+- **Serial console** (works any time): in the monitor, type
+  `wifi_set <ssid> <password>` — the device stores the credentials and
+  restarts its network path. `wifi_clear` erases; `gc_status` shows state.
+- **Dev seed**: create a gitignored `firmware/sdkconfig.local` with
+  `CONFIG_GC_WIFI_SSID`/`CONFIG_GC_WIFI_PASSWORD` and build with
+  `SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local"` — seeded into
+  NVS on first boot only.
+
+To pin the board to a fixed location (e.g. test a station you're not at,
+or work around thin BeaconDB coverage in your area), type
+`loc_set <lat> <lon>` in the console — the device then uses the GET path
+and skips WiFi scanning; `loc_clear` returns to scan-based location.
+A build-time seed via `CONFIG_GC_DEV_FIXED_LAT`/`_LON` (same
+`sdkconfig.local` mechanism) behaves identically; the console value wins
+when both exist.
+
+### Host tests
+
+```bash
+cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
+./build/test_model                   # model parser suite (ASAN)
+```
+
 ## Feed data licensing
 
 This project redistributes transit data published by agencies under their
