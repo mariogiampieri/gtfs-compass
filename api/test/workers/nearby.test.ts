@@ -260,9 +260,11 @@ describe("composeNearby — rail", () => {
 
     respondWith(`${ORIGIN}/${feed.id}-ace`, () => ({
       status: 200,
+      // Mid-minute offsets (+150/+330): an exact-minute boundary flips the
+      // floor()ed eta when composition lands a second later than `now`.
       body: encodeTrips(now, [
-        { routeId: "A", stops: [["A41S", now + 120], ["A65S", now + 1800]] },
-        { routeId: "C", stops: [["A41N", now + 300], ["A09N", now + 2400]] },
+        { routeId: "A", stops: [["A41S", now + 150], ["A65S", now + 1800]] },
+        { routeId: "C", stops: [["A41N", now + 330], ["A09N", now + 2400]] },
       ]),
     }));
 
