@@ -14,7 +14,14 @@ export default defineConfig({
         },
       },
       {
-        plugins: [cloudflareTest({ wrangler: { configPath: "./wrangler.jsonc" } })],
+        plugins: [
+          cloudflareTest({
+            wrangler: { configPath: "./wrangler.jsonc" },
+            // Test-only shared secret so the locate diagnostics surfaces can
+            // be exercised end-to-end (production uses a wrangler secret).
+            miniflare: { bindings: { DIAG_TOKEN: "test-diag-token" } },
+          }),
+        ],
         test: {
           name: "workers",
           include: ["test/workers/**/*.test.ts"],

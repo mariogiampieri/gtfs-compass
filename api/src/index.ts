@@ -1,4 +1,5 @@
 import { adapterGroups } from "./adapters";
+import { routeLocate } from "./routes/locate";
 
 export { FeedDO } from "./feed_do";
 
@@ -13,27 +14,42 @@ const CURATED_FEEDS: ReadonlySet<string> = new Set(["mta-subway"]);
 const RATE_CAPACITY = 20; // burst
 const RATE_REFILL_PER_SEC = 5;
 
+// /v1/locate* fronts an external geolocation provider (BeaconDB-proxy abuse
+// is in-scope harm), so it gets its own tighter bucket, keyed separately
+// from the debug route's.
+const LOCATE_RATE_CAPACITY = 10; // burst
+const LOCATE_RATE_REFILL_PER_SEC = 1;
+
+type RateBuckets = Map<string, { tokens: number; lastMs: number }>;
+
 // In-isolate caches: best-effort (reset on isolate recycle), which is the
 // right cost/benefit for a debug surface ahead of Phase 3/5 auth.
 const adapterCache = new Map<string, string | null>();
-const rateBuckets = new Map<string, { tokens: number; lastMs: number }>();
+const rateBuckets: RateBuckets = new Map();
+const locateRateBuckets: RateBuckets = new Map();
 
-export function rateLimited(ip: string, now: number): boolean {
-  if (rateBuckets.size > 10_000) {
-    rateBuckets.clear(); // crude bound: scanners rotating IPs can't grow memory forever
+export function rateLimited(
+  ip: string,
+  now: number,
+  buckets: RateBuckets = rateBuckets,
+  capacity: number = RATE_CAPACITY,
+  refillPerSec: number = RATE_REFILL_PER_SEC,
+): boolean {
+  if (buckets.size > 10_000) {
+    buckets.clear(); // crude bound: scanners rotating IPs can't grow memory forever
   }
-  const bucket = rateBuckets.get(ip) ?? { tokens: RATE_CAPACITY, lastMs: now };
+  const bucket = buckets.get(ip) ?? { tokens: capacity, lastMs: now };
   bucket.tokens = Math.min(
-    RATE_CAPACITY,
-    bucket.tokens + ((now - bucket.lastMs) / 1000) * RATE_REFILL_PER_SEC,
+    capacity,
+    bucket.tokens + ((now - bucket.lastMs) / 1000) * refillPerSec,
   );
   bucket.lastMs = now;
   if (bucket.tokens < 1) {
-    rateBuckets.set(ip, bucket);
+    buckets.set(ip, bucket);
     return true;
   }
   bucket.tokens -= 1;
-  rateBuckets.set(ip, bucket);
+  buckets.set(ip, bucket);
   return false;
 }
 
@@ -67,6 +83,17 @@ export default {
 
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+
+    if (url.pathname === "/v1/locate" || url.pathname.startsWith("/v1/locate/")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (
+        rateLimited(ip, Date.now(), locateRateBuckets, LOCATE_RATE_CAPACITY, LOCATE_RATE_REFILL_PER_SEC)
+      ) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routeLocate(request, env, url);
+    }
+
     const match = url.pathname.match(ROUTE);
     if (!match || request.method !== "GET") {
       return Response.json({ error: "not found" }, { status: 404 });
