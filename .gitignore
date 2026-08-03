@@ -19,3 +19,4 @@ ingest/dist/
 .obsidian/
 .DS_Store
 .claude/
+node_modules/
