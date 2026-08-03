@@ -18,6 +18,7 @@ import time
 
 from . import seeds
 from .catalog import run_catalog
+from .gbfs import run_gbfs_static
 from .load import D1Client, PruneRefused, acquire_lock, release_lock, renew_lock
 from .static_gtfs import run_static
 
@@ -106,7 +107,13 @@ def _run(args: argparse.Namespace) -> int:
                 if not dry_run and not renew_lock(client, holder):
                     log.error("lost the D1 ingest lock mid-run; aborting")
                     return EXIT_FAILURE
-                run_static(client, feed_id, dry_run=dry_run, force=args.force)
+                # Dispatch on the feed's adapter (from the seeds registry —
+                # only curated feeds are static-ingested): a GBFS JSON pushed
+                # through the zip pipeline would be a BadZipFile crash.
+                if seeds.adapter_for(feed_id) == "gbfs":
+                    run_gbfs_static(client, feed_id, dry_run=dry_run, force=args.force)
+                else:
+                    run_static(client, feed_id, dry_run=dry_run, force=args.force)
         return EXIT_OK
     except PruneRefused as exc:
         log.error("%s", exc)
