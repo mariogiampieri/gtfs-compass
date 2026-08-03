@@ -1,5 +1,6 @@
 import { adapterGroups } from "./adapters";
 import { routeLocate } from "./routes/locate";
+import { routeNearby } from "./routes/nearby";
 
 export { FeedDO } from "./feed_do";
 export { GbfsDO } from "./gbfs_do";
@@ -10,7 +11,7 @@ export { GbfsDO } from "./gbfs_do";
  * be fetched on an anonymous caller's say-so — reachability is by explicit
  * allowlist, not by what exists in the table.
  */
-const CURATED_FEEDS: ReadonlySet<string> = new Set(["mta-subway"]);
+const CURATED_FEEDS: ReadonlySet<string> = new Set(["mta-subway", "citibike"]);
 
 const RATE_CAPACITY = 20; // burst
 const RATE_REFILL_PER_SEC = 5;
@@ -85,12 +86,21 @@ export default {
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
-    if (url.pathname === "/v1/locate" || url.pathname.startsWith("/v1/locate/")) {
+    if (
+      url.pathname === "/v1/nearby" ||
+      url.pathname === "/v1/locate" ||
+      url.pathname.startsWith("/v1/locate/")
+    ) {
+      // /v1/nearby shares the locate chain's fan-out cost, so it shares the
+      // tighter bucket too (plan KTD: BeaconDB-proxy abuse is in-scope harm).
       const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
       if (
         rateLimited(ip, Date.now(), locateRateBuckets, LOCATE_RATE_CAPACITY, LOCATE_RATE_REFILL_PER_SEC)
       ) {
         return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      if (url.pathname === "/v1/nearby") {
+        return routeNearby(request, env, url, CURATED_FEEDS);
       }
       return routeLocate(request, env, url);
     }
