@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
-import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrlsFor } from "./adapters";
+import { ParseError } from "./adapters";
+import { type StationStatus, parseStationStatus } from "./adapters/gbfs";
 import {
   type DoIdentity,
   FETCH_TIMEOUT_MS,
@@ -9,41 +10,42 @@ import {
   doTag,
 } from "./do_shared";
 
-export { FETCH_TIMEOUT_MS, IDLE_SUSPEND_MS } from "./do_shared";
-
-export const POLL_INTERVAL_MS = 20_000;
-export const ARRIVALS_PER_ROUTE = 8; // per (stop, route): the trunk-detail screen scrolls all upcoming
+export const POLL_INTERVAL_MS = 60_000; // the GBFS feed's ttl; polling faster is wasted
+// Persist last_read at FeedDO's 20 s bound rather than the 60 s cadence, so
+// the suspend decision's staleness error stays capped at 20 s here too.
+export const LAST_READ_PERSIST_MS = 20_000;
 
 interface Snapshot {
-  arrivals: Record<string, Arrival[]>;
+  stations: Record<string, StationStatus>;
   fetchedAtMs: number; // wall clock at fetch start
-  headerTimestamp: number; // feed generation time (epoch seconds)
+  lastUpdated: number; // GBFS top-level last_updated (epoch seconds)
 }
 
-interface FeedConfig {
-  rtTripUrl: string;
-  adapter: string;
+interface GbfsConfig {
+  statusUrl: string;
 }
 
 /**
- * One DO per feed group ("{feed_id}:{group}"). Polls upstream on a 20 s alarm
- * while devices are reading; self-suspends after 10 idle minutes; serves the
- * last snapshot instantly and refreshes behind. Concurrency discipline per
- * docs/plans/2026-08-02-002: reschedule-first alarm that never throws, one
- * refresh in flight, storage-await-only read-path arming, newer-only stores.
+ * One DO per GBFS feed ("{feed_id}:all" — station_status is a single
+ * document, so there is exactly one group). Sibling of FeedDO with the same
+ * lifecycle discipline (docs/solutions/architecture-patterns/
+ * durable-object-alarm-loop-discipline.md): reschedule-first alarm that never
+ * throws, one refresh in flight, storage-await-only read-path arming,
+ * newer-only stores, 10-idle-minute self-suspend. Only the cadence (60 s ttl),
+ * snapshot shape (station counts vs arrivals), and parse differ.
  */
-export class FeedDO extends DurableObject<Env> {
+export class GbfsDO extends DurableObject<Env> {
   private snapshot: Snapshot | null = null;
   private identity: DoIdentity | null = null;
   private lastReadMs = 0;
   private lastPersistedReadMs = 0;
   private refreshInFlight = false;
-  private configPromise: Promise<FeedConfig> | null = null;
+  private configPromise: Promise<GbfsConfig> | null = null;
   private configMissing = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // Storage-only restore: warm restart serves the last snapshot (R4).
+    // Storage-only restore: warm restart serves the last snapshot.
     ctx.blockConcurrencyWhile(async () => {
       const stored = await ctx.storage.get<unknown>(["snapshot", "identity", "last_read"]);
       const map = stored as Map<string, unknown>;
@@ -56,19 +58,16 @@ export class FeedDO extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const single = url.pathname.match(/^\/stop\/([^/]+)$/);
-    const batch = url.pathname === "/stops";
     const feedId = url.searchParams.get("feed");
     const group = url.searchParams.get("group");
-    if ((!single && !batch) || !feedId || !group) {
+    const single = url.pathname.match(/^\/station\/([^/]+)$/);
+    const batchIds = url.pathname === "/stations" ? url.searchParams.get("ids") : null;
+    if ((!single && batchIds === null) || !feedId || !group) {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
     if (this.configMissing) {
       return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
     }
-    const stopIds = single
-      ? [decodeURIComponent(single[1])]
-      : (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
     const now = Date.now();
 
     // Input-gated sequence: storage awaits only, no interleaving point.
@@ -77,7 +76,7 @@ export class FeedDO extends DurableObject<Env> {
       this.identity = { feedId, group };
       await this.ctx.storage.put("identity", this.identity);
     }
-    if (now - this.lastPersistedReadMs > POLL_INTERVAL_MS) {
+    if (now - this.lastPersistedReadMs > LAST_READ_PERSIST_MS) {
       // Hibernation between sparse reads is the common case; a memory-only
       // stamp would be forgotten and the DO could suspend mid-usage.
       await this.ctx.storage.put("last_read", now);
@@ -90,8 +89,8 @@ export class FeedDO extends DurableObject<Env> {
     }
 
     const response = single
-      ? this.stopResponse(stopIds[0], group, now)
-      : this.stopsResponse(stopIds, group, now);
+      ? this.stationResponse(decodeURIComponent(single[1]))
+      : this.stationsResponse(batchIds ?? "");
     if (arming) {
       this.ctx.waitUntil(this.refresh());
     }
@@ -100,7 +99,7 @@ export class FeedDO extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     // Total handler: exception-driven retries are intentionally unreachable;
-    // the 20 s cadence is the retry policy. Duplicate (at-least-once)
+    // the 60 s cadence is the retry policy. Duplicate (at-least-once)
     // invocations are idempotent: setAlarm overrides, refresh single-flights.
     try {
       if (!this.identity) return; // pre-first-read alarm: nothing to poll
@@ -111,7 +110,7 @@ export class FeedDO extends DurableObject<Env> {
         this.lastPersistedReadMs = this.lastReadMs;
       }
       if (now - this.lastReadMs >= IDLE_SUSPEND_MS) {
-        return; // self-suspend: no reschedule (R2)
+        return; // self-suspend: no reschedule
       }
       await this.ctx.storage.setAlarm(now + POLL_INTERVAL_MS); // reschedule-first
       await this.refresh();
@@ -132,49 +131,45 @@ export class FeedDO extends DurableObject<Env> {
     try {
       const config = await this.loadConfig(this.identity.feedId);
       this.configMissing = false; // a later-fixed feeds row must recover reads
-      const url = groupUrlsFor(config.adapter, config.rtTripUrl)?.[this.identity.group];
-      if (!url) {
-        console.warn(`${this.tag()} adapter ${config.adapter} has no group ${this.identity.group}`);
-        return;
-      }
 
-      const upstream = await fetch(url, {
+      const upstream = await fetch(config.statusUrl, {
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!upstream.ok) {
         console.warn(`${this.tag()} upstream ${upstream.status}; keeping old snapshot`);
         return;
       }
-      const buf = new Uint8Array(await upstream.arrayBuffer());
+      const parsed = parseStationStatus(await upstream.text());
 
-      const headerTimestamp = feedHeaderTimestamp(buf);
       // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
       // failed fetch so staleness becomes visible (spec constraint #5).
-      // Feeds that omit the optional header timestamp (0) skip this gate.
-      if (this.snapshot && headerTimestamp > 0 && headerTimestamp <= this.snapshot.headerTimestamp) {
-        console.warn(`${this.tag()} feed header not advancing (${headerTimestamp}); keeping old snapshot`);
+      // A body that omits last_updated (0) skips this gate.
+      if (this.snapshot && parsed.lastUpdated > 0 && parsed.lastUpdated <= this.snapshot.lastUpdated) {
+        console.warn(`${this.tag()} last_updated not advancing (${parsed.lastUpdated}); keeping old snapshot`);
         return;
       }
       if (this.snapshot && fetchStartMs <= this.snapshot.fetchedAtMs) {
         return; // stale-ordered write from an older interleaved fetch
       }
 
-      const nowSec = Math.floor(fetchStartMs / 1000);
-      const parsed = getAdapter(config.adapter).parse(buf, nowSec);
+      const stations: Record<string, StationStatus> = Object.create(null); // no prototype keys
+      for (const [id, status] of parsed.stations) {
+        stations[id] = status;
+      }
       const snapshot: Snapshot = {
-        arrivals: trimPerRoute(parsed),
+        stations,
         fetchedAtMs: fetchStartMs,
-        headerTimestamp,
+        lastUpdated: parsed.lastUpdated,
       };
       // Persist first, then flip memory: a failed put must not leave the live
-      // instance serving data that regresses on the next warm restart (R4).
+      // instance serving data that regresses on the next warm restart.
       await this.ctx.storage.put("snapshot", snapshot);
       this.snapshot = snapshot;
     } catch (error) {
       if (error instanceof MissingFeedError) {
         this.configMissing = true;
       } else if (error instanceof ParseError) {
-        console.warn(`${this.tag()} unparseable upstream feed; keeping old snapshot:`, error.message);
+        console.warn(`${this.tag()} unparseable station_status; keeping old snapshot:`, error.message);
       } else {
         console.warn(`${this.tag()} refresh failed; keeping old snapshot:`, error);
       }
@@ -183,18 +178,18 @@ export class FeedDO extends DurableObject<Env> {
     }
   }
 
-  private loadConfig(feedId: string): Promise<FeedConfig> {
+  private loadConfig(feedId: string): Promise<GbfsConfig> {
     if (!this.configPromise) {
       this.configPromise = (async () => {
         const row = await this.env.DB.prepare(
-          "SELECT rt_trip_url, adapter FROM feeds WHERE id = ?",
+          "SELECT rt_trip_url FROM feeds WHERE id = ?",
         )
           .bind(feedId)
-          .first<{ rt_trip_url: string | null; adapter: string | null }>();
-        if (!row?.rt_trip_url || !row.adapter) {
+          .first<{ rt_trip_url: string | null }>();
+        if (!row?.rt_trip_url) {
           throw new MissingFeedError(feedId);
         }
-        return { rtTripUrl: row.rt_trip_url, adapter: row.adapter };
+        return { statusUrl: row.rt_trip_url }; // rt_trip_url = station_status URL for GBFS feeds
       })();
       // Clear on rejection so a transient D1 error doesn't pin failure.
       this.configPromise.catch(() => {
@@ -204,67 +199,36 @@ export class FeedDO extends DurableObject<Env> {
     return this.configPromise;
   }
 
-  private stopResponse(stopId: string, group: string, nowMs: number): Response {
+  private stationResponse(stationId: string): Response {
     if (!this.snapshot) {
-      // First-ever read: "no data yet" — distinct from no-service (fetched_at null).
-      return Response.json({ fetched_at: null, group, arrivals: [] });
+      // First-ever read: "no data yet" — distinct from unknown-station (fetched_at null).
+      return Response.json({ fetched_at: null, station: null });
     }
-    const nowSec = Math.floor(nowMs / 1000);
-    // hasOwn guard: stop ids are caller-controlled and storage round-trips
+    // hasOwn guard: station ids are caller-controlled and storage round-trips
     // restore Object.prototype, so "constructor" etc. must not hit the chain.
-    const stored = Object.hasOwn(this.snapshot.arrivals, stopId)
-      ? this.snapshot.arrivals[stopId]
-      : [];
-    const arrivals = stored.filter(
-      (a) => a.time >= nowSec, // same boundary rule as the adapter's write-trim
-    );
+    const station = Object.hasOwn(this.snapshot.stations, stationId)
+      ? this.snapshot.stations[stationId]
+      : null;
     return Response.json({
       fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
-      group,
-      arrivals,
+      station,
     });
   }
 
-  /**
-   * Batch read for composition: one snapshot lookup per group per request
-   * instead of one per platform. Same first-read/staleness contract as the
-   * single-stop route; every requested id is present (empty when unknown).
-   */
-  private stopsResponse(stopIds: string[], group: string, nowMs: number): Response {
+  private stationsResponse(idsParam: string): Response {
+    const ids = idsParam.split(",").filter((id) => id !== "");
     if (!this.snapshot) {
-      const empty: Record<string, Arrival[]> = {};
-      for (const id of stopIds) empty[id] = [];
-      return Response.json({ fetched_at: null, group, stops: empty });
+      return Response.json({ fetched_at: null, stations: {} });
     }
-    const nowSec = Math.floor(nowMs / 1000);
-    const stops: Record<string, Arrival[]> = {};
-    for (const id of stopIds) {
-      const stored = Object.hasOwn(this.snapshot.arrivals, id) ? this.snapshot.arrivals[id] : [];
-      stops[id] = stored.filter((a) => a.time >= nowSec);
-    }
-    return Response.json({
-      fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
-      group,
-      stops,
-    });
-  }
-}
-
-/** Keep the next ARRIVALS_PER_ROUTE arrivals per (stop, route), merged sorted. */
-export function trimPerRoute(byStop: Map<string, Arrival[]>): Record<string, Arrival[]> {
-  const out: Record<string, Arrival[]> = Object.create(null); // no prototype keys
-  for (const [stopId, arrivals] of byStop) {
-    const perRoute = new Map<string, number>();
-    const kept: Arrival[] = [];
-    for (const arrival of arrivals) {
-      // arrivals are sorted ascending by the adapter
-      const count = perRoute.get(arrival.routeId) ?? 0;
-      if (count < ARRIVALS_PER_ROUTE) {
-        kept.push(arrival);
-        perRoute.set(arrival.routeId, count + 1);
+    const stations: Record<string, StationStatus> = Object.create(null); // "__proto__" id must not hit the setter
+    for (const id of ids) {
+      if (Object.hasOwn(this.snapshot.stations, id)) {
+        stations[id] = this.snapshot.stations[id]; // missing ids omitted
       }
     }
-    out[stopId] = kept;
+    return Response.json({
+      fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
+      stations,
+    });
   }
-  return out;
 }
