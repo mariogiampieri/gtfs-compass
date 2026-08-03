@@ -138,12 +138,17 @@ static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
 /* One fetch cycle. Returns the net status for the UI state machine. */
 static gc_net_status_t fetch_once(model_nearby_t *out) {
   static char post_body[2048];
-  bool use_fixed = CONFIG_GC_DEV_FIXED_LAT[0] != '\0' && CONFIG_GC_DEV_FIXED_LON[0] != '\0';
+  /* Location override: NVS (console loc_set) wins over the compile-time
+   * dev seed; either routes through GET and skips scanning. */
+  char lat[GC_COORD_LEN] = CONFIG_GC_DEV_FIXED_LAT;
+  char lon[GC_COORD_LEN] = CONFIG_GC_DEV_FIXED_LON;
+  gc_loc_get(lat, lon);
+  bool use_fixed = lat[0] != '\0' && lon[0] != '\0';
   char url[256];
   int post_len = 0;
   if (use_fixed) {
     snprintf(url, sizeof(url), "%s/v1/nearby?lat=%s&lon=%s&modes=rail,bus,bike",
-             CONFIG_GC_API_BASE_URL, CONFIG_GC_DEV_FIXED_LAT, CONFIG_GC_DEV_FIXED_LON);
+             CONFIG_GC_API_BASE_URL, lat, lon);
   } else {
     snprintf(url, sizeof(url), "%s/v1/nearby", CONFIG_GC_API_BASE_URL);
     post_len = scan_to_json(post_body, sizeof(post_body));

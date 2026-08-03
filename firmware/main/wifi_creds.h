@@ -21,4 +21,16 @@ bool gc_creds_set(const char *ssid, const char *pass);
 /* Erase stored credentials. */
 void gc_creds_clear(void);
 
+#define GC_COORD_LEN 16
+
+/*
+ * Dev location override (NVS "gc"/loc_lat+loc_lon, set via the console's
+ * loc_set): when present, the device uses GET /v1/nearby?lat=&lon= and skips
+ * WiFi scanning — the workaround for thin BeaconDB coverage. Compile-time
+ * CONFIG_GC_DEV_FIXED_* seeds behave identically; NVS wins when both exist.
+ */
+bool gc_loc_get(char lat[GC_COORD_LEN], char lon[GC_COORD_LEN]);
+bool gc_loc_set(const char *lat, const char *lon);
+void gc_loc_clear(void);
+
 #endif

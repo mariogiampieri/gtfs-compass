@@ -9,6 +9,7 @@
  * Connect with: idf.py -p <port> monitor   (or any 115200 serial terminal)
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_console.h"
@@ -61,6 +62,33 @@ static int cmd_status(int argc, char **argv) {
   char ssid[GC_SSID_LEN], pass[GC_PASS_LEN];
   bool have = gc_creds_get(ssid, pass);
   printf("creds: %s%s\n", have ? "stored for " : "none", have ? ssid : "");
+  char lat[GC_COORD_LEN], lon[GC_COORD_LEN];
+  if (gc_loc_get(lat, lon)) printf("location override: %s, %s\n", lat, lon);
+  else printf("location: from WiFi scan (BeaconDB)\n");
+  return 0;
+}
+
+static bool valid_coord(const char *s, double lo, double hi) {
+  char *end;
+  double v = strtod(s, &end);
+  return end != s && *end == '\0' && v >= lo && v <= hi && strlen(s) < GC_COORD_LEN;
+}
+
+static int cmd_loc_set(int argc, char **argv) {
+  if (argc != 3 || !valid_coord(argv[1], -90, 90) || !valid_coord(argv[2], -180, 180)) {
+    printf("usage: loc_set <lat> <lon>   e.g. loc_set 40.692338 -73.987342\n");
+    return 1;
+  }
+  bool ok = gc_loc_set(argv[1], argv[2]);
+  printf(ok ? "stored — next poll uses the fixed location (<=30s)\n" : "NVS write failed\n");
+  return ok ? 0 : 1;
+}
+
+static int cmd_loc_clear(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  gc_loc_clear();
+  printf("cleared — next poll resolves via WiFi scan\n");
   return 0;
 }
 
@@ -75,6 +103,8 @@ void gc_console_start(void) {
   const esp_console_cmd_t cmds[] = {
       {.command = "wifi_set", .help = "wifi_set <ssid> [password]", .func = cmd_wifi_set},
       {.command = "wifi_clear", .help = "erase stored wifi credentials", .func = cmd_wifi_clear},
+      {.command = "loc_set", .help = "loc_set <lat> <lon> — fixed location (skips BeaconDB)", .func = cmd_loc_set},
+      {.command = "loc_clear", .help = "back to WiFi-scan location", .func = cmd_loc_clear},
       {.command = "gc_status", .help = "show provisioning state", .func = cmd_status},
   };
   for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {

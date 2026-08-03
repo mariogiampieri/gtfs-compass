@@ -40,6 +40,36 @@ void gc_creds_clear(void) {
   ESP_LOGI(TAG, "credentials cleared");
 }
 
+bool gc_loc_get(char lat[GC_COORD_LEN], char lon[GC_COORD_LEN]) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t la = GC_COORD_LEN, lo = GC_COORD_LEN;
+  bool ok = nvs_get_str(h, "loc_lat", lat, &la) == ESP_OK &&
+            nvs_get_str(h, "loc_lon", lon, &lo) == ESP_OK && lat[0] != '\0';
+  nvs_close(h);
+  return ok;
+}
+
+bool gc_loc_set(const char *lat, const char *lon) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
+  bool ok = nvs_set_str(h, "loc_lat", lat) == ESP_OK &&
+            nvs_set_str(h, "loc_lon", lon) == ESP_OK && nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  ESP_LOGI(TAG, "location override %s (%s, %s)", ok ? "stored" : "store FAILED", lat, lon);
+  return ok;
+}
+
+void gc_loc_clear(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_key(h, "loc_lat");
+  nvs_erase_key(h, "loc_lon");
+  nvs_commit(h);
+  nvs_close(h);
+  ESP_LOGI(TAG, "location override cleared");
+}
+
 void gc_creds_seed_from_config(void) {
   char ssid[GC_SSID_LEN], pass[GC_PASS_LEN];
   if (gc_creds_get(ssid, pass)) return; /* NVS wins; never overwrite */

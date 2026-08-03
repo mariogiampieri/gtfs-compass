@@ -138,6 +138,29 @@ static void tick_cb(lv_timer_t *t) {
   ui_board_tick(&g_state);
 }
 
+/*
+ * The BSP allocates its LVGL draw buffer with plain malloc, which lands in
+ * PSRAM under SPIRAM_USE_MALLOC — so every flush makes spi_master allocate
+ * an internal DMA bounce buffer the size of the whole transaction, which
+ * starts failing (dropped flushes, error spam) once WiFi+TLS fragment the
+ * internal heap. Replace it with an internal DMA-capable buffer claimed at
+ * boot, before the radio takes the heap. 50 rows ≈ 40 KB keeps the claim
+ * modest; LVGL just flushes in more, smaller chunks.
+ */
+#define GC_DRAW_BUF_ROWS 50
+static void gc_use_dma_draw_buffer(lv_display_t *disp) {
+  size_t size = BSP_LCD_H_RES * GC_DRAW_BUF_ROWS * 2; /* RGB565 */
+  void *buf = heap_caps_aligned_alloc(64, size, MALLOC_CAP_DMA);
+  if (buf == NULL) {
+    ESP_LOGW(TAG, "no internal DMA draw buffer — keeping BSP default");
+    return;
+  }
+  bsp_display_lock(0);
+  lv_display_set_buffers(disp, buf, NULL, size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+  bsp_display_unlock();
+  ESP_LOGI(TAG, "draw buffer: %u B internal DMA (%d rows)", (unsigned)size, GC_DRAW_BUF_ROWS);
+}
+
 void app_main(void) {
   ESP_LOGI(TAG, "gtfs-compass firmware — M1 vertical slice");
   int64_t t0 = now_ms();
@@ -152,7 +175,8 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(nvs_err);
 
-  bsp_display_start();
+  lv_display_t *disp = bsp_display_start();
+  gc_use_dma_draw_buffer(disp);
   bsp_display_backlight_on();
 
   g_ui_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
