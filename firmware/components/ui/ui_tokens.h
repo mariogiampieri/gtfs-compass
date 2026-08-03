@@ -3,6 +3,8 @@
 #ifndef GTFS_COMPASS_UI_TOKENS_H
 #define GTFS_COMPASS_UI_TOKENS_H
 
+#include "gc_fonts.h"
+
 #define TK_SCREEN_W 410
 #define TK_SCREEN_H 502
 #define TK_SIDE_INSET 34
@@ -27,6 +29,24 @@
 #define TK_SKELETON_HI 0x26262A
 #define TK_EMPTY_RING 0x3A3A3E
 #define TK_EMPTY_TITLE 0xC9C9CF
+
+/* Fonts — IBM Plex Sans at the handoff's true ramp (px/weight); the M1
+ * Montserrat even-size mapping (15→14, 17→16, 25→24, 27→26) is retired. */
+#define TK_FONT_SUB (&gc_plex_14)          /* sub/hint/unit        14/400 */
+#define TK_FONT_PILL (&gc_plex_15)         /* pill & legend        15/600 */
+#define TK_FONT_CHIP (&gc_plex_16)         /* chip / caps labels   16/600 */
+#define TK_FONT_BODY (&gc_plex_17)         /* empty-state body     17/400 */
+#define TK_FONT_HEADSIGN (&gc_plex_18)     /* board headsign       18/400 */
+#define TK_FONT_DIRECTION (&gc_plex_20)    /* detail direction /
+                                              short bus-pill label 20/600 */
+#define TK_FONT_TITLE_SM (&gc_plex_24)     /* 2-line station name,
+                                              empty-state title    24/700 */
+#define TK_FONT_BULLET (&gc_plex_25)       /* rail bullet label    25/700 */
+#define TK_FONT_TITLE_MD (&gc_plex_27)     /* station name (13-18) 27/700 */
+#define TK_FONT_TITLE_LG (&gc_plex_30)     /* station name (<=12)  30/700 */
+#define TK_FONT_COUNTDOWN (&gc_plex_36)    /* board countdown      36/700 */
+#define TK_FONT_COUNTDOWN_XL (&gc_plex_40) /* detail countdown     40/700 */
+#define TK_FONT_HERO (&gc_plex_84)         /* bike heroes, digits  84/700 */
 
 /* Chrome */
 #define TK_CHIP_Y 18

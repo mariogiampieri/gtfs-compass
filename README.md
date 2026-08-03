@@ -374,6 +374,16 @@ cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 ./build/test_model                   # model parser suite (ASAN)
 ```
 
+### Fonts
+
+The UI renders IBM Plex Sans (OFL 1.1) converted to LVGL bitmap faces at
+the design ramp with tabular numerals. The generated `.c` files live in
+`firmware/components/ui/fonts/` and are committed, so ordinary builds need
+nothing extra. To change sizes, weights, or glyph ranges, edit and re-run
+`firmware/tools/genfonts.sh` (needs node + curl; it downloads the pinned
+TTF releases into a gitignored cache). Attribution and license text:
+`firmware/components/ui/fonts/README.md` and `OFL.txt`.
+
 ## Feed data licensing
 
 This project redistributes transit data published by agencies under their

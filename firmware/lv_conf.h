@@ -26,21 +26,14 @@
 #define LV_DPI_DEF 130
 
 /*
- * Handoff type ramp (px): 14 15 16 17 18 20 24 25 27 30 36 (+40/84 in M2).
- * Built-in Montserrat ships even sizes; the M1 mapping is 15→14, 17→16,
- * 25→24, 27→26 — converted faces with tabular numerals are a deferred
- * polish pass (plan KTD).
+ * Fonts: converted IBM Plex Sans faces at the handoff's true ramp
+ * (components/ui/fonts/, plan U6) — no built-in Montserrat sizes are
+ * referenced anywhere. Montserrat 14 stays enabled only as LVGL's theme
+ * default font (every UI label sets a TK_FONT_* face explicitly); this
+ * mirrors the device build, where the Kconfig defaults do the same.
  */
 #define LV_FONT_MONTSERRAT_14 1
-#define LV_FONT_MONTSERRAT_16 1
-#define LV_FONT_MONTSERRAT_18 1
-#define LV_FONT_MONTSERRAT_20 1
-#define LV_FONT_MONTSERRAT_24 1
-#define LV_FONT_MONTSERRAT_26 1
-#define LV_FONT_MONTSERRAT_28 1
-#define LV_FONT_MONTSERRAT_30 1
-#define LV_FONT_MONTSERRAT_36 1
-#define LV_FONT_DEFAULT (&lv_font_montserrat_16)
+#define LV_FONT_DEFAULT (&lv_font_montserrat_14)
 
 #define LV_USE_LABEL 1
 #define LV_USE_ANIMATION 1
