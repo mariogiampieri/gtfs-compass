@@ -1,5 +1,6 @@
 import { NYCT_ROUTE_GROUP, nyctDirectionId } from "./adapters/nyct";
 import type { StationStatus } from "./adapters/gbfs";
+import { AGENCY_WIDE_KEY, type AlertItem } from "./adapters/mta_alerts";
 import { FETCH_TIMEOUT_MS } from "./do_shared";
 import { bulletShape, normalizeColor, paletteColor, textColorFor } from "./presentation";
 import { type StopGroup, nearbyStops, nearestBeyond } from "./stops";
@@ -30,6 +31,12 @@ export const DEFAULT_RADIUS_M = 1200;
 export const STOPS_PER_SYSTEM = 5; // payload cap — a designer call, flagged in the plan
 const ARRIVALS_PER_DIRECTION = 8; // matches FeedDO's per-route trim depth
 const TERMINAL_LOOKUP_CAP = 80; // headroom under D1's 100-binding statement limit
+// Alert staleness horizon: 3× the self-suspend threshold, NOT 10× cadence — a
+// horizon equal to the suspend threshold would deterministically null the
+// first post-idle read (the pocket-pull gesture), and slow-moving alert data
+// stays informative for tens of minutes (plan A6).
+const ALERT_MAX_AGE_S = 30 * 60;
+const ALERT_TEXT_MAX = 200; // unbounded vendor copy must not become a device problem
 
 // The device contract (design handoff README "API Contract") — typed so the
 // compiler guards the shape Phase 4 firmware builds against.
@@ -51,12 +58,19 @@ export interface DirectionEntry {
   arrivals: ArrivalEntry[];
 }
 
+export interface TrunkAlert {
+  severity: "delay" | "info";
+  text: string;
+  directions: number[];
+}
+
 export interface Trunk {
   key: string;
   color: string;
   text_color: string;
   routes: RouteEntry[];
-  alert: null;
+  /** null conflates no-alert / source-down / stale — documented contract. */
+  alert: TrunkAlert | null;
   note: null;
   directions: [DirectionEntry, DirectionEntry];
 }
@@ -205,11 +219,12 @@ async function composeRailSystem(
   const neededGroups = [...new Set(groupByRoute.values())];
   const allPlatformIds = stations.flatMap((s) => s.stopIds);
 
-  // The three lookups depend only on routeIds/stations — run them together.
-  const [routeRows, fallbackHeadsigns, snapshots] = await Promise.all([
+  // The four lookups depend only on routeIds/stations — run them together.
+  const [routeRows, fallbackHeadsigns, snapshots, alertsByRoute] = await Promise.all([
     loadRouteRows(env, feed.id, routeIds),
     loadFallbackHeadsigns(env, feed.id, routeIds),
     fetchGroupSnapshots(env, feed.id, neededGroups, allPlatformIds),
+    fetchAlerts(env, feed.id, routeIds),
   ]);
   const routesById = new Map(routeRows.map((r) => [r.route_id, r]));
 
@@ -255,6 +270,9 @@ async function composeRailSystem(
         direction.arrivals.length = Math.min(direction.arrivals.length, ARRIVALS_PER_DIRECTION);
       }
     }
+    if (alertsByRoute) {
+      attachAlerts(trunks, trunkByRoute, station, alertsByRoute);
+    }
     return {
       id: station.id,
       name: station.name,
@@ -276,6 +294,94 @@ async function composeRailSystem(
     ...(snapshots.anySourceFailed ? { partial: true as const } : {}),
     stops,
   };
+}
+
+/**
+ * Alerts overlay fetch: failure-isolated (null → every trunk renders
+ * alert: null, `partial` untouched — alerts are an overlay, not an arrivals
+ * source) and honesty-gated (a snapshot older than ALERT_MAX_AGE_S is
+ * treated as absent — never silently shown). The DO serves active-only.
+ */
+async function fetchAlerts(
+  env: Env,
+  feedId: string,
+  routeIds: string[],
+): Promise<Record<string, AlertItem[]> | null> {
+  if (routeIds.length === 0) return null;
+  try {
+    const stub = env.ALERT_DO.get(env.ALERT_DO.idFromName(`${feedId}:alerts`));
+    const res = await stub.fetch(
+      `https://do/routes?ids=${routeIds.map(encodeURIComponent).join(",")}&feed=${feedId}&group=alerts`,
+      { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    );
+    if (!res.ok) throw new Error(`alerts status ${res.status}`);
+    const body = await res.json<{ fetched_at: number | null; routes: Record<string, AlertItem[]> }>();
+    if (body.fetched_at === null) return null; // cold: no data yet
+    if (Math.floor(Date.now() / 1000) - body.fetched_at > ALERT_MAX_AGE_S) {
+      console.warn(`[nearby] ${feedId} alerts snapshot beyond freshness horizon; suppressing`);
+      return null;
+    }
+    return body.routes;
+  } catch (error) {
+    console.warn(`[nearby] ${feedId} alerts fetch failed:`, error);
+    return null;
+  }
+}
+
+/**
+ * Fill trunk.alert per the design shape: candidates from member routes plus
+ * the agency-wide sentinel, station-scoped when the alert carries stop
+ * selectors, one alert per trunk (severity then recency — the design renders
+ * a single object), directions from the picked item's selectors.
+ */
+function attachAlerts(
+  trunks: Trunk[],
+  trunkByRoute: Map<string, Trunk>,
+  station: StopGroup,
+  alertsByRoute: Record<string, AlertItem[]>,
+): void {
+  const stationIds = new Set([station.id, ...station.stopIds]);
+  const candidates = new Map<Trunk, AlertItem[]>();
+  const add = (trunk: Trunk | undefined, items: AlertItem[] | undefined) => {
+    if (!trunk || !items?.length) return;
+    const list = candidates.get(trunk) ?? [];
+    list.push(...items);
+    candidates.set(trunk, list);
+  };
+  for (const [routeId, trunk] of trunkByRoute) {
+    add(trunk, Object.hasOwn(alertsByRoute, routeId) ? alertsByRoute[routeId] : undefined);
+  }
+  const agencyWide = Object.hasOwn(alertsByRoute, AGENCY_WIDE_KEY)
+    ? alertsByRoute[AGENCY_WIDE_KEY]
+    : undefined;
+  for (const trunk of trunks) {
+    add(trunk, agencyWide);
+  }
+
+  for (const [trunk, items] of candidates) {
+    const inScope = items.filter(
+      (item) => item.stopIds.length === 0 || item.stopIds.some((id) => stationIds.has(id)),
+    );
+    if (inScope.length === 0) continue;
+    inScope.sort(
+      (a, b) =>
+        (a.severity === b.severity ? 0 : a.severity === "delay" ? -1 : 1) ||
+        b.updatedAt - a.updatedAt,
+    );
+    const picked = inScope[0];
+    trunk.alert = {
+      severity: picked.severity,
+      text: truncateAtWhitespace(picked.text, ALERT_TEXT_MAX),
+      directions: picked.directionIds.length ? picked.directionIds : [0, 1],
+    };
+  }
+}
+
+function truncateAtWhitespace(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const lastSpace = cut.lastIndexOf(" ");
+  return `${cut.slice(0, lastSpace > max / 2 ? lastSpace : max)}…`;
 }
 
 /** One batch snapshot read per needed group, concurrent, failure-isolated. */
