@@ -479,6 +479,24 @@ def test_normalized_identical_duplicate_deduped_and_counted(two_source_feed, cap
     assert any("normalized-identical" in r.message for r in caplog.records)
 
 
+def test_survey_drift_duplicate_dedupes_without_refusal(two_source_feed):
+    # Same stop id ~20 m away with an abbreviated name: the live borough vs
+    # busco zips publish exactly this shape (781 ids on 2026-08-03) — it is
+    # survey drift, not a conflict, and must never wedge the nightly prune.
+    b_stops = (
+        "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+        "B1,COURT ST (E),40.69018,-73.98988,,\n"  # ~20 m from zip_a's B1
+        "Q1,Main St,40.70,-73.80,,\n"
+        "Q2,Kissena Blvd,40.7010,-73.8010,,\n"
+    )
+    client, session = multi_client()
+    http = FakeMultiHTTP({SRC_A: zip_a(), SRC_B: zip_b(stops=b_stops)})
+    run_static(client, "multi-bus", http_session=http)  # no PruneRefused
+
+    stops = {r["stop_id"]: r for r in inserted_rows(session, "stops")}
+    assert stops["B1"]["name"] == "Court St"  # first-seen text wins
+
+
 def test_conflicting_duplicate_keeps_first_seen_and_refuses_prune(two_source_feed, caplog):
     b_stops = (
         "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"

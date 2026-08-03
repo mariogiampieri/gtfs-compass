@@ -239,6 +239,34 @@ def _normalized_payload(row: dict) -> tuple:
     return tuple(normalized)
 
 
+# Same-id stops closer than this are the same physical stop published with
+# survey drift, not a conflict. Measured against the live zips (2026-08-03):
+# borough vs busco rows for shared stop boxes differ by ~15-30 m and by name
+# abbreviation ("EAST" vs "E"), across 781 ids — exact-payload identity would
+# refuse the nightly prune forever. A reused id for a *different* place is
+# what the conflict path exists to catch, and distance is its real signal.
+STOP_DRIFT_TOLERANCE_DEG = 0.001  # ~111 m latitude; generous for GPS drift
+# Name-identical same-id stops get a looser allowance: the live zips carry a
+# handful ~90-150 m apart (wide parkway intersections, disagreeing pole
+# placements) with byte-equal names — same stop, not a reused id.
+STOP_DRIFT_SAME_NAME_DEG = 0.0025
+
+
+def _same_stop_within_drift(seen: dict, row: dict) -> bool:
+    try:
+        same_name = (seen.get("name") or "").strip().casefold() == (
+            row.get("name") or ""
+        ).strip().casefold()
+        tolerance = STOP_DRIFT_SAME_NAME_DEG if same_name else STOP_DRIFT_TOLERANCE_DEG
+        return (
+            abs(float(seen["lat"]) - float(row["lat"])) <= tolerance
+            and abs(float(seen["lon"]) - float(row["lon"])) <= tolerance
+            and (seen.get("parent_station") or None) == (row.get("parent_station") or None)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _merge_source_rows(
     accum: dict[str, dict],
     rows: list[dict],
@@ -260,6 +288,10 @@ def _merge_source_rows(
         if seen is None:
             accum[key] = row
         elif _normalized_payload(seen) == _normalized_payload(row):
+            deduped += 1
+        elif table_name == "stops" and _same_stop_within_drift(seen, row):
+            # Coordinate-proximate same-id stops: survey drift between
+            # generators, first-seen text wins, not a conflict.
             deduped += 1
         else:
             conflicts += 1
