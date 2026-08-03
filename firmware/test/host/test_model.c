@@ -1,9 +1,11 @@
-/* Host tests for components/model — runs with plain cc + Unity, no IDF. */
+/* Host tests for components/model + the ui_state reconciler (plan U1) —
+ * runs with plain cc + Unity, no IDF. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "model.h"
+#include "ui_state.h"
 #include "unity.h"
 
 void setUp(void) {}
@@ -315,6 +317,207 @@ static void test_depth_bomb_rejected_not_crashed(void) {
   TEST_ASSERT_EQUAL(MODEL_PARSE_ERR_JSON, model_parse_nearby(bomb, strlen(bomb), &m));
 }
 
+/* ---------- identity fields (plan U1 / R6) ---------- */
+
+static void test_parser_populates_ids_on_live_fixture(void) {
+  size_t len;
+  char *body = read_file("live-jay-st.json", &len);
+  TEST_ASSERT_EQUAL(MODEL_PARSE_OK, model_parse_nearby(body, len, &g_model));
+  free(body);
+  TEST_ASSERT_EQUAL_STRING("A41", g_model.rail.stops[0].id);
+  TEST_ASSERT_EQUAL_STRING("0062cf", g_model.rail.stops[0].trunks[0].key);
+  /* GBFS station ids are full UUIDs — the longest identity the API sends */
+  TEST_ASSERT_EQUAL_STRING("66db88f5-0aca-11e7-82f6-3863bb44ef7c", g_model.bike.stations[0].id);
+}
+
+static void test_id_and_key_truncate_nul_terminated(void) {
+  char longid[80];
+  memset(longid, 'I', sizeof(longid) - 1);
+  longid[sizeof(longid) - 1] = '\0';
+  char json[2048];
+  snprintf(json, sizeof(json),
+           "{\"units\":\"imperial\",\"systems\":["
+           "{\"mode\":\"rail\",\"direction_labels\":null,\"fetched_at\":9,\"stops\":["
+           "{\"id\":\"%.60s\",\"name\":\"S\",\"distance_label\":\"1 mi\","
+           "\"trunks\":[{\"key\":\"%.30s\",\"color\":\"#112233\",\"routes\":[]}]}]},"
+           "{\"mode\":\"bike\",\"fetched_at\":5,\"stations\":["
+           "{\"id\":\"%.70s\",\"name\":\"D\",\"distance_label\":\"1 ft\",\"bikes_classic\":1,"
+           "\"bikes_electric\":0,\"docks_open\":1,\"capacity\":2}]}]}",
+           longid, longid, longid);
+  parse_ok(json);
+  TEST_ASSERT_EQUAL(MODEL_STOP_ID_LEN - 1, strlen(g_model.rail.stops[0].id));
+  TEST_ASSERT_EQUAL(MODEL_TRUNK_KEY_LEN - 1, strlen(g_model.rail.stops[0].trunks[0].key));
+  TEST_ASSERT_EQUAL(MODEL_BIKE_ID_LEN - 1, strlen(g_model.bike.stations[0].id));
+}
+
+/* ---------- ui_reconcile (plan U1 / R6, KTD-7) ---------- */
+
+/* rail: S1 (trunks k1,k2), S2 (k3) — fetched 120 s before generated_at.
+ * bike: b1, b2, b3 — fetched 5 s before generated_at (per-system ages differ). */
+static const char *RECON_BASE =
+    "{\"generated_at\":\"2026-08-03T04:02:43Z\",\"units\":\"imperial\",\"systems\":["
+    "{\"mode\":\"rail\",\"direction_labels\":[\"Uptown\",\"Downtown\"],\"fetched_at\":1785729643,"
+    "\"stops\":["
+    "{\"id\":\"S1\",\"name\":\"First\",\"distance_label\":\"1 mi\",\"trunks\":["
+    "{\"key\":\"k1\",\"color\":\"#112233\",\"routes\":[]},"
+    "{\"key\":\"k2\",\"color\":\"#445566\",\"routes\":[]}]},"
+    "{\"id\":\"S2\",\"name\":\"Second\",\"distance_label\":\"2 mi\",\"trunks\":["
+    "{\"key\":\"k3\",\"color\":\"#778899\",\"routes\":[]}]}]},"
+    "{\"mode\":\"bike\",\"fetched_at\":1785729758,\"stations\":["
+    "{\"id\":\"b1\",\"name\":\"D1\",\"distance_label\":\"1 ft\",\"bikes_classic\":1,"
+    "\"bikes_electric\":0,\"docks_open\":2,\"capacity\":3},"
+    "{\"id\":\"b2\",\"name\":\"D2\",\"distance_label\":\"2 ft\",\"bikes_classic\":2,"
+    "\"bikes_electric\":1,\"docks_open\":0,\"capacity\":3},"
+    "{\"id\":\"b3\",\"name\":\"D3\",\"distance_label\":\"3 ft\",\"bikes_classic\":0,"
+    "\"bikes_electric\":0,\"docks_open\":3,\"capacity\":3}]}]}";
+
+/* Same entities reordered + a new first stop: rail [S3 (k4), S1 (k2,k1), S2 (k3)],
+ * bike [b3, b2, b1] — indices shift, identities persist. */
+static const char *RECON_SHUFFLED =
+    "{\"generated_at\":\"2026-08-03T04:02:43Z\",\"units\":\"imperial\",\"systems\":["
+    "{\"mode\":\"rail\",\"direction_labels\":[\"Uptown\",\"Downtown\"],\"fetched_at\":1785729643,"
+    "\"stops\":["
+    "{\"id\":\"S3\",\"name\":\"Newcomer\",\"distance_label\":\"0 ft\",\"trunks\":["
+    "{\"key\":\"k4\",\"color\":\"#000000\",\"routes\":[]}]},"
+    "{\"id\":\"S1\",\"name\":\"First\",\"distance_label\":\"1 mi\",\"trunks\":["
+    "{\"key\":\"k2\",\"color\":\"#445566\",\"routes\":[]},"
+    "{\"key\":\"k1\",\"color\":\"#112233\",\"routes\":[]}]},"
+    "{\"id\":\"S2\",\"name\":\"Second\",\"distance_label\":\"2 mi\",\"trunks\":["
+    "{\"key\":\"k3\",\"color\":\"#778899\",\"routes\":[]}]}]},"
+    "{\"mode\":\"bike\",\"fetched_at\":1785729758,\"stations\":["
+    "{\"id\":\"b3\",\"name\":\"D3\",\"distance_label\":\"3 ft\",\"bikes_classic\":0,"
+    "\"bikes_electric\":0,\"docks_open\":3,\"capacity\":3},"
+    "{\"id\":\"b2\",\"name\":\"D2\",\"distance_label\":\"2 ft\",\"bikes_classic\":2,"
+    "\"bikes_electric\":1,\"docks_open\":0,\"capacity\":3},"
+    "{\"id\":\"b1\",\"name\":\"D1\",\"distance_label\":\"1 ft\",\"bikes_classic\":1,"
+    "\"bikes_electric\":0,\"docks_open\":2,\"capacity\":3}]}]}";
+
+static ui_state_t g_state; /* zero-padded via ui_state_init → memcmp-safe */
+
+static void test_reconcile_viewed_stop_survives_refresh(void) {
+  parse_ok(RECON_SHUFFLED);
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_RAIL;
+  g_state.view = UI_VIEW_BOARD;
+  strcpy(g_state.stop_id[UI_SYS_RAIL], "S2");
+  g_state.stop_idx[UI_SYS_RAIL] = 1; /* stale index from the previous model */
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(2, g_state.stop_idx[UI_SYS_RAIL]); /* index updates */
+  TEST_ASSERT_EQUAL_STRING("S2", g_state.stop_id[UI_SYS_RAIL]);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view); /* view kept */
+}
+
+static void test_reconcile_viewed_stop_gone_pops_to_board(void) {
+  parse_ok(RECON_BASE);
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_RAIL;
+  g_state.view = UI_VIEW_DETAIL;
+  strcpy(g_state.stop_id[UI_SYS_RAIL], "SX"); /* not in the new model */
+  g_state.stop_idx[UI_SYS_RAIL] = 4;
+  strcpy(g_state.trunk_key, "k1");
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL(0, g_state.stop_idx[UI_SYS_RAIL]);
+  TEST_ASSERT_EQUAL_STRING("S1", g_state.stop_id[UI_SYS_RAIL]); /* adopts new stop 0 */
+  TEST_ASSERT_EQUAL_STRING("", g_state.trunk_key);
+}
+
+static void test_reconcile_viewed_trunk_gone_pops_detail(void) {
+  parse_ok(RECON_BASE);
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_RAIL;
+  g_state.view = UI_VIEW_DETAIL;
+  strcpy(g_state.stop_id[UI_SYS_RAIL], "S1");
+  strcpy(g_state.trunk_key, "k3"); /* lives on S2, not S1 */
+  g_state.trunk_idx = 1;
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL_STRING("", g_state.trunk_key);
+  /* the stop itself survived */
+  TEST_ASSERT_EQUAL(0, g_state.stop_idx[UI_SYS_RAIL]);
+  TEST_ASSERT_EQUAL_STRING("S1", g_state.stop_id[UI_SYS_RAIL]);
+}
+
+static void test_reconcile_trunk_shuffle_refound_at_new_index(void) {
+  parse_ok(RECON_SHUFFLED);
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_RAIL;
+  g_state.view = UI_VIEW_DETAIL;
+  strcpy(g_state.stop_id[UI_SYS_RAIL], "S1");
+  g_state.stop_idx[UI_SYS_RAIL] = 0; /* S1 moved 0 → 1 */
+  strcpy(g_state.trunk_key, "k2");
+  g_state.trunk_idx = 1; /* k2 moved 1 → 0 within S1 */
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_DETAIL, g_state.view); /* detail survives */
+  TEST_ASSERT_EQUAL(1, g_state.stop_idx[UI_SYS_RAIL]);
+  TEST_ASSERT_EQUAL(0, g_state.trunk_idx);
+  TEST_ASSERT_EQUAL_STRING("k2", g_state.trunk_key);
+}
+
+static void test_reconcile_bike_selection_survives_reorder(void) {
+  parse_ok(RECON_SHUFFLED);
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_BIKE;
+  g_state.view = UI_VIEW_BIKE_NEARBY;
+  strcpy(g_state.stop_id[UI_SYS_BIKE], "b1");
+  g_state.stop_idx[UI_SYS_BIKE] = 0; /* b1 moved 0 → 2 */
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(2, g_state.stop_idx[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL_STRING("b1", g_state.stop_id[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL(UI_VIEW_BIKE_NEARBY, g_state.view); /* view kept */
+}
+
+static void test_reconcile_bike_station_gone_pops_to_board(void) {
+  parse_ok(RECON_BASE);
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_BIKE;
+  g_state.view = UI_VIEW_BIKE_NEARBY;
+  strcpy(g_state.stop_id[UI_SYS_BIKE], "bX");
+  g_state.stop_idx[UI_SYS_BIKE] = 3;
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL(0, g_state.stop_idx[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL_STRING("b1", g_state.stop_id[UI_SYS_BIKE]);
+}
+
+static void test_reconcile_seeds_age_per_system(void) {
+  parse_ok(RECON_BASE);
+  ui_state_init(&g_state);
+  TEST_ASSERT_EQUAL(-1, g_state.age_s[UI_SYS_RAIL]); /* init sentinel */
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(120, g_state.age_s[UI_SYS_RAIL]); /* rail vs bike differ */
+  TEST_ASSERT_EQUAL(5, g_state.age_s[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL(-1, g_state.age_s[UI_SYS_BUS]); /* no bus data source (KTD-6) */
+}
+
+static void test_reconcile_first_fetch_adopts_entity_zero(void) {
+  parse_ok(RECON_BASE);
+  ui_state_init(&g_state); /* never navigated: identity strings empty */
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL_STRING("S1", g_state.stop_id[UI_SYS_RAIL]);
+  TEST_ASSERT_EQUAL(0, g_state.stop_idx[UI_SYS_RAIL]);
+  TEST_ASSERT_EQUAL_STRING("b1", g_state.stop_id[UI_SYS_BIKE]);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view); /* adoption never pops anything */
+}
+
+static void test_reconcile_empty_model_is_noop(void) {
+  /* never-fetched model: all systems absent — the state must not move */
+  static model_nearby_t empty;
+  memset(&empty, 0, sizeof(empty));
+  ui_state_init(&g_state);
+  g_state.sys = UI_SYS_RAIL;
+  g_state.view = UI_VIEW_DETAIL;
+  g_state.dir = 1;
+  strcpy(g_state.stop_id[UI_SYS_RAIL], "S1");
+  g_state.stop_idx[UI_SYS_RAIL] = 1;
+  strcpy(g_state.trunk_key, "k2");
+  g_state.age_s[UI_SYS_RAIL] = 42;
+  ui_state_t before;
+  memcpy(&before, &g_state, sizeof(before));
+  ui_reconcile(&g_state, &empty);
+  TEST_ASSERT_EQUAL_MEMORY(&before, &g_state, sizeof(before));
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_live_fixture_parses_with_expected_shape);
@@ -333,5 +536,16 @@ int main(void) {
   RUN_TEST(test_headsign_and_alert_text_truncate);
   RUN_TEST(test_generated_at_seeds_initial_age);
   RUN_TEST(test_depth_bomb_rejected_not_crashed);
+  RUN_TEST(test_parser_populates_ids_on_live_fixture);
+  RUN_TEST(test_id_and_key_truncate_nul_terminated);
+  RUN_TEST(test_reconcile_viewed_stop_survives_refresh);
+  RUN_TEST(test_reconcile_viewed_stop_gone_pops_to_board);
+  RUN_TEST(test_reconcile_viewed_trunk_gone_pops_detail);
+  RUN_TEST(test_reconcile_trunk_shuffle_refound_at_new_index);
+  RUN_TEST(test_reconcile_bike_selection_survives_reorder);
+  RUN_TEST(test_reconcile_bike_station_gone_pops_to_board);
+  RUN_TEST(test_reconcile_seeds_age_per_system);
+  RUN_TEST(test_reconcile_first_fetch_adopts_entity_zero);
+  RUN_TEST(test_reconcile_empty_model_is_noop);
   return UNITY_END();
 }

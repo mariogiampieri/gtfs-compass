@@ -7,6 +7,8 @@
  * fields, free the tree in one exit path; never store pointers into the
  * tree; every field access is null-checked (the Worker is ours, the network
  * is not).
+  * M2: identity fields (stop id / trunk key / bike station id) land here
+ * for the reconciler — plan U1.
  */
 #include "model.h"
 
@@ -104,6 +106,7 @@ static void parse_alert(const cJSON *alert, model_alert_t *out) {
 
 static void parse_trunk(const cJSON *trunk, model_trunk_t *out) {
   memset(out, 0, sizeof(*out));
+  copy_str(out->key, sizeof(out->key), cJSON_GetObjectItemCaseSensitive(trunk, "key"));
   out->color = parse_color(cJSON_GetObjectItemCaseSensitive(trunk, "color"));
   out->text_color = parse_color(cJSON_GetObjectItemCaseSensitive(trunk, "text_color"));
 
@@ -165,6 +168,7 @@ static void parse_rail_system(const cJSON *sys, model_rail_system_t *out) {
     if (!cJSON_IsObject(s) || out->stop_count >= MODEL_MAX_STOPS) continue;
     model_stop_t *stop = &out->stops[out->stop_count];
     memset(stop, 0, sizeof(*stop));
+    copy_str(stop->id, sizeof(stop->id), cJSON_GetObjectItemCaseSensitive(s, "id"));
     copy_str(stop->name, sizeof(stop->name), cJSON_GetObjectItemCaseSensitive(s, "name"));
     copy_str(stop->distance_label, sizeof(stop->distance_label),
              cJSON_GetObjectItemCaseSensitive(s, "distance_label"));
@@ -201,6 +205,7 @@ static void parse_bike_system(const cJSON *sys, model_bike_system_t *out) {
     if (!cJSON_IsObject(s) || out->station_count >= MODEL_MAX_BIKE_STATIONS) continue;
     model_bike_station_t *st = &out->stations[out->station_count];
     memset(st, 0, sizeof(*st));
+    copy_str(st->id, sizeof(st->id), cJSON_GetObjectItemCaseSensitive(s, "id"));
     copy_str(st->name, sizeof(st->name), cJSON_GetObjectItemCaseSensitive(s, "name"));
     copy_str(st->distance_label, sizeof(st->distance_label),
              cJSON_GetObjectItemCaseSensitive(s, "distance_label"));

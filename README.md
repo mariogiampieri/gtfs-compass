@@ -346,9 +346,32 @@ cd firmware/sim && cmake -B build -G Ninja . && cmake --build build
 ./build/sim                          # renders fixtures/live-jay-st.json
 ```
 
-Keys: `1`–`5` cycle loading/live/stale/offline/no-location, `j`/`k` cycle
-stops, `f` toggles the refresh flash. Capture a fresh live fixture with
+Keys (routed through the same navigation code the device gestures use):
+
+| Key       | Action                                              |
+| --------- | --------------------------------------------------- |
+| `h` / `l` | previous / next system (rail ↔ bus ↔ bike, clamped) |
+| `j` / `k` | next / previous stop (rail board)                   |
+| `Enter`   | open the trunk detail for the first trunk           |
+| `Esc`/`b` | back to the board                                   |
+| `d`       | flip direction (global)                             |
+| `1`–`5`   | loading / live / stale / offline / no-location      |
+| `f`       | toggle the refresh flash · `q` quit                 |
+
+The mouse drives the same gesture tracker and tap/swipe routing as the
+device touch panel: swipe left/right for systems, up/down for stops, tap a
+trunk row for detail, tap the `⇅` pill to flip, tap the bike screen for the
+nearby list, tap a nearby row to make that station current (`‹ back` or a
+horizontal swipe exits without changing it). Capture a fresh live fixture with
 `curl <worker>/v1/nearby?lat=..&lon=.. > firmware/fixtures/name.json`.
+
+Headless capture: `GC_DUMP=/tmp/f.ppm ./build/sim` renders one frame and
+exits; `GC_VIEW=detail[:N] | bike | bus | nearby` sets the view first and
+`GC_DIR=1` flips the rendered direction, so
+every screen is reachable without a window.
+
+The sim build also produces `./build/test_input`, a headless scripted-pointer
+suite for the gesture tracker (run in CI).
 
 ### Device build, flash, provision
 
@@ -383,7 +406,22 @@ when both exist.
 ```bash
 cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 ./build/test_model                   # model parser suite (ASAN)
+./build/test_nav                     # navigation/reconciler transitions
+./build/test_bike_layout             # bike hero/capacity-bar math
 ```
+
+(The sim build also produces `firmware/sim/build/test_input`, the headless
+gesture-tracker suite.)
+
+### Fonts
+
+The UI renders IBM Plex Sans (OFL 1.1) converted to LVGL bitmap faces at
+the design ramp with tabular numerals. The generated `.c` files live in
+`firmware/components/ui/fonts/` and are committed, so ordinary builds need
+nothing extra. To change sizes, weights, or glyph ranges, edit and re-run
+`firmware/tools/genfonts.sh` (needs node + curl + unzip; it downloads the pinned
+TTF releases into a gitignored cache). Attribution and license text:
+`firmware/components/ui/fonts/README.md` and `OFL.txt`.
 
 ## Feed data licensing
 
