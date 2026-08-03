@@ -88,6 +88,10 @@ def build_feed_rows(catalog_text: str, now: int) -> list[dict]:
                 "license_url": row.get("urls.license") or None,
                 "status": seeds.SUPPRESSED_STATUS if suppressed else "active",
                 "updated_at": now,
+                # Catalog knows nothing about direction semantics; curated
+                # rows set real labels. Units default matches the seeds.
+                "direction_labels": None,
+                "units": "imperial",
             }
         )
     return feed_rows

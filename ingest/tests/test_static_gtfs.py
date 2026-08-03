@@ -1,9 +1,9 @@
 import io
+import logging
 import zipfile
 
 import pytest
 from conftest import FakeSession
-
 from gtfs_compass_ingest.load import D1Client
 from gtfs_compass_ingest.static_gtfs import run_static
 
@@ -131,7 +131,7 @@ def test_header_order_independence():
 
 
 def test_removed_stop_pruned_children_before_parents():
-    blank = {"name": None, "lat": None, "lon": None, "parent_station": None}
+    blank = {"name": None, "lat": None, "lon": None, "parent_station": None, "capacity": None}
     existing = {
         "stops": [
             {"feed_id": "mta-subway", "stop_id": s, **blank}
@@ -178,3 +178,103 @@ def test_missing_static_url_in_d1_raises():
 def test_unknown_feed_without_client_raises():
     with pytest.raises(ValueError, match="unknown"):
         run_static(None, "not-a-feed", dry_run=True, http_session=FakeHTTP(make_zip()))
+
+
+# --- route_directions derivation (Phase 3 / U1) ---
+
+TRIPS_WITH_DIRECTIONS = """route_id,service_id,trip_id,direction_id,trip_headsign
+A,wk,t1,0,Far Rockaway
+A,wk,t2,0,Far Rockaway
+A,wk,t3,0,Lefferts Blvd
+A,wk,t4,1,Inwood-207 St
+F,wk,t5,,Jamaica
+"""
+
+
+def direction_rows(session):
+    return {
+        (r["route_id"], r["direction_id"]): r["headsign"]
+        for r in inserted_rows(session, "route_directions")
+    }
+
+
+def test_dominant_headsign_wins_and_directionless_counted():
+    stats, session = run(make_zip(trips=TRIPS_WITH_DIRECTIONS))
+    assert direction_rows(session) == {
+        ("A", 0): "Far Rockaway",  # 2 votes beat 1
+        ("A", 1): "Inwood-207 St",
+    }
+    assert stats.skipped_directionless == 1  # the F trip without direction_id
+    assert stats.directions_written == 2
+
+
+def test_headsign_tie_breaks_lexicographic_and_deterministic():
+    trips = (
+        "route_id,service_id,trip_id,direction_id,trip_headsign\n"
+        "A,wk,t1,0,Rockaway Park\n"
+        "A,wk,t2,0,Far Rockaway\n"
+    )
+    results = []
+    for _ in range(2):
+        _, session = run(make_zip(trips=trips))
+        results.append(direction_rows(session))
+    assert results[0] == results[1] == {("A", 0): "Far Rockaway"}
+
+
+def test_missing_direction_id_warns_and_does_not_crash(caplog):
+    with caplog.at_level(logging.WARNING):
+        stats, _ = run(make_zip())  # base TRIPS has no direction_id column
+    assert stats.skipped_directionless == 3
+    assert any(
+        "3 trips without a usable direction_id" in r.message for r in caplog.records
+    )
+
+
+def test_headsignless_direction_yields_null_headsign():
+    trips = "route_id,service_id,trip_id,direction_id\nA,wk,t1,0\n"
+    _, session = run(make_zip(trips=trips))
+    assert direction_rows(session) == {("A", 0): None}
+
+
+def test_ns_convention_confirmed_logs_mapping_without_warning(caplog):
+    trips = (
+        "route_id,service_id,trip_id,direction_id,trip_headsign\n"
+        "A,wk,X_000600_A..N03R,0,Uptown Terminal\n"
+        "A,wk,X_000700_A..S03R,1,Downtown Terminal\n"
+    )
+    with caplog.at_level(logging.INFO):
+        run(make_zip(trips=trips))
+    assert any(
+        "observed direction_id -> platform-suffix mapping" in r.message
+        for r in caplog.records
+    )
+    assert not any("MISMATCH" in r.message for r in caplog.records)
+
+
+def test_ns_convention_swapped_warns_loudly(caplog):
+    trips = (
+        "route_id,service_id,trip_id,direction_id,trip_headsign\n"
+        "A,wk,X_000600_A..S03R,0,Wrong Way\n"
+        "A,wk,X_000700_A..N03R,1,Wrong Way\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        run(make_zip(trips=trips))
+    mismatches = [r for r in caplog.records if "MISMATCH" in r.message]
+    assert len(mismatches) == 2  # both directions disagree
+    assert all(r.levelno == logging.WARNING for r in mismatches)
+
+
+def test_removed_route_direction_pruned_feed_scoped():
+    existing = {
+        "route_directions": [
+            {"feed_id": "mta-subway", "route_id": "OLD", "direction_id": 0, "headsign": "Gone"},
+        ],
+    }
+    _, session = run(make_zip(trips=TRIPS_WITH_DIRECTIONS), existing_by_table=existing)
+    deletes = [
+        c["payload"]
+        for c in session.calls
+        if c["payload"]["sql"].startswith("DELETE FROM route_directions")
+    ]
+    assert deletes and "OLD" in deletes[0]["params"]
+    assert "mta-subway" in deletes[0]["params"]  # feed-scoped delete

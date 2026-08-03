@@ -1,6 +1,7 @@
 """Table specs for everything the ingest job writes.
 
-These must match api/migrations/0000_initial_schema.sql exactly;
+These must match the api/migrations/*.sql files exactly (CREATE TABLE plus
+any later ALTER TABLE ADD COLUMN, in migration order);
 tests/test_schema_sync.py enforces that at commit time.
 """
 
@@ -31,13 +32,15 @@ FEEDS = TableSpec(
         "license_url",
         "status",
         "updated_at",
+        "direction_labels",
+        "units",
     ),
     pk_columns=("id",),
 )
 
 STOPS = TableSpec(
     name="stops",
-    columns=("feed_id", "stop_id", "name", "lat", "lon", "parent_station"),
+    columns=("feed_id", "stop_id", "name", "lat", "lon", "parent_station", "capacity"),
     pk_columns=("feed_id", "stop_id"),
 )
 
@@ -61,4 +64,10 @@ STOP_ROUTES = TableSpec(
     pk_columns=("feed_id", "stop_id", "route_id"),
 )
 
-SYNCED_TABLES = (FEEDS, STOPS, ROUTES, STOP_ROUTES)
+ROUTE_DIRECTIONS = TableSpec(
+    name="route_directions",
+    columns=("feed_id", "route_id", "direction_id", "headsign"),
+    pk_columns=("feed_id", "route_id", "direction_id"),
+)
+
+SYNCED_TABLES = (FEEDS, STOPS, ROUTES, STOP_ROUTES, ROUTE_DIRECTIONS)

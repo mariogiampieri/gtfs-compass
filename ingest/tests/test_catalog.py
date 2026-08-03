@@ -1,8 +1,8 @@
 import csv
 import io
+import json
 
 from conftest import FakeSession
-
 from gtfs_compass_ingest import seeds
 from gtfs_compass_ingest.catalog import build_feed_rows, run_catalog
 from gtfs_compass_ingest.load import D1Client
@@ -45,6 +45,24 @@ def gtfs_row(feed_id, status="active", **overrides):
     }
     row.update(overrides)
     return row
+
+
+def test_catalog_rows_carry_null_direction_labels_and_default_units():
+    rows = build_feed_rows(make_csv([gtfs_row("mdb-1")]), now=0)
+    (feed,) = rows
+    assert feed["direction_labels"] is None  # only curated rows set labels
+    assert feed["units"] == "imperial"  # consistent with the curated seeds
+
+
+def test_curated_direction_labels_round_trip_as_json():
+    rows = {r["id"]: r for r in seeds.curated_rows(now=0)}
+    assert json.loads(rows["mta-subway"]["direction_labels"]) == ["Uptown", "Downtown"]
+    assert rows["mta-subway"]["units"] == "imperial"
+    assert rows["citibike"]["direction_labels"] is None  # null stays null
+    assert rows["citibike"]["adapter"] == "gbfs"
+    assert rows["citibike"]["static_url"].endswith("station_information.json")
+    assert rows["citibike"]["rt_trip_url"].endswith("station_status.json")
+    assert rows["citibike"]["license_url"] == "https://citibikenyc.com/data-sharing-policy"
 
 
 def test_only_active_rows_emitted():
@@ -173,7 +191,7 @@ def test_full_run_includes_curated_row_and_never_prunes_it():
     stale = {c: None for c in
              ("name", "static_url", "rt_trip_url", "rt_alert_url", "rt_needs_key",
               "adapter", "min_lat", "max_lat", "min_lon", "max_lon",
-              "license_url", "status", "updated_at")}
+              "license_url", "status", "updated_at", "direction_labels", "units")}
     existing = [
         {"id": "mta-subway", **stale},
         {"id": "mdb-stale", **stale},
@@ -202,4 +220,4 @@ def test_dry_run_makes_no_d1_calls():
             return R()
 
     stats = run_catalog(None, now=1000, dry_run=True, session=FakeHTTP())
-    assert stats.unchanged == 2  # mdb-1 + curated mta-subway, nothing written
+    assert stats.unchanged == 3  # mdb-1 + curated mta-subway + citibike, nothing written

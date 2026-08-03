@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 from gtfs_compass_ingest.load import D1Client
 
 

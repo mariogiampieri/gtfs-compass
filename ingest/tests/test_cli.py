@@ -1,8 +1,7 @@
 import fcntl
 
-import pytest
-
 import gtfs_compass_ingest.__main__ as cli
+import pytest
 
 
 class Recorder:
@@ -15,12 +14,16 @@ class Recorder:
     def run_static(self, client, feed_id, **kwargs):
         self.calls.append(("static", feed_id, kwargs))
 
+    def run_gbfs_static(self, client, feed_id, **kwargs):
+        self.calls.append(("gbfs", feed_id, kwargs))
+
 
 @pytest.fixture
 def recorder(monkeypatch, tmp_path):
     rec = Recorder()
     monkeypatch.setattr(cli, "run_catalog", rec.run_catalog)
     monkeypatch.setattr(cli, "run_static", rec.run_static)
+    monkeypatch.setattr(cli, "run_gbfs_static", rec.run_gbfs_static)
     monkeypatch.setattr(cli.D1Client, "from_env", classmethod(lambda cls: object()))
     monkeypatch.setattr(cli, "acquire_lock", lambda client, holder: True)
     monkeypatch.setattr(cli, "renew_lock", lambda client, holder: True)
@@ -34,8 +37,12 @@ def recorder(monkeypatch, tmp_path):
 
 def test_all_runs_catalog_then_static_in_order(recorder):
     assert cli.main(["all"]) == 0
-    assert [c[0] for c in recorder.calls] == ["catalog", "static"]
-    assert recorder.calls[1][1] == "mta-subway"  # default from seed flags
+    # Default set from seed flags; citibike dispatches to the GBFS path.
+    assert recorder.calls[0][0] == "catalog"
+    assert [c[:2] for c in recorder.calls[1:]] == [
+        ("static", "mta-subway"),
+        ("gbfs", "citibike"),
+    ]
     assert recorder.released  # D1 lock released on success
 
 
@@ -79,6 +86,20 @@ def test_d1_lock_held_exits_2_without_running(recorder, monkeypatch):
     assert cli.main(["catalog"]) == 2
     assert not recorder.calls
     assert not recorder.released  # never acquired, never released
+
+
+def test_static_dispatches_by_adapter(recorder):
+    assert cli.main(["static", "citibike", "mta-subway"]) == 0
+    assert [c[:2] for c in recorder.calls] == [
+        ("gbfs", "citibike"),  # adapter 'gbfs' from the seeds registry
+        ("static", "mta-subway"),
+    ]
+
+
+def test_unknown_adapter_falls_back_to_run_static(recorder):
+    # Catalog-only ids resolve no adapter -> zip pipeline (existing behavior).
+    assert cli.main(["static", "mdb-999"]) == 0
+    assert [c[:2] for c in recorder.calls] == [("static", "mdb-999")]
 
 
 def test_ingest_static_feeds_env_overrides_selector(recorder, monkeypatch):
