@@ -16,7 +16,7 @@
 
 static model_nearby_t g_model;
 static ui_state_t g_state = {
-    .conn = UI_CONN_LIVE, .secs_since_fetch = 12, .battery_pct = 82, .stop_idx = 0};
+    .conn = UI_CONN_LIVE, .secs_since_fetch = 12, .battery_pct = 82};
 
 static char *read_fixture(const char *arg, size_t *len) {
   char path[512];
@@ -50,12 +50,14 @@ static void key_cb(lv_event_t *e) {
     case '5': g_state.conn = UI_CONN_NO_LOCATION; break;
     case 'j':
       if (g_model.rail.stop_count)
-        g_state.stop_idx = (uint8_t)((g_state.stop_idx + 1) % g_model.rail.stop_count);
+        g_state.stop_idx[UI_SYS_RAIL] =
+            (uint8_t)((g_state.stop_idx[UI_SYS_RAIL] + 1) % g_model.rail.stop_count);
       break;
     case 'k':
       if (g_model.rail.stop_count)
-        g_state.stop_idx =
-            (uint8_t)((g_state.stop_idx + g_model.rail.stop_count - 1) % g_model.rail.stop_count);
+        g_state.stop_idx[UI_SYS_RAIL] =
+            (uint8_t)((g_state.stop_idx[UI_SYS_RAIL] + g_model.rail.stop_count - 1) %
+                      g_model.rail.stop_count);
       break;
     case 'f': g_state.flash_now = !g_state.flash_now; break;
     case 'q': exit(0);

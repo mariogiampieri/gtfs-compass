@@ -14,28 +14,13 @@
 
 #include "lvgl.h"
 #include "model.h"
+/* ui_state_t + ui_reconcile() live in ui_state.h (LVGL-free, plan U1) so
+ * the reconciler is host-testable; this header re-exports them for callers. */
+#include "ui_state.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef enum {
-  UI_CONN_LOADING = 0, /* skeleton: no data yet */
-  UI_CONN_LIVE,
-  UI_CONN_STALE,       /* fetches succeed, data age > 90 s (amber chip) */
-  UI_CONN_OFFLINE,     /* fetches failing (red chip) */
-  UI_CONN_NO_LOCATION, /* API 422 — the R10 screen */
-} ui_conn_t;
-
-typedef struct {
-  ui_conn_t conn;
-  uint32_t secs_since_fetch; /* chip counter; ticks locally at 1 Hz
-                                (uint32: an overnight offline device must
-                                not wrap at 18.2h and re-age from zero) */
-  int8_t battery_pct;        /* -1 = unknown (sim default feeds a constant) */
-  bool flash_now;            /* 1.4 s green "now" flash after a fetch lands */
-  uint8_t stop_idx;          /* which stop of the rail system is shown */
-} ui_state_t;
 
 /* Build the static screen tree onto the default display. Call once. */
 void ui_init(void);
