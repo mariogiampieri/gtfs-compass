@@ -58,6 +58,9 @@ def test_curated_direction_labels_round_trip_as_json():
     rows = {r["id"]: r for r in seeds.curated_rows(now=0)}
     assert json.loads(rows["mta-subway"]["direction_labels"]) == ["Uptown", "Downtown"]
     assert rows["mta-subway"]["units"] == "imperial"
+    # The alerts poller is config-driven off this row (alert-layer plan U1);
+    # the Mercury JSON variant is deliberate — see the seed's comment.
+    assert rows["mta-subway"]["rt_alert_url"].endswith("subway-alerts.json")
     assert rows["citibike"]["direction_labels"] is None  # null stays null
     assert rows["citibike"]["adapter"] == "gbfs"
     assert rows["citibike"]["static_url"].endswith("station_information.json")
