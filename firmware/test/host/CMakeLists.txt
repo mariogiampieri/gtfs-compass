@@ -22,6 +22,7 @@ target_include_directories(test_model PRIVATE
 )
 target_compile_definitions(test_model PRIVATE
   FIXTURE_DIR="${FW}/fixtures"
+  CJSON_NESTING_LIMIT=48
   UNITY_INCLUDE_DOUBLE
 )
 

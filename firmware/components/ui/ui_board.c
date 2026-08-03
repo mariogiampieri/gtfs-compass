@@ -27,6 +27,7 @@ static lv_obj_t *g_chip_label;
 static lv_obj_t *g_batt_label;
 static lv_obj_t *g_content; /* everything below the chip */
 static ui_conn_t g_conn_at_show;
+static bool g_degraded_at_show; /* offline/stale: rows render ~ countdowns */
 
 static lv_color_t hex(uint32_t rgb) { return lv_color_hex(rgb); }
 
@@ -49,11 +50,16 @@ static void style_plain(lv_obj_t *o) {
 static void chip_text(char *buf, size_t cap, const ui_state_t *st) {
   switch (st->conn) {
     case UI_CONN_LOADING: snprintf(buf, cap, "…"); break;
-    case UI_CONN_OFFLINE: snprintf(buf, cap, "offline · %um", st->secs_since_fetch / 60u); break;
-    case UI_CONN_STALE: snprintf(buf, cap, "stale · %um", st->secs_since_fetch / 60u); break;
+    case UI_CONN_NO_LOCATION: snprintf(buf, cap, "no location"); break;
+    case UI_CONN_OFFLINE:
+      snprintf(buf, cap, "offline · %lum", (unsigned long)(st->secs_since_fetch / 60u));
+      break;
+    case UI_CONN_STALE:
+      snprintf(buf, cap, "stale · %lum", (unsigned long)(st->secs_since_fetch / 60u));
+      break;
     default:
       if (st->flash_now) snprintf(buf, cap, "now");
-      else snprintf(buf, cap, "%us", st->secs_since_fetch);
+      else snprintf(buf, cap, "%lus", (unsigned long)st->secs_since_fetch);
   }
 }
 
@@ -303,8 +309,10 @@ static void build_row(lv_obj_t *parent, const model_trunk_t *t, int row_h) {
   lv_obj_set_style_pad_column(cd, 4, 0);
   lv_obj_set_flex_align(cd, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
   lv_obj_align(cd, LV_ALIGN_RIGHT_MID, 0, 0);
-  char num[8] = "—";
-  if (a) snprintf(num, sizeof(num), "%d", a->eta_min);
+  /* Degraded data carries the handoff's `~` prefix — stale numbers are
+   * estimates, never presented as live (spec constraint #4 / R6). */
+  char num[12] = "—";
+  if (a) snprintf(num, sizeof(num), "%s%d", g_degraded_at_show ? "~" : "", a->eta_min);
   make_label(cd, num, &lv_font_montserrat_36, delay ? TK_ALERT : TK_TEXT_PRIMARY);
   if (a) make_label(cd, "min", &lv_font_montserrat_14, TK_TEXT_MUTED);
 }
@@ -418,8 +426,8 @@ static void build_no_location(void) {
 
 static void build_offline_banner(const ui_state_t *st) {
   char text[64];
-  snprintf(text, sizeof(text), "last fetch %um ago — retrying automatically",
-           st->secs_since_fetch / 60u);
+  snprintf(text, sizeof(text), "last fetch %lum ago — retrying automatically",
+           (unsigned long)(st->secs_since_fetch / 60u));
   lv_obj_t *banner = make_label(g_jitter, text, &lv_font_montserrat_14, TK_OFFLINE); /* 15→14 */
   lv_obj_align(banner, LV_ALIGN_BOTTOM_MID, 0, -40);
 }
@@ -445,6 +453,7 @@ void ui_board_show(const model_nearby_t *model, const ui_state_t *state) {
   lv_obj_set_pos(g_jitter, jx, jy);
 
   g_conn_at_show = state->conn;
+  g_degraded_at_show = state->conn == UI_CONN_OFFLINE || state->conn == UI_CONN_STALE;
   build_chrome(state);
 
   g_content = lv_obj_create(g_jitter);

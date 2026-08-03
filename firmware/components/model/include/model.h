@@ -103,6 +103,14 @@ typedef struct {
   bool no_data;  /* fetched_at was null: never fetched, distinct from empty */
   bool partial;  /* arrivals data incomplete (M1: parsed + logged, not rendered) */
   int64_t fetched_at; /* epoch seconds; 0 when no_data */
+  /*
+   * Server-side data age at response time: generated_at - fetched_at,
+   * clamped >= 0; -1 when unknown. Both stamps are the SERVER's clock, so
+   * no device RTC/SNTP is needed — the device seeds its local freshness
+   * counter with this, which is how "staleness lives in the API response,
+   * not device guesswork" (spec) is honored without wall time.
+   */
+  int32_t initial_age_s;
   char direction_labels[2][MODEL_DIR_LABEL_LEN]; /* "" when null (compass-tag feeds) */
   model_stop_t stops[MODEL_MAX_STOPS];
   uint8_t stop_count;
@@ -114,6 +122,7 @@ typedef struct {
   bool no_data;
   bool partial;
   int64_t fetched_at;
+  int32_t initial_age_s; /* see rail system */
   model_bike_station_t stations[MODEL_MAX_BIKE_STATIONS];
   uint8_t station_count;
   char nearest_distance_label[MODEL_DISTANCE_LEN];
@@ -123,6 +132,7 @@ typedef struct {
   model_rail_system_t rail;
   model_bike_system_t bike;
   bool bus_present; /* configured-empty in v1; presence only */
+  int64_t generated_at; /* response generation time, epoch s; 0 when absent */
   char units[MODEL_UNITS_LEN];
   /* Top-level location echo — debug logging only in M1, never rendered. */
   double loc_lat;

@@ -34,4 +34,5 @@ target_include_directories(sim PRIVATE
   ${SDL2_INCLUDE_DIRS}
 )
 target_link_libraries(sim lvgl ${SDL2_LIBRARIES})
-target_compile_definitions(sim PRIVATE FIXTURE_DIR="${FW}/fixtures")
+target_compile_definitions(sim PRIVATE FIXTURE_DIR="${FW}/fixtures"
+  CJSON_NESTING_LIMIT=48)

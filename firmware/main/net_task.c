@@ -41,6 +41,13 @@ static model_nearby_t *g_buf[2]; /* PSRAM double buffer */
 static int g_buf_idx;
 static char *g_body; /* PSRAM response buffer */
 
+static esp_timer_handle_t g_reconnect_timer;
+
+static void reconnect_cb(void *arg) {
+  (void)arg;
+  esp_wifi_connect();
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
   (void)arg;
   (void)data;
@@ -48,9 +55,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     esp_wifi_connect();
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
     xEventGroupClearBits(g_wifi_events, WIFI_CONNECTED_BIT);
-    ESP_LOGW(TAG, "wifi disconnected; retrying");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    esp_wifi_connect();
+    ESP_LOGW(TAG, "wifi disconnected; retry in 2s");
+    /* Never block the shared event-loop task: defer via a one-shot timer. */
+    esp_timer_stop(g_reconnect_timer);
+    esp_timer_start_once(g_reconnect_timer, 2000 * 1000);
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     xEventGroupSetBits(g_wifi_events, WIFI_CONNECTED_BIT);
     ESP_LOGI(TAG, "wifi connected");
@@ -62,6 +70,8 @@ static bool wifi_start(void) {
   if (!gc_creds_get(ssid, pass)) {
     return false; /* no credentials: caller reports OFFLINE with console hint */
   }
+  const esp_timer_create_args_t rt = {.callback = reconnect_cb, .name = "gc_reconnect"};
+  ESP_ERROR_CHECK(esp_timer_create(&rt, &g_reconnect_timer));
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   esp_netif_create_default_wifi_sta();
@@ -89,16 +99,21 @@ static int scan_to_json(char *out, size_t cap) {
   if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK || n == 0) return 0;
   ESP_LOGI(TAG, "scan: %u APs in %lld ms", n, (esp_timer_get_time() - t0) / 1000);
 
-  int off = snprintf(out, cap, "{\"wifiAccessPoints\":[");
+  /* Bounds-first accumulation: check remaining space BEFORE each write and
+   * clamp snprintf's would-be length so `off` can never exceed cap (review
+   * ADV-8: the old post-write check underflowed cap-off after truncation). */
+  size_t off = (size_t)snprintf(out, cap, "{\"wifiAccessPoints\":[");
   for (int i = 0; i < n; i++) {
-    off += snprintf(out + off, cap - (size_t)off,
-                    "%s{\"macAddress\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"signalStrength\":%d}",
-                    i ? "," : "", recs[i].bssid[0], recs[i].bssid[1], recs[i].bssid[2],
-                    recs[i].bssid[3], recs[i].bssid[4], recs[i].bssid[5], recs[i].rssi);
-    if ((size_t)off > cap - 80) break; /* defensive; 20 APs never gets here */
+    if (cap - off < 80) break; /* not enough room for one entry + closer */
+    int wrote = snprintf(out + off, cap - off,
+                         "%s{\"macAddress\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"signalStrength\":%d}",
+                         i ? "," : "", recs[i].bssid[0], recs[i].bssid[1], recs[i].bssid[2],
+                         recs[i].bssid[3], recs[i].bssid[4], recs[i].bssid[5], recs[i].rssi);
+    if (wrote < 0 || (size_t)wrote >= cap - off) break; /* truncated: drop entry */
+    off += (size_t)wrote;
   }
-  off += snprintf(out + off, cap - (size_t)off, "]}");
-  return off;
+  off += (size_t)snprintf(out + off, cap - off, "]}");
+  return (int)off;
 }
 
 typedef struct {
@@ -164,6 +179,11 @@ static gc_net_status_t fetch_once(model_nearby_t *out) {
   if (err != ESP_OK) return GC_NET_OFFLINE;
   if (status == 422) return GC_NET_NO_LOCATION;
   if (status != 200) return GC_NET_OFFLINE;
+  if (sink.len >= BODY_CAP - 1) {
+    /* distinct from network failure: the cap fired (fail-closed truncation) */
+    ESP_LOGE(TAG, "response body hit the %d-byte cap; refusing truncated JSON", BODY_CAP);
+    return GC_NET_OFFLINE;
+  }
   g_body[sink.len] = '\0';
   if (model_parse_nearby(g_body, (size_t)sink.len, out) != MODEL_PARSE_OK) {
     ESP_LOGW(TAG, "parse failed");
@@ -178,24 +198,41 @@ static void net_task(void *arg) {
     gc_net_msg_t msg = {.status = GC_NET_NO_CREDS, .model = NULL};
     xQueueOverwrite(g_queue, &msg);
     ESP_LOGW(TAG, "no wifi credentials — provision via console: wifi_set <ssid> <pass>");
-    /* poll NVS: the console may provision at any time */
+    /* The console restarts the device on wifi_set; this poll is only the
+     * backstop for a seed landing through some other path. */
     char s[GC_SSID_LEN], p[GC_PASS_LEN];
     while (!gc_creds_get(s, p)) vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart(); /* simplest correct re-init path post-provisioning */
   }
 
-  xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+  /* Bounded join wait: wrong password or absent AP must surface as OFFLINE
+   * (red chip), not an eternal loading skeleton — the plan's own scenario. */
+  while (!(xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                               pdMS_TO_TICKS(20000)) &
+           WIFI_CONNECTED_BIT)) {
+    gc_net_msg_t offline = {.status = GC_NET_OFFLINE, .model = NULL};
+    xQueueOverwrite(g_queue, &offline);
+    ESP_LOGW(TAG, "wifi join not established after 20s; still retrying");
+  }
   int64_t boot_first_fetch = esp_timer_get_time();
 
   while (1) {
+    /* Mid-run drop: report OFFLINE each poll rather than hanging on fetch. */
+    if (!(xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT)) {
+      gc_net_msg_t offline = {.status = GC_NET_OFFLINE, .model = NULL};
+      xQueueOverwrite(g_queue, &offline);
+      vTaskDelay(pdMS_TO_TICKS(5000));
+      continue;
+    }
     model_nearby_t *buf = g_buf[g_buf_idx];
     gc_net_status_t st = fetch_once(buf);
     gc_net_msg_t msg = {.status = st, .model = st == GC_NET_OK ? buf : NULL};
     if (st == GC_NET_OK) g_buf_idx ^= 1; /* hand off; write the other next */
     xQueueOverwrite(g_queue, &msg);
     if (boot_first_fetch) {
-      ESP_LOGI(TAG, "first fetch complete %lld ms after task start",
-               (esp_timer_get_time() - boot_first_fetch) / 1000);
+      ESP_LOGI(TAG, "first fetch complete %lld ms after task start; stack HWM %u bytes free",
+               (esp_timer_get_time() - boot_first_fetch) / 1000,
+               (unsigned)uxTaskGetStackHighWaterMark(NULL));
       boot_first_fetch = 0;
     }
     vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));

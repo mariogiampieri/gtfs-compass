@@ -9,9 +9,13 @@
  * Connect with: idf.py -p <port> monitor   (or any 115200 serial terminal)
  */
 #include <stdio.h>
+#include <string.h>
 
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "wifi_creds.h"
 
 static int cmd_wifi_set(int argc, char **argv) {
@@ -19,9 +23,28 @@ static int cmd_wifi_set(int argc, char **argv) {
     printf("usage: wifi_set <ssid> [password]\n");
     return 1;
   }
+  /* WiFi's own limits: SSID <=32 bytes, WPA passphrase <=64. Storing longer
+   * values would silently break the fixed-buffer read path (review ADV-7). */
+  if (strlen(argv[1]) > 32) {
+    printf("error: ssid longer than 32 bytes\n");
+    return 1;
+  }
+  if (argc == 3 && strlen(argv[2]) > 64) {
+    printf("error: password longer than 64 bytes\n");
+    return 1;
+  }
   bool ok = gc_creds_set(argv[1], argc == 3 ? argv[2] : "");
-  printf(ok ? "stored — device will join shortly\n" : "NVS write failed\n");
-  return ok ? 0 : 1;
+  if (!ok) {
+    printf("NVS write failed\n");
+    return 1;
+  }
+  /* Honest contract: the running network path holds boot-time credentials,
+   * so a restart is the reliable way to apply new ones (review ADV-3). */
+  printf("stored — restarting to join %s\n", argv[1]);
+  fflush(stdout);
+  vTaskDelay(pdMS_TO_TICKS(300)); /* let the message flush over USB */
+  esp_restart();
+  return 0;
 }
 
 static int cmd_wifi_clear(int argc, char **argv) {

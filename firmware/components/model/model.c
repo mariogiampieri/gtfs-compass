@@ -10,6 +10,8 @@
  */
 #include "model.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -52,6 +54,30 @@ static model_shape_t parse_shape(const cJSON *item) {
 /* null / absent / non-number → fallback */
 static int32_t number_or(const cJSON *item, int32_t fallback) {
   return cJSON_IsNumber(item) ? (int32_t)item->valuedouble : fallback;
+}
+
+/* "2026-08-03T04:02:43Z" → epoch seconds (UTC only); 0 on any mismatch.
+ * Days-from-civil per Howard Hinnant's algorithm — no timegm on all libcs. */
+static int64_t parse_iso_utc(const cJSON *item) {
+  if (!cJSON_IsString(item) || item->valuestring == NULL) return 0;
+  int y, mo, d, h, mi, s;
+  if (sscanf(item->valuestring, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return 0;
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
+  int64_t yy = y - (mo <= 2 ? 1 : 0);
+  int64_t era = (yy >= 0 ? yy : yy - 399) / 400;
+  int64_t yoe = yy - era * 400;
+  int64_t doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  int64_t days = era * 146097 + doe - 719468;
+  return days * 86400 + h * 3600 + mi * 60 + s;
+}
+
+/* generated_at - fetched_at, clamped; -1 when either side is unknown. */
+static int32_t initial_age(int64_t generated_at, int64_t fetched_at, bool no_data) {
+  if (no_data || generated_at <= 0 || fetched_at <= 0) return -1;
+  int64_t age = generated_at - fetched_at;
+  if (age < 0) age = 0;
+  return age > INT32_MAX ? INT32_MAX : (int32_t)age;
 }
 
 static void parse_alert(const cJSON *alert, model_alert_t *out) {
@@ -199,6 +225,7 @@ model_parse_result_t model_parse_nearby(const char *buf, size_t len, model_nearb
   if (!cJSON_IsObject(root) || !cJSON_IsArray(systems)) goto cleanup;
 
   copy_str(out->units, sizeof(out->units), cJSON_GetObjectItemCaseSensitive(root, "units"));
+  out->generated_at = parse_iso_utc(cJSON_GetObjectItemCaseSensitive(root, "generated_at"));
 
   const cJSON *loc = cJSON_GetObjectItemCaseSensitive(root, "location");
   if (cJSON_IsObject(loc)) {
@@ -223,6 +250,8 @@ model_parse_result_t model_parse_nearby(const char *buf, size_t len, model_nearb
       out->bus_present = true;
     }
   }
+  out->rail.initial_age_s = initial_age(out->generated_at, out->rail.fetched_at, out->rail.no_data);
+  out->bike.initial_age_s = initial_age(out->generated_at, out->bike.fetched_at, out->bike.no_data);
   result = MODEL_PARSE_OK;
 
 cleanup:

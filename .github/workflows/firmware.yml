@@ -8,16 +8,18 @@ on:
 
 jobs:
   host-tests:
-    # Seconds: plain cc + Unity + ASAN over the platform-free model component.
-    runs-on: macos-latest
+    # Seconds: plain cc + Unity over the platform-free model component.
+    # Linux deliberately: Apple clang's ASan silently skips leak detection
+    # (verified in review), Linux ASan includes LeakSanitizer by default.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run model tests
+      - name: Build and run model tests (ASAN+LSAN)
         run: |
           cd firmware/test/host
           cmake -B build -G "Unix Makefiles" .
           cmake --build build
-          ./build/test_model
+          ASAN_OPTIONS=detect_leaks=1 ./build/test_model
 
   device-build:
     # Minutes: full ESP-IDF compile in the pinned container (no hardware).

@@ -223,6 +223,98 @@ static void test_malformed_entries_skipped_not_fatal(void) {
   TEST_ASSERT_EQUAL(0, g_model.rail.stops[0].trunks[0].directions[0].arrival_count);
 }
 
+
+/* ---------- review-driven regressions ---------- */
+
+static void test_stop_and_arrival_clamps(void) {
+  /* 7 stops (cap 5); one direction with 10 arrivals (cap 8) */
+  static char buf[16384];
+  char *p = buf;
+  p += sprintf(p, "{\"units\":\"imperial\",\"systems\":[{\"mode\":\"rail\","
+                  "\"direction_labels\":null,\"fetched_at\":9,\"stops\":[");
+  for (int s = 0; s < 7; s++) {
+    p += sprintf(p, "%s{\"id\":\"S%d\",\"name\":\"Stop %d\",\"distance_label\":\"1 mi\","
+                    "\"trunks\":[{\"key\":\"k\",\"color\":\"#112233\",\"text_color\":\"#FFFFFF\","
+                    "\"routes\":[{\"label\":\"A\",\"shape\":\"circle\"}],\"alert\":null,"
+                    "\"directions\":[{\"direction_id\":0,\"arrivals\":[",
+                 s ? "," : "", s, s);
+    for (int a = 0; a < 10; a++) {
+      p += sprintf(p, "%s{\"route\":\"A\",\"headsign\":\"X\",\"eta_min\":%d}", a ? "," : "", a);
+    }
+    p += sprintf(p, "]},{\"direction_id\":1,\"arrivals\":[]}]}]}");
+  }
+  sprintf(p, "]}]}");
+  parse_ok(buf);
+  TEST_ASSERT_EQUAL(MODEL_MAX_STOPS, g_model.rail.stop_count);
+  TEST_ASSERT_EQUAL(MODEL_MAX_ARRIVALS,
+                    g_model.rail.stops[0].trunks[0].directions[0].arrival_count);
+  /* retained arrivals are the FIRST 8 (soonest — API sorts ascending) */
+  TEST_ASSERT_EQUAL(0, g_model.rail.stops[0].trunks[0].directions[0].arrivals[0].eta_min);
+  TEST_ASSERT_EQUAL(7, g_model.rail.stops[0].trunks[0].directions[0].arrivals[7].eta_min);
+}
+
+static void test_null_alert_yields_zero_values(void) {
+  parse_ok("{\"units\":\"imperial\",\"systems\":[{\"mode\":\"rail\",\"direction_labels\":null,"
+           "\"fetched_at\":9,\"stops\":[{\"id\":\"X\",\"name\":\"S\",\"distance_label\":\"1 mi\","
+           "\"trunks\":[{\"key\":\"k\",\"color\":\"#112233\",\"routes\":[],\"alert\":null}]}]}]}");
+  const model_alert_t *al = &g_model.rail.stops[0].trunks[0].alert;
+  TEST_ASSERT_EQUAL(MODEL_ALERT_NONE, al->severity);
+  TEST_ASSERT_EQUAL_STRING("", al->text);
+  TEST_ASSERT_EQUAL(0, al->directions_mask);
+}
+
+static void test_headsign_and_alert_text_truncate(void) {
+  char longtext[512];
+  memset(longtext, 'A', sizeof(longtext) - 1);
+  longtext[sizeof(longtext) - 1] = '\0';
+  char json[4096];
+  snprintf(json, sizeof(json),
+           "{\"units\":\"imperial\",\"systems\":[{\"mode\":\"rail\",\"direction_labels\":null,"
+           "\"fetched_at\":9,\"stops\":[{\"id\":\"X\",\"name\":\"S\",\"distance_label\":\"1 mi\","
+           "\"trunks\":[{\"key\":\"k\",\"color\":\"#112233\",\"routes\":[],"
+           "\"alert\":{\"severity\":\"delay\",\"text\":\"%.300s\",\"directions\":[0]},"
+           "\"directions\":[{\"direction_id\":0,\"arrivals\":["
+           "{\"route\":\"A\",\"headsign\":\"%.100s\",\"eta_min\":1}]}]}]}]}]}",
+           longtext, longtext);
+  parse_ok(json);
+  const model_trunk_t *t = &g_model.rail.stops[0].trunks[0];
+  TEST_ASSERT_EQUAL(MODEL_ALERT_TEXT_LEN - 1, strlen(t->alert.text));
+  TEST_ASSERT_EQUAL(MODEL_HEADSIGN_LEN - 1, strlen(t->directions[0].arrivals[0].headsign));
+}
+
+static void test_generated_at_seeds_initial_age(void) {
+  /* generated 2026-08-03T04:02:43Z = 1785729763; fetched 120s earlier */
+  parse_ok("{\"generated_at\":\"2026-08-03T04:02:43Z\",\"units\":\"imperial\",\"systems\":["
+           "{\"mode\":\"rail\",\"direction_labels\":null,\"fetched_at\":1785729643,\"stops\":[]}]}");
+  TEST_ASSERT_EQUAL(1785729763, (long long)g_model.generated_at);
+  TEST_ASSERT_EQUAL(120, g_model.rail.initial_age_s);
+
+  /* fresh: age 0; skewed (fetched_at ahead): clamps to 0, never negative */
+  parse_ok("{\"generated_at\":\"2026-08-03T04:02:43Z\",\"units\":\"imperial\",\"systems\":["
+           "{\"mode\":\"rail\",\"direction_labels\":null,\"fetched_at\":1785729999,\"stops\":[]}]}");
+  TEST_ASSERT_EQUAL(0, g_model.rail.initial_age_s);
+
+  /* cold body: unknown age */
+  parse_ok("{\"generated_at\":\"2026-08-03T04:02:43Z\",\"units\":\"imperial\",\"systems\":["
+           "{\"mode\":\"rail\",\"direction_labels\":null,\"fetched_at\":null,\"stops\":[]}]}");
+  TEST_ASSERT_EQUAL(-1, g_model.rail.initial_age_s);
+
+  /* no generated_at: unknown age */
+  parse_ok("{\"units\":\"imperial\",\"systems\":["
+           "{\"mode\":\"rail\",\"direction_labels\":null,\"fetched_at\":123,\"stops\":[]}]}");
+  TEST_ASSERT_EQUAL(-1, g_model.rail.initial_age_s);
+}
+
+static void test_depth_bomb_rejected_not_crashed(void) {
+  /* 200 nested arrays: must fail via CJSON_NESTING_LIMIT (48), not the stack */
+  char bomb[512];
+  int i = 0;
+  for (; i < 200; i++) bomb[i] = '[';
+  bomb[i] = '\0';
+  model_nearby_t m;
+  TEST_ASSERT_EQUAL(MODEL_PARSE_ERR_JSON, model_parse_nearby(bomb, strlen(bomb), &m));
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_live_fixture_parses_with_expected_shape);
@@ -236,5 +328,10 @@ int main(void) {
   RUN_TEST(test_bike_zero_counts_stay_zero);
   RUN_TEST(test_garbage_and_wrong_shape);
   RUN_TEST(test_malformed_entries_skipped_not_fatal);
+  RUN_TEST(test_stop_and_arrival_clamps);
+  RUN_TEST(test_null_alert_yields_zero_values);
+  RUN_TEST(test_headsign_and_alert_text_truncate);
+  RUN_TEST(test_generated_at_seeds_initial_age);
+  RUN_TEST(test_depth_bomb_rejected_not_crashed);
   return UNITY_END();
 }

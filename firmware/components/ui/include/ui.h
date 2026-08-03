@@ -29,7 +29,9 @@ typedef enum {
 
 typedef struct {
   ui_conn_t conn;
-  uint16_t secs_since_fetch; /* chip counter; ticks locally at 1 Hz */
+  uint32_t secs_since_fetch; /* chip counter; ticks locally at 1 Hz
+                                (uint32: an overnight offline device must
+                                not wrap at 18.2h and re-age from zero) */
   int8_t battery_pct;        /* -1 = unknown (sim default feeds a constant) */
   bool flash_now;            /* 1.4 s green "now" flash after a fetch lands */
   uint8_t stop_idx;          /* which stop of the rail system is shown */
