@@ -43,6 +43,7 @@ export class GbfsDO extends DurableObject<Env> {
   private refreshInFlight = false;
   private configPromise: Promise<GbfsConfig> | null = null;
   private configMissing = false;
+  private configMissingSinceMs = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -67,7 +68,14 @@ export class GbfsDO extends DurableObject<Env> {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
     if (this.configMissing) {
-      return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+      // Natural recovery: under continuous polling the DO stays resident, so
+      // a memory-only flag would pin 404 forever after the feeds row is
+      // fixed. One retry per poll interval falls through to arm-and-refresh,
+      // which re-runs loadConfig against D1.
+      if (Date.now() - this.configMissingSinceMs <= POLL_INTERVAL_MS) {
+        return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+      }
+      this.configMissing = false;
     }
     const now = Date.now();
 
@@ -177,6 +185,7 @@ export class GbfsDO extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof MissingFeedError) {
         this.configMissing = true;
+        this.configMissingSinceMs = Date.now();
       } else if (error instanceof ParseError) {
         console.warn(`${this.tag()} unparseable station_status; keeping old snapshot:`, error.message);
       } else {

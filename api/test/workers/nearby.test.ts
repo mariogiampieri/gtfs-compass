@@ -1,4 +1,4 @@
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
@@ -915,5 +915,58 @@ describe("alert text normalization", () => {
     expect(railSystem(body).stops[0].trunks[0].alert.text).toBe(
       "No [2] between stations Trains run every 20 minutes",
     );
+  });
+});
+
+describe("alert overlay review regressions", () => {
+  it("suppresses alerts older than the freshness horizon", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], text: "current incident" }]),
+    }));
+    const warm: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(warm).stops[0].trunks[0].alert).not.toBeNull();
+
+    // Backdate the AlertDO's snapshot past the 30-minute horizon.
+    const stub = env.ALERT_DO.get(env.ALERT_DO.idFromName(`${feed.id}:alerts`));
+    await runInDurableObject(stub, async (instance: any, state: DurableObjectState) => {
+      const stale = { ...instance.snapshot, fetchedAtMs: Date.now() - 31 * 60_000 };
+      await state.storage.put("snapshot", stale);
+      instance.snapshot = stale;
+      // keep the pending alarm from re-freshening it mid-test
+      await state.storage.deleteAlarm();
+    });
+    const after: any = await compose([feed], ["rail"]);
+    expect(railSystem(after).stops[0].trunks[0].alert).toBeNull(); // stale → honest null
+  });
+
+  it("breaks same-severity ties by newer updatedAt", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([
+        { routes: ["A"], alertType: "Boarding Change", text: "older info", updatedAt: 100 },
+        { routes: ["A"], alertType: "Boarding Change", text: "newer info", updatedAt: 200 },
+      ]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe("newer info"); // recency isolated
+  });
+
+  it("matches stop selectors against the bare parent station id", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], stops: ["A41"], text: "parent-scoped" }]), // parent id, no suffix
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe("parent-scoped");
   });
 });

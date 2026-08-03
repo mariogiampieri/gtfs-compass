@@ -50,6 +50,7 @@ export class AlertDO extends DurableObject<Env> {
   private refreshInFlight = false;
   private configPromise: Promise<AlertsConfig> | null = null;
   private configMissing = false;
+  private configMissingSinceMs = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -73,7 +74,14 @@ export class AlertDO extends DurableObject<Env> {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
     if (this.configMissing) {
-      return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+      // Natural recovery: under continuous polling the DO stays resident, so
+      // a memory-only flag would pin 404 forever after the feeds row is
+      // fixed. One retry per poll interval falls through to arm-and-refresh,
+      // which re-runs loadConfig against D1.
+      if (Date.now() - this.configMissingSinceMs <= POLL_INTERVAL_MS) {
+        return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+      }
+      this.configMissing = false;
     }
     const now = Date.now();
 
@@ -146,11 +154,17 @@ export class AlertDO extends DurableObject<Env> {
       }
       const parsed = parseMtaAlerts(await upstream.text());
 
-      // Severity-signal loss must be distinguishable from calm: if Mercury
-      // vanishes from a non-trivial feed, every alert silently greys to info.
-      if (parsed.entitiesParsed >= 10 && parsed.entitiesWithMercury === 0) {
+      // Severity-signal loss must be distinguishable from calm: a partial
+      // vendor migration greys most alerts to info just as silently as a
+      // total one, so the gate is a ratio collapse, not only absence.
+      if (parsed.entitiesParsed >= 10 && parsed.entitiesWithMercury / parsed.entitiesParsed < 0.5) {
         console.warn(
-          `${this.tag()} mercury extension missing from all ${parsed.entitiesParsed} entities — severity signal lost`,
+          `${this.tag()} mercury extension on only ${parsed.entitiesWithMercury}/${parsed.entitiesParsed} entities — severity signal degrading`,
+        );
+      }
+      if (parsed.unparseablePeriodValues > 0) {
+        console.warn(
+          `${this.tag()} ${parsed.unparseablePeriodValues} active_period value(s) present but uncoercible — timestamp-shape drift`,
         );
       }
 
@@ -160,20 +174,36 @@ export class AlertDO extends DurableObject<Env> {
         console.warn(`${this.tag()} implausible header timestamp ${parsed.timestamp}; ignoring`);
         parsed.timestamp = 0;
       }
-      // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
-      // failed fetch so staleness becomes visible (spec constraint #5).
-      // A body that omits the timestamp (0) skips this gate.
+      // DELIBERATE DIVERGENCE from the sibling frozen-upstream gate: the
+      // Mercury header timestamp advances on CONTENT change, not per
+      // generation (verified live — frozen for 20+ quiet minutes). An
+      // unchanged document is the healthy steady state for slow-moving
+      // alerts, so a successful unchanged fetch refreshes the staleness
+      // stamp (or composition's 30-min horizon would null every alert on a
+      // quiet night) while keeping the existing content.
       if (this.snapshot && parsed.timestamp > 0 && parsed.timestamp <= this.snapshot.headerTimestamp) {
-        console.warn(`${this.tag()} header not advancing (${parsed.timestamp}); keeping old snapshot`);
+        if (fetchStartMs > this.snapshot.fetchedAtMs) {
+          const restamped: Snapshot = { ...this.snapshot, fetchedAtMs: fetchStartMs };
+          await this.ctx.storage.put("snapshot", restamped);
+          this.snapshot = restamped;
+        }
         return;
       }
       if (this.snapshot && fetchStartMs <= this.snapshot.fetchedAtMs) {
         return; // stale-ordered write from an older interleaved fetch
       }
 
+      // Snapshot hygiene: fully-expired planned work (every bounded period
+      // already over) never becomes readable again — don't store it.
+      const nowSec = Math.floor(fetchStartMs / 1000);
       const byRoute: Record<string, AlertItem[]> = Object.create(null); // no prototype keys
       for (const [routeId, items] of parsed.byRoute) {
-        byRoute[routeId] = items;
+        const live = items.filter(
+          (item) =>
+            item.activePeriods.length === 0 ||
+            item.activePeriods.some((p) => p.end === undefined || p.end >= nowSec),
+        );
+        if (live.length > 0) byRoute[routeId] = live;
       }
       const snapshot: Snapshot = {
         byRoute,
@@ -187,6 +217,7 @@ export class AlertDO extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof MissingFeedError) {
         this.configMissing = true;
+        this.configMissingSinceMs = Date.now();
       } else if (error instanceof ParseError) {
         console.warn(`${this.tag()} unparseable alerts body; keeping old snapshot:`, error.message);
       } else {
@@ -233,7 +264,11 @@ export class AlertDO extends DurableObject<Env> {
     for (const id of new Set([...routeIds, AGENCY_WIDE_KEY])) {
       const stored = Object.hasOwn(this.snapshot.byRoute, id) ? this.snapshot.byRoute[id] : [];
       const active = stored.filter((item) => isActiveNow(item, nowSec));
-      if (id === AGENCY_WIDE_KEY && active.length === 0) continue; // sentinel only when meaningful
+      // The auto-added sentinel is omitted when empty; an EXPLICITLY requested
+      // id — sentinel included — is always present (the documented contract).
+      if (id === AGENCY_WIDE_KEY && active.length === 0 && !routeIds.includes(AGENCY_WIDE_KEY)) {
+        continue;
+      }
       routes[id] = active;
     }
     return Response.json({

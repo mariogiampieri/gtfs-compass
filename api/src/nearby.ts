@@ -37,6 +37,11 @@ const TERMINAL_LOOKUP_CAP = 80; // headroom under D1's 100-binding statement lim
 // stays informative for tens of minutes (plan A6).
 const ALERT_MAX_AGE_S = 30 * 60;
 const ALERT_TEXT_MAX = 200; // unbounded vendor copy must not become a device problem
+// The overlay must never stall the arrivals response: an AlertDO read is a
+// storage-backed cache hit (~ms), so a slow one means the DO is struggling —
+// degrade to null well inside the device's 1-2 s budget instead of waiting
+// the full upstream-sized FETCH_TIMEOUT_MS.
+const ALERT_FETCH_TIMEOUT_MS = 2_000;
 
 // The device contract (design handoff README "API Contract") — typed so the
 // compiler guards the shape Phase 4 firmware builds against.
@@ -312,7 +317,7 @@ async function fetchAlerts(
     const stub = env.ALERT_DO.get(env.ALERT_DO.idFromName(`${feedId}:alerts`));
     const res = await stub.fetch(
       `https://do/routes?ids=${routeIds.map(encodeURIComponent).join(",")}&feed=${feedId}&group=alerts`,
-      { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+      { signal: AbortSignal.timeout(ALERT_FETCH_TIMEOUT_MS) },
     );
     if (!res.ok) throw new Error(`alerts status ${res.status}`);
     const body = await res.json<{ fetched_at: number | null; routes: Record<string, AlertItem[]> }>();

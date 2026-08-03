@@ -185,3 +185,92 @@ describe("isActiveNow", () => {
     expect(isActiveNow(item, 250)).toBe(false);
   });
 });
+
+describe("per-route selector scoping (review ADV-1)", () => {
+  it("keeps each route's stop and direction selectors separate", () => {
+    const body = JSON.stringify({
+      header: { timestamp: 1785731836 },
+      entity: [
+        {
+          id: "multi",
+          alert: {
+            informed_entity: [
+              { route_id: "A", stop_id: "A41N" },
+              { route_id: "D", stop_id: "D14S" },
+            ],
+            active_period: [],
+            header_text: { translation: [{ language: "en", text: "two routes, two scopes" }] },
+            [MERCURY]: { alert_type: "Delays", updated_at: 1 },
+          },
+        },
+      ],
+    });
+    const parsed = parseMtaAlerts(body);
+    const a = parsed.byRoute.get("A")![0];
+    const d = parsed.byRoute.get("D")![0];
+    expect(a.stopIds).toEqual(["A41N"]);
+    expect(a.directionIds).toEqual([0]); // N suffix — A's selector only
+    expect(d.stopIds).toEqual(["D14S"]);
+    expect(d.directionIds).toEqual([1]); // S suffix — D's selector only
+  });
+
+  it("shares routeless selectors with every route", () => {
+    const body = JSON.stringify({
+      header: {},
+      entity: [
+        {
+          id: "shared",
+          alert: {
+            informed_entity: [
+              { route_id: "A" },
+              { route_id: "C" },
+              { stop_id: "A41S" }, // no route: shared pool
+            ],
+            header_text: { translation: [{ language: "en", text: "shared scope" }] },
+          },
+        },
+      ],
+    });
+    const parsed = parseMtaAlerts(body);
+    expect(parsed.byRoute.get("A")![0].stopIds).toEqual(["A41S"]);
+    expect(parsed.byRoute.get("C")![0].stopIds).toEqual(["A41S"]);
+  });
+
+  it("drops out-of-range direction_id values from the untrusted body", () => {
+    const parsed = parseMtaAlerts(
+      feedOf([
+        {
+          id: "dirs",
+          alert: {
+            informed_entity: [
+              { route_id: "A", direction_id: 2 },
+              { route_id: "A", direction_id: -1 },
+              { route_id: "A", direction_id: 1.5 },
+              { route_id: "A", direction_id: 1 },
+            ],
+            header_text: { translation: [{ language: "en", text: "dirs" }] },
+          },
+        },
+      ]),
+    );
+    expect(parsed.byRoute.get("A")![0].directionIds).toEqual([1]); // only the valid 0|1 survives
+  });
+
+  it("counts present-but-uncoercible active_period values and caps stored text", () => {
+    const parsed = parseMtaAlerts(
+      feedOf([
+        {
+          id: "drift",
+          alert: {
+            informed_entity: [{ route_id: "A" }],
+            active_period: [{ start: "2026-08-03T00:00:00Z", end: "not-a-number" }],
+            header_text: { translation: [{ language: "en", text: "x".repeat(1000) }] },
+          },
+        },
+      ]),
+    );
+    expect(parsed.unparseablePeriodValues).toBe(1); // counted per period with any bad bound
+    expect(parsed.byRoute.get("A")![0].text.length).toBe(400); // stored cap
+    expect(parsed.byRoute.get("A")![0].activePeriods).toEqual([{}]); // degrades to always-active
+  });
+});

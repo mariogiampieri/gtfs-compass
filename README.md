@@ -129,6 +129,7 @@ documented below):
 ```bash
 curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/mta-subway/ace/stop/A32N"
 curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/citibike/all/station/<station-id>"
+curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/mta-subway/alerts/route/A"
 ```
 
 `npm run deploy` applies any pending D1 migrations first — new Worker code

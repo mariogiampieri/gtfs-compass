@@ -184,20 +184,103 @@ describe("AlertDO", () => {
     expect("*" in quietBody.routes).toBe(false);
   });
 
-  it("frozen header timestamp keeps the old snapshot and stamp", async () => {
+  it("unchanged header keeps the content but refreshes the staleness stamp", async () => {
+    // Deliberate divergence from the sibling gate: the Mercury timestamp only
+    // advances on content change, so an unchanged 200 is healthy steady
+    // state — the stamp must advance or the 30-min horizon nulls quiet nights.
     const stub = stubFor("mta-subway:alerts#frozen");
     const t = nowSec();
     mockAlertsOnce(encodeAlerts(t, [{ routes: ["A"], text: "one" }]));
     await readRoutes(stub, ["A"]);
     await settleRefresh(stub);
-    const first = await (await readRoutes(stub, ["A"])).json<any>();
+    const firstMs = await runInDurableObject(stub, (i: AlertDO) => (i as any).snapshot.fetchedAtMs);
 
     mockAlertsOnce(encodeAlerts(t, [{ routes: ["A"], text: "two" }])); // same timestamp
     await runDurableObjectAlarm(stub);
     await settleRefresh(stub);
     const second = await (await readRoutes(stub, ["A"])).json<any>();
-    expect(second.fetched_at).toBe(first.fetched_at); // stamp not refreshed
-    expect(second.routes.A.map((a: any) => a.text)).toEqual(["one"]); // body kept
+    const secondMs = await runInDurableObject(stub, (i: AlertDO) => (i as any).snapshot.fetchedAtMs);
+    expect(secondMs).toBeGreaterThan(firstMs); // stamp refreshed (ms precision)
+    expect(second.routes.A.map((a: any) => a.text)).toEqual(["one"]); // content kept
+  });
+
+  it("single-flights a read landing during a slow in-flight refresh", async () => {
+    const stub = stubFor("mta-subway:alerts#race");
+    mockAlertsOnce(encodeAlerts(nowSec(), [{ routes: ["A"] }]), 150);
+    await readRoutes(stub, ["A"]); // arms + starts slow refresh
+    const during = await (await readRoutes(stub, ["A"])).json<any>(); // lands mid-fetch
+    expect(during.fetched_at).toBeNull(); // still no data, no crash
+    await settleRefresh(stub);
+    expect(upstreamAttempts).toBe(1); // no double fetch
+    const after = await (await readRoutes(stub, ["A"])).json<any>();
+    expect(after.routes.A).toHaveLength(1);
+  });
+
+  it("keeps the old snapshot on a non-2xx upstream", async () => {
+    const stub = stubFor("mta-subway:alerts#500");
+    mockAlertsOnce(encodeAlerts(nowSec(), [{ routes: ["A"], text: "good" }]));
+    await readRoutes(stub, ["A"]);
+    await settleRefresh(stub);
+    mockAlertsOnce("", 0, 503);
+    await runDurableObjectAlarm(stub);
+    await settleRefresh(stub);
+    const body = await (await readRoutes(stub, ["A"])).json<any>();
+    expect(body.routes.A.map((a: any) => a.text)).toEqual(["good"]);
+  });
+
+  it("always includes an explicitly requested '*' id, even when empty", async () => {
+    const stub = stubFor("mta-subway:alerts#star");
+    mockAlertsOnce(encodeAlerts(nowSec(), [{ routes: ["A"] }])); // no agency alerts
+    await readRoutes(stub, ["A"]);
+    await settleRefresh(stub);
+    const body = await (
+      await stub.fetch(`https://do/routes?ids=${encodeURIComponent("*")},A&feed=mta-subway&group=alerts`)
+    ).json<any>();
+    expect(body.routes["*"]).toEqual([]); // requested → present, empty
+  });
+
+  it("drops fully-expired planned work at store time", async () => {
+    const stub = stubFor("mta-subway:alerts#expired");
+    const now = nowSec();
+    mockAlertsOnce(
+      encodeAlerts(now, [
+        { routes: ["A"], text: "over", periods: [{ start: now - 500, end: now - 100 }] },
+        { routes: ["A"], text: "ongoing", periods: [{ start: now - 500, end: now + 500 }] },
+      ]),
+    );
+    await readRoutes(stub, ["A"]);
+    await settleRefresh(stub);
+    const stored = await runInDurableObject(stub, (i: AlertDO) => (i as any).snapshot.byRoute.A);
+    expect(stored.map((a: any) => a.text)).toEqual(["ongoing"]); // expired never persisted
+  });
+
+  it("naturally retries a missing config after a poll interval, without manual resets", async () => {
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO feeds (id, rt_alert_url, adapter) VALUES ('late-feed', NULL, 'nyct')",
+    ).run();
+    const stub = stubFor("late-feed:alerts");
+    await readRoutes(stub, ["A"], "late-feed"); // arms; refresh flags configMissing
+    await settleRefresh(stub);
+    expect((await readRoutes(stub, ["A"], "late-feed")).status).toBe(404);
+
+    // Operator fixes the row; simulate the poll interval elapsing.
+    await env.DB.prepare("UPDATE feeds SET rt_alert_url = ? WHERE id = 'late-feed'")
+      .bind(ALERTS_URL)
+      .run();
+    await runInDurableObject(stub, (i: AlertDO) => {
+      (i as any).configMissingSinceMs = Date.now() - 61_000; // > POLL_INTERVAL_MS ago
+      (i as any).configPromise = null; // memo would have been cleared by its rejection
+    });
+    mockAlertsOnce(encodeAlerts(nowSec(), [{ routes: ["A"] }]));
+    const retried = await readRoutes(stub, ["A"], "late-feed");
+    expect(retried.status).toBe(200); // the read fell through the cleared flag
+    // The alarm from the first read is still pending, so the retried read
+    // didn't arm a refresh — the next alarm drives loadConfig against the
+    // fixed row (the production recovery path).
+    await runDurableObjectAlarm(stub);
+    await settleRefresh(stub);
+    const warm = await (await readRoutes(stub, ["A"], "late-feed")).json<any>();
+    expect(warm.fetched_at).toBeGreaterThan(0);
   });
 
   it("clamps an implausible far-future header timestamp instead of poisoning the watermark", async () => {
