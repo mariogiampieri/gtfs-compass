@@ -1,0 +1,39 @@
+# CI: the two real gates, failing loudly. No continue-on-error anywhere —
+# a green check must mean both suites actually passed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api:
+    name: api — tsc + vitest (unit + workerd pool)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      # --legacy-peer-deps matches the documented local install (README).
+      - run: npm ci --legacy-peer-deps
+      - run: npx tsc --noEmit
+      - run: npm test
+
+  ingest:
+    name: ingest — pytest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run pytest -q
