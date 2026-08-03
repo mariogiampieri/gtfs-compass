@@ -118,7 +118,9 @@ export function parseMtaAlerts(text: string): ParsedAlerts {
     for (const sel of asArray(alert.informed_entity)) {
       const s = sel as Record<string, unknown>;
       if (typeof s.route_id === "string" && s.route_id) {
-        routeIds.add(ROUTE_ALIASES[s.route_id] ?? s.route_id);
+        // hasOwn guard: route ids are upstream-controlled and a bare index of
+        // "__proto__" would hand back Object.prototype from the alias map.
+        routeIds.add(Object.hasOwn(ROUTE_ALIASES, s.route_id) ? ROUTE_ALIASES[s.route_id] : s.route_id);
       } else if (typeof s.agency_id === "string" && s.agency_id) {
         agencyScoped = true;
       }

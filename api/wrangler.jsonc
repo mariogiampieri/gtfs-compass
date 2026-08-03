@@ -25,6 +25,10 @@
       {
         "name": "GBFS_DO",
         "class_name": "GbfsDO"
+      },
+      {
+        "name": "ALERT_DO",
+        "class_name": "AlertDO"
       }
     ]
   },
@@ -36,6 +40,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["GbfsDO"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["AlertDO"]
     }
   ]
 }

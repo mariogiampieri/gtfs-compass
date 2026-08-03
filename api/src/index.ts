@@ -4,6 +4,7 @@ import { routeNearby } from "./routes/nearby";
 
 export { FeedDO } from "./feed_do";
 export { GbfsDO } from "./gbfs_do";
+export { AlertDO } from "./alerts_do";
 
 /**
  * Curated feeds reachable through the public routes come from wrangler
