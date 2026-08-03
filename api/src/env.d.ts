@@ -6,6 +6,8 @@ declare global {
     DB: D1Database;
     FEED_DO: DurableObjectNamespace<FeedDO>;
     GBFS_DO: DurableObjectNamespace<GbfsDO>;
+    /** Curated-feed allowlist (wrangler vars, JSON array of feed ids). */
+    CURATED_FEEDS?: string[];
     /** Accuracy gate for locate results, meters (default 500). */
     LOCATE_MAX_ACCURACY_M?: string;
     /** Abort timeout for locate provider fetches, ms (default 2000). */

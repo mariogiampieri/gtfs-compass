@@ -137,3 +137,13 @@ describe("rateLimited refill math", () => {
     expect(rateLimited(ip, t0 + 1000)).toBe(true); // sixth within the second fails
   });
 });
+
+describe("curated allowlist from wrangler vars", () => {
+  it("reads CURATED_FEEDS vars, not a code constant", async () => {
+    const { curatedFeeds } = await import("../../src/index");
+    const set = curatedFeeds(env);
+    expect(set.has("mta-subway")).toBe(true);
+    expect(set.has("citibike")).toBe(true); // present in vars only — never in the old constant
+    expect(set.has("not-curated")).toBe(false);
+  });
+});

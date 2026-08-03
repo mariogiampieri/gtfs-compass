@@ -6,12 +6,19 @@ export { FeedDO } from "./feed_do";
 export { GbfsDO } from "./gbfs_do";
 
 /**
- * Curated feeds reachable through the group-addressed route. The D1 feeds
- * table also holds ~2,800 crowd-sourced catalog rows whose URLs must never
- * be fetched on an anonymous caller's say-so — reachability is by explicit
- * allowlist, not by what exists in the table.
+ * Curated feeds reachable through the public routes come from wrangler
+ * `vars.CURATED_FEEDS` (JSON array) — the D1 feeds table also holds ~2,800
+ * crowd-sourced catalog rows whose URLs must never be fetched on an
+ * anonymous caller's say-so, so reachability is by explicit config, not by
+ * what exists in the table. Memoized per isolate; vars are deploy-time.
  */
-const CURATED_FEEDS: ReadonlySet<string> = new Set(["mta-subway", "citibike"]);
+let curatedFeedsMemo: ReadonlySet<string> | null = null;
+export function curatedFeeds(env: Env): ReadonlySet<string> {
+  if (!curatedFeedsMemo) {
+    curatedFeedsMemo = new Set(Array.isArray(env.CURATED_FEEDS) ? env.CURATED_FEEDS : []);
+  }
+  return curatedFeedsMemo;
+}
 
 const RATE_CAPACITY = 20; // burst
 const RATE_REFILL_PER_SEC = 5;
@@ -100,7 +107,7 @@ async function route(request: Request, env: Env): Promise<Response> {
         return Response.json({ error: "rate limited" }, { status: 429 });
       }
       if (url.pathname === "/v1/nearby") {
-        return routeNearby(request, env, url, CURATED_FEEDS);
+        return routeNearby(request, env, url, curatedFeeds(env));
       }
       return routeLocate(request, env, url);
     }
@@ -125,7 +132,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     const [, feedId, group, stopId] = decoded;
 
     // Allowlist before any lookup: non-curated feeds are unreachable by design.
-    if (!CURATED_FEEDS.has(feedId)) {
+    if (!curatedFeeds(env).has(feedId)) {
       return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
     }
     const adapter = await feedAdapter(env, feedId);

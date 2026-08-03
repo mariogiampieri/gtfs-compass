@@ -6,10 +6,11 @@ Cloudflare Worker + Durable Object layer does all the heavy lifting —
 normalizing GTFS-Realtime and GBFS feeds into tiny JSON the device can render
 in under a second.
 
-**Project status: early.** Phase 1 (data model + ingest) is built. The
-realtime layer (Durable Objects), read API, firmware, and config UI are
-specified in [`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md)
-and land in later phases.
+**Project status: early.** Phase 1 (data model + ingest), Phase 2 (realtime
+Durable Objects), and Phase 3 (the `/v1/nearby` read API, WiFi geolocation,
+and Citi Bike GBFS) are built. Firmware and the config UI are specified in
+[`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md) and land in
+later phases.
 
 ## Architecture at a glance
 
@@ -28,9 +29,10 @@ MTA static GTFS zip  ──┘                                 │
 - **`ingest/`** — Python package, run on a cron box. Seeds a catalog of
   ~2,800 active transit feeds (with bounding boxes and license URLs) from the
   [Mobility Database](https://mobilitydatabase.org/), parses static GTFS for
-  configured feeds (v1: NYC subway), and loads stops, routes, and
-  stop-to-route edges into D1 over the HTTP API. Idempotent: re-running with
-  unchanged sources writes zero rows.
+  configured feeds (v1: NYC subway, plus Citi Bike station information via
+  GBFS), derives per-direction headsigns from `trips.txt`, and loads stops,
+  routes, and stop-to-route edges into D1 over the HTTP API. Idempotent:
+  re-running with unchanged sources writes zero rows.
 - **`api/`** — owns the D1 database schema via wrangler migrations, and (as
   of Phase 2) the realtime layer: a Worker plus one Durable Object per feed
   group that polls GTFS-RT on a 20-second alarm loop while devices are
@@ -79,11 +81,12 @@ cd ingest
 uv sync
 set -a; source ../.env; set +a
 uv run gtfs-compass-ingest --dry-run all   # parse everything, write nothing
-uv run gtfs-compass-ingest all             # catalog + NYC subway static data
+uv run gtfs-compass-ingest all             # catalog + subway static + Citi Bike stations
 ```
 
 A full run seeds the feeds catalog, then loads ~1,500 subway stops,
-29 routes, and ~2,000 stop-route edges. Verify with:
+29 routes, ~2,000 stop-route edges, per-direction headsigns, and ~2,000+
+Citi Bike stations with dock capacity. Verify with:
 
 ```bash
 cd ../api
@@ -133,11 +136,61 @@ older than 90 s as stale. A feed whose upstream freezes (HTTP 200 but a
 non-advancing header timestamp) goes visibly stale rather than being
 re-stamped fresh.
 
-**No authentication yet.** The `/internal/*` route is public until the
-device-token model lands (Phase 3/5); it is limited to the curated feed
-allowlist and per-IP rate limiting, and exposes only already-public transit
-arrival times. Self-hosters uncomfortable with that can simply not deploy
-until Phase 3.
+**No authentication yet.** The `/internal/*` and `/v1/*` routes are public
+until the device-token model lands (Phase 5); they are limited to the
+curated feed allowlist (`vars.CURATED_FEEDS` in `api/wrangler.jsonc`) and
+per-IP rate limiting, and expose only already-public transit data. The
+locate diagnostics surfaces are additionally gated by a `DIAG_TOKEN` Worker
+secret (see `.env.example`).
+
+## The read API (Phase 3)
+
+One endpoint does the thinking; the device is a dumb renderer.
+
+**`GET /v1/nearby?lat=&lon=&modes=rail,bus,bike`** — nearby stations with
+realtime arrivals, grouped into color trunks with per-train headsigns,
+direction labels, pre-formatted distance labels, and bike station counts:
+
+```bash
+curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/v1/nearby?lat=40.6923&lon=-73.9873&modes=rail,bike"
+```
+
+**`POST /v1/nearby`** — the device path: one round trip from WiFi scan to
+board. The body carries the scan; the Worker resolves a position and
+composes the same response (plus the resolved `location`):
+
+```bash
+curl -X POST "https://gtfs-compass-api.<your-subdomain>.workers.dev/v1/nearby" \
+  -H 'content-type: application/json' \
+  -d '{"wifiAccessPoints": [{"macAddress": "aa:bb:cc:dd:ee:ff", "signalStrength": -60}, ...]}'
+```
+
+An unresolvable location returns `422 {"error": "location unknown"}` —
+distinct from a located-but-empty board. Each system carries `fetched_at`
+(the oldest upstream snapshot consulted, `null` when never fetched) and
+`partial: true` while any feed group is still cold, so the device never
+shows stale data as live.
+
+**`POST /v1/locate`** — the bare geolocation step, for diagnostics and the
+config UI. `POST /v1/locate/ref` and `GET /v1/locate/log` (both
+`DIAG_TOKEN`-gated) support the accuracy walk described in the spec.
+
+### Location privacy
+
+Submitted BSSIDs (WiFi MAC addresses) are **forwarded to
+[BeaconDB](https://beacondb.net)**, a third-party community geolocation
+service, to resolve a position — that is their only use. This project never
+stores BSSIDs: only a one-way hash of the scanned set lives in a 10-minute
+in-memory cache, and only a *count* of access points appears in diagnostic
+rows. Operator-initiated diagnostic logging (`log: true`, `DIAG_TOKEN`
+required) stores the resolved position estimate; those rows currently
+persist until the Phase 5 retention purge ships. BeaconDB is explicitly
+experimental (no SLA) — an unavailable provider degrades to
+`{"known": false}` and the device falls back to its favorite-stop behavior.
+
+> Note: the guiding spec's 500-byte payload budget applies to the
+> favorites-departures endpoint (a later phase); `/v1/nearby` is a richer
+> explore-first payload (~15–25 KB) fetched over WiFi.
 
 ## Feed data licensing
 
@@ -145,7 +198,9 @@ This project redistributes transit data published by agencies under their
 own terms. The catalog stores each feed's license URL (`feeds.license_url`)
 precisely because terms vary — surface it wherever feed data is shown.
 NYC subway data comes from the
-[MTA's developer feeds](https://www.mta.info/developers).
+[MTA's developer feeds](https://www.mta.info/developers). Citi Bike station
+data is used under the
+[Citi Bike data sharing policy](https://citibikenyc.com/data-sharing-policy).
 
 ## License
 

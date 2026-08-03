@@ -18,3 +18,4 @@ ingest/dist/
 # Editor / local tooling
 .obsidian/
 .DS_Store
+.claude/
