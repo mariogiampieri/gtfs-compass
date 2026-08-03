@@ -34,6 +34,15 @@ A Station is the parent place riders name ("Jay St–MetroTech"); Platforms are 
 ### Stop-Route Edge
 The derived fact that a route serves a stop, computed by joining trips against stop times during ingest. Edges are kept at Platform level; Station-level views aggregate them through the parent relationship.
 
+### Leave-By
+The product's headline number: minutes until the rider should start walking, computed server-side as arrival minus Walk Time. Negative leave-by is a real, renderable fact ("too late for this train") — distinct from zero ("leave now") and from no-data. Pre-Phase-5 the walk inputs arrive with the request; the server never guesses them.
+
+### Walk Time
+Seconds from a rider's origin to a stop's street entrance, resolved through ordered tiers — manual (rider-supplied, always wins) > heuristic (haversine × 1.3 detour factor at 1.3 m/s) > routed (deferred) — always carrying its `source` so estimated values render differently from confirmed ones, and always incremented by the Entry Buffer.
+
+### Entry Buffer
+The systematic seconds between a stop's street entrance and its platform (mezzanine, turnstile, stairs) that no router models: 90 s for rail, 0 for bus and bikeshare. Added to every Walk Time regardless of tier — omitting it is the bias that makes people miss trains.
+
 ## Ingest operations
 
 ### Sync

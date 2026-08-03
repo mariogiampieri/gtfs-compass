@@ -39,13 +39,14 @@ const BEACONDB_URL = "https://api.beacondb.net/v1/geolocate";
 // BeaconDB mandates an identifying User-Agent (verified in the Phase 3 plan).
 const USER_AGENT = "gtfs-compass/0.1 (+https://github.com/mariogiampieri/gtfs-compass)";
 
-const DEFAULT_MAX_ACCURACY_M = 500;
+export const DEFAULT_MAX_ACCURACY_M = 500;
 const DEFAULT_TIMEOUT_MS = 2000;
 export const MAX_BSSIDS = 50;
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
-function intVar(raw: string | undefined, fallback: number): number {
+/** Positive-integer env var with fallback (shared with walk.ts's gate). */
+export function intVar(raw: string | undefined, fallback: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }

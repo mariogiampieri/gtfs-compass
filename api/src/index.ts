@@ -1,4 +1,5 @@
 import { adapterGroups } from "./adapters";
+import { routeDepartures } from "./routes/departures";
 import { routeLocate } from "./routes/locate";
 import { routeNearby } from "./routes/nearby";
 
@@ -117,6 +118,16 @@ async function route(request: Request, env: Env): Promise<Response> {
         return routeNearby(request, env, url, curatedFeeds(env));
       }
       return routeLocate(request, env, url);
+    }
+
+    if (url.pathname === "/v1/departures") {
+      // Standard bucket, not the locate bucket: this path fans out to cached
+      // DO snapshots only, no external geolocation provider.
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (rateLimited(ip, Date.now())) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routeDepartures(request, env, url, curatedFeeds(env));
     }
 
     const alertsMatch = url.pathname.match(ALERTS_ROUTE);
