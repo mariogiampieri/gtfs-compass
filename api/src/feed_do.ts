@@ -5,7 +5,7 @@ import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrlsFor
 export const POLL_INTERVAL_MS = 20_000;
 export const IDLE_SUSPEND_MS = 10 * 60_000;
 export const FETCH_TIMEOUT_MS = 10_000; // safely under the poll cadence
-export const ARRIVALS_PER_ROUTE = 4; // per (stop, route): Phase 3 needs n=3 per route
+export const ARRIVALS_PER_ROUTE = 8; // per (stop, route): the trunk-detail screen scrolls all upcoming
 
 interface Snapshot {
   arrivals: Record<string, Arrival[]>;
@@ -54,16 +54,19 @@ export class FeedDO extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const match = url.pathname.match(/^\/stop\/([^/]+)$/);
+    const single = url.pathname.match(/^\/stop\/([^/]+)$/);
+    const batch = url.pathname === "/stops";
     const feedId = url.searchParams.get("feed");
     const group = url.searchParams.get("group");
-    if (!match || !feedId || !group) {
+    if ((!single && !batch) || !feedId || !group) {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
     if (this.configMissing) {
       return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
     }
-    const stopId = decodeURIComponent(match[1]);
+    const stopIds = single
+      ? [decodeURIComponent(single[1])]
+      : (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
     const now = Date.now();
 
     // Input-gated sequence: storage awaits only, no interleaving point.
@@ -84,7 +87,9 @@ export class FeedDO extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(now + POLL_INTERVAL_MS);
     }
 
-    const response = this.stopResponse(stopId, group, now);
+    const response = single
+      ? this.stopResponse(stopIds[0], group, now)
+      : this.stopsResponse(stopIds, group, now);
     if (arming) {
       this.ctx.waitUntil(this.refresh());
     }
@@ -215,6 +220,30 @@ export class FeedDO extends DurableObject<Env> {
       fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
       group,
       arrivals,
+    });
+  }
+
+  /**
+   * Batch read for composition: one snapshot lookup per group per request
+   * instead of one per platform. Same first-read/staleness contract as the
+   * single-stop route; every requested id is present (empty when unknown).
+   */
+  private stopsResponse(stopIds: string[], group: string, nowMs: number): Response {
+    if (!this.snapshot) {
+      const empty: Record<string, Arrival[]> = {};
+      for (const id of stopIds) empty[id] = [];
+      return Response.json({ fetched_at: null, group, stops: empty });
+    }
+    const nowSec = Math.floor(nowMs / 1000);
+    const stops: Record<string, Arrival[]> = {};
+    for (const id of stopIds) {
+      const stored = Object.hasOwn(this.snapshot.arrivals, id) ? this.snapshot.arrivals[id] : [];
+      stops[id] = stored.filter((a) => a.time >= nowSec);
+    }
+    return Response.json({
+      fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
+      group,
+      stops,
     });
   }
 }

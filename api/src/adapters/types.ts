@@ -2,6 +2,12 @@
 export interface Arrival {
   routeId: string;
   time: number; // epoch seconds
+  /**
+   * The trip's terminal stop (last stop_time_update): branched routes need
+   * per-train headsigns, and a dominant per-direction label is wrong for
+   * roughly half of southbound A trains. Absent when the feed omits it.
+   */
+  terminalStopId?: string;
 }
 
 export interface FeedAdapter {

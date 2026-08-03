@@ -323,23 +323,60 @@ describe("FeedDO", () => {
 });
 
 describe("trimPerRoute", () => {
-  it("keeps 4 per route so infrequent routes are not starved (per-route floor)", () => {
+  it("keeps 8 per route so infrequent routes are not starved (per-route floor)", () => {
     const base = 1000;
     const arrivals = [
-      ...Array.from({ length: 8 }, (_, i) => ({ routeId: "A", time: base + i * 10 })),
-      { routeId: "F", time: base + 5 },
-      { routeId: "F", time: base + 45 },
-      { routeId: "F", time: base + 85 },
-      { routeId: "F", time: base + 125 },
-      { routeId: "F", time: base + 165 },
+      ...Array.from({ length: 12 }, (_, i) => ({ routeId: "A", time: base + i * 10 })),
+      ...Array.from({ length: 10 }, (_, i) => ({ routeId: "F", time: base + 5 + i * 40 })),
     ].sort((a, b) => a.time - b.time);
 
     const trimmed = trimPerRoute(new Map([["S1", arrivals]]));
     const byRoute = (route: string) => trimmed.S1.filter((a) => a.routeId === route);
-    expect(byRoute("A")).toHaveLength(4);
-    expect(byRoute("F")).toHaveLength(4); // not starved by the frequent A
+    expect(byRoute("A")).toHaveLength(8);
+    expect(byRoute("F")).toHaveLength(8); // not starved by the frequent A
     for (let i = 1; i < trimmed.S1.length; i++) {
       expect(trimmed.S1[i].time).toBeGreaterThanOrEqual(trimmed.S1[i - 1].time);
     }
+  });
+});
+
+describe("batch stop reads", () => {
+  it("returns every requested id with filtered arrivals and one shared fetched_at", async () => {
+    const now = nowSec();
+    mockFeedOnce(
+      "/gtfs-ace",
+      encodeFeed(now, [
+        ["A", "A41N", now + 120],
+        ["A", "A41S", now + 300],
+      ]),
+    );
+    const stub = stubFor("mta-subway:ace-batch");
+    await read(stub, "A41N"); // arm + refresh
+    await settleRefresh(stub);
+
+    const res = await stub.fetch("https://do/stops?ids=A41N,A41S,MISSING&feed=mta-subway&group=ace");
+    const body = await res.json<any>();
+    expect(body.fetched_at).toBeGreaterThan(0);
+    expect(body.stops.A41N).toHaveLength(1);
+    expect(body.stops.A41S).toHaveLength(1);
+    expect(body.stops.MISSING).toEqual([]);
+    assertNoPendingMocks();
+  });
+
+  it("honors the first-read contract: fetched_at null with empty lists", async () => {
+    mockFeedOnce("/gtfs-ace", encodeFeed(nowSec(), []));
+    const stub = stubFor("mta-subway:ace-batch-first");
+    const res = await stub.fetch("https://do/stops?ids=A41N,A41S&feed=mta-subway&group=ace");
+    const body = await res.json<any>();
+    expect(body.fetched_at).toBeNull();
+    expect(body.stops).toEqual({ A41N: [], A41S: [] });
+    await settleRefresh(stub); // consume the armed refresh's mock
+    assertNoPendingMocks();
+  });
+
+  it("rejects a batch read missing feed/group params", async () => {
+    const stub = stubFor("mta-subway:ace-batch-bad");
+    const res = await stub.fetch("https://do/stops?ids=A41N");
+    expect(res.status).toBe(400);
   });
 });
