@@ -1,6 +1,5 @@
 import pytest
 from conftest import FakeResponse, FakeSession, d1_body
-
 from gtfs_compass_ingest import load
 from gtfs_compass_ingest.load import (
     D1Client,

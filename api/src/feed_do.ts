@@ -1,21 +1,24 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrlsFor } from "./adapters";
+import {
+  batchIdsParam,
+  type DoIdentity,
+  FETCH_TIMEOUT_MS,
+  IDLE_SUSPEND_MS,
+  MissingFeedError,
+  doTag,
+} from "./do_shared";
+
+export { FETCH_TIMEOUT_MS, IDLE_SUSPEND_MS } from "./do_shared";
 
 export const POLL_INTERVAL_MS = 20_000;
-export const IDLE_SUSPEND_MS = 10 * 60_000;
-export const FETCH_TIMEOUT_MS = 10_000; // safely under the poll cadence
-export const ARRIVALS_PER_ROUTE = 4; // per (stop, route): Phase 3 needs n=3 per route
+export const ARRIVALS_PER_ROUTE = 8; // per (stop, route): the trunk-detail screen scrolls all upcoming
 
 interface Snapshot {
   arrivals: Record<string, Arrival[]>;
   fetchedAtMs: number; // wall clock at fetch start
   headerTimestamp: number; // feed generation time (epoch seconds)
-}
-
-interface Identity {
-  feedId: string;
-  group: string;
 }
 
 interface FeedConfig {
@@ -32,7 +35,7 @@ interface FeedConfig {
  */
 export class FeedDO extends DurableObject<Env> {
   private snapshot: Snapshot | null = null;
-  private identity: Identity | null = null;
+  private identity: DoIdentity | null = null;
   private lastReadMs = 0;
   private lastPersistedReadMs = 0;
   private refreshInFlight = false;
@@ -46,7 +49,7 @@ export class FeedDO extends DurableObject<Env> {
       const stored = await ctx.storage.get<unknown>(["snapshot", "identity", "last_read"]);
       const map = stored as Map<string, unknown>;
       this.snapshot = (map.get("snapshot") as Snapshot | undefined) ?? null;
-      this.identity = (map.get("identity") as Identity | undefined) ?? null;
+      this.identity = (map.get("identity") as DoIdentity | undefined) ?? null;
       this.lastReadMs = (map.get("last_read") as number | undefined) ?? 0;
       this.lastPersistedReadMs = this.lastReadMs;
     });
@@ -54,16 +57,17 @@ export class FeedDO extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const match = url.pathname.match(/^\/stop\/([^/]+)$/);
+    const single = url.pathname.match(/^\/stop\/([^/]+)$/);
+    const batch = url.pathname === "/stops";
     const feedId = url.searchParams.get("feed");
     const group = url.searchParams.get("group");
-    if (!match || !feedId || !group) {
+    if ((!single && !batch) || !feedId || !group) {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
     if (this.configMissing) {
       return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
     }
-    const stopId = decodeURIComponent(match[1]);
+    const stopIds = single ? [decodeURIComponent(single[1])] : (batchIdsParam(url) ?? []);
     const now = Date.now();
 
     // Input-gated sequence: storage awaits only, no interleaving point.
@@ -84,7 +88,9 @@ export class FeedDO extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(now + POLL_INTERVAL_MS);
     }
 
-    const response = this.stopResponse(stopId, group, now);
+    const response = single
+      ? this.stopResponse(stopIds[0], group, now)
+      : this.stopsResponse(stopIds, group, now);
     if (arming) {
       this.ctx.waitUntil(this.refresh());
     }
@@ -114,7 +120,7 @@ export class FeedDO extends DurableObject<Env> {
   }
 
   private tag(): string {
-    return this.identity ? `[${this.identity.feedId}:${this.identity.group}]` : "[unbound]";
+    return doTag(this.identity);
   }
 
   /** Fetch + parse + store, single-flight, newer-only. Never throws. */
@@ -140,7 +146,13 @@ export class FeedDO extends DurableObject<Env> {
       }
       const buf = new Uint8Array(await upstream.arrayBuffer());
 
-      const headerTimestamp = feedHeaderTimestamp(buf);
+      let headerTimestamp = feedHeaderTimestamp(buf);
+      // A far-future header timestamp must never become the persisted
+      // high-water mark — it would reject every correct feed forever.
+      if (headerTimestamp > Math.floor(fetchStartMs / 1000) + 300) {
+        console.warn(`${this.tag()} implausible header timestamp ${headerTimestamp}; ignoring`);
+        headerTimestamp = 0;
+      }
       // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
       // failed fetch so staleness becomes visible (spec constraint #5).
       // Feeds that omit the optional header timestamp (0) skip this gate.
@@ -217,12 +229,31 @@ export class FeedDO extends DurableObject<Env> {
       arrivals,
     });
   }
-}
 
-class MissingFeedError extends Error {
-  constructor(feedId: string) {
-    super(`no feeds row for ${feedId}`);
-    this.name = "MissingFeedError";
+  /**
+   * Batch read for composition: one snapshot lookup per group per request
+   * instead of one per platform. Same first-read/staleness contract as the
+   * single-stop route; every requested id is present (empty when unknown).
+   */
+  private stopsResponse(stopIds: string[], group: string, nowMs: number): Response {
+    // Object.create(null): stop ids are caller-controlled; "__proto__" etc.
+    // must land as own keys, mirroring trimPerRoute and GbfsDO.
+    if (!this.snapshot) {
+      const empty: Record<string, Arrival[]> = Object.create(null);
+      for (const id of stopIds) empty[id] = [];
+      return Response.json({ fetched_at: null, group, stops: empty });
+    }
+    const nowSec = Math.floor(nowMs / 1000);
+    const stops: Record<string, Arrival[]> = Object.create(null);
+    for (const id of stopIds) {
+      const stored = Object.hasOwn(this.snapshot.arrivals, id) ? this.snapshot.arrivals[id] : [];
+      stops[id] = stored.filter((a) => a.time >= nowSec);
+    }
+    return Response.json({
+      fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
+      group,
+      stops,
+    });
   }
 }
 

@@ -10,9 +10,12 @@ const adapters: Record<string, FeedAdapter> = {
 /**
  * Adapters that fan a feed out into named groups. Only feeds whose adapter
  * appears here are reachable through the group-addressed route (U4's
- * allowlist leans on this: no groups, no route).
+ * allowlist leans on this: no groups, no route). A plain GTFS-RT feed is a
+ * single full dataset — one group, "all" — so a second agency needs config
+ * only, no new code (constraint #6).
  */
 export const adapterGroups: Record<string, readonly string[]> = {
+  gtfs_rt: ["all"],
   nyct: NYCT_GROUPS,
 };
 
@@ -25,6 +28,7 @@ export function getAdapter(name: string): FeedAdapter {
 }
 
 const groupUrlBuilders: Record<string, (baseUrl: string) => Record<string, string>> = {
+  gtfs_rt: (base) => ({ all: base }),
   nyct: (base) => ({ ...groupUrls(base) }),
 };
 

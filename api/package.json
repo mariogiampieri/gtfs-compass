@@ -6,7 +6,7 @@
     "migrate:remote": "wrangler d1 migrations apply gtfs-compass --remote",
     "test": "vitest run",
     "generate:proto": "./scripts/generate-proto.sh",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler d1 migrations apply gtfs-compass --remote && wrangler deploy",
     "dev": "wrangler dev"
   },
   "devDependencies": {

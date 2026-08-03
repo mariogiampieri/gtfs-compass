@@ -33,11 +33,37 @@ MTA_SUBWAY = CuratedFeed(
         "max_lon": -73.68,
         "license_url": "https://www.mta.info/developers",
         "status": "active",
+        # NYC subway platforms carry N/S suffixes mapping to direction_id 0/1.
+        "direction_labels": '["Uptown","Downtown"]',
+        "units": "imperial",
     },
     static_ingest=True,
 )
 
-CURATED_FEEDS = (MTA_SUBWAY,)
+CITIBIKE = CuratedFeed(
+    row={
+        "id": "citibike",
+        "name": "Citi Bike NYC",
+        # GBFS 2.3 (3.0 is 403 as of 2026-08-02); station_information stands in
+        # as the "static" source — stations become stops rows with capacity.
+        "static_url": "https://gbfs.lyft.com/gbfs/2.3/bkn/en/station_information.json",
+        "rt_trip_url": "https://gbfs.lyft.com/gbfs/2.3/bkn/en/station_status.json",
+        "rt_alert_url": None,
+        "rt_needs_key": 0,
+        "adapter": "gbfs",
+        "min_lat": 40.50,
+        "max_lat": 40.92,
+        "min_lon": -74.28,
+        "max_lon": -73.68,
+        "license_url": "https://citibikenyc.com/data-sharing-policy",
+        "status": "active",
+        "direction_labels": None,  # bikes have no directions
+        "units": "imperial",
+    },
+    static_ingest=True,
+)
+
+CURATED_FEEDS = (MTA_SUBWAY, CITIBIKE)
 
 # Mobility Database ids whose systems a curated row already covers.
 # mdb-511 = NYC Subway Supplemented (static), mdb-516 = NYC Subway (static);
@@ -53,3 +79,15 @@ def curated_rows(now: int) -> list[dict]:
 
 def static_ingest_feed_ids() -> list[str]:
     return [feed.row["id"] for feed in CURATED_FEEDS if feed.static_ingest]
+
+
+def adapter_for(feed_id: str) -> str | None:
+    """Adapter name for a curated feed; None for unknown/catalog feeds.
+
+    The static loop dispatches on this. Resolving from the seeds registry is
+    sufficient because only curated feeds are static-ingested.
+    """
+    for feed in CURATED_FEEDS:
+        if feed.row["id"] == feed_id:
+            return feed.row["adapter"]
+    return None

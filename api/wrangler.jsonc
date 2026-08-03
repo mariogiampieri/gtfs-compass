@@ -2,6 +2,13 @@
   "name": "gtfs-compass-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-02",
+  "vars": {
+    // Feeds reachable through the public routes. The D1 feeds table also
+    // holds ~2,800 crowd-sourced catalog rows whose URLs must never be
+    // fetched on an anonymous caller's say-so — reachability is by this
+    // explicit allowlist. A second agency is a config change, not code.
+    "CURATED_FEEDS": ["mta-subway", "citibike"]
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -14,6 +21,10 @@
       {
         "name": "FEED_DO",
         "class_name": "FeedDO"
+      },
+      {
+        "name": "GBFS_DO",
+        "class_name": "GbfsDO"
       }
     ]
   },
@@ -21,6 +32,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["FeedDO"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["GbfsDO"]
     }
   ]
 }

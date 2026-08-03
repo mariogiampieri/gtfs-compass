@@ -27,12 +27,16 @@ export function parseGtfsRt(buf: Uint8Array, now: number): Map<string, Arrival[]
     if (!tripUpdate) continue;
     const routeId = tripUpdate.trip?.routeId;
     if (!routeId) continue;
-    for (const update of tripUpdate.stopTimeUpdate ?? []) {
+    const updates = tripUpdate.stopTimeUpdate ?? [];
+    // NYCT-style feeds list every remaining stop, so the last entry is this
+    // train's terminal — the per-arrival headsign source.
+    const terminalStopId = updates.length ? updates[updates.length - 1].stopId ?? undefined : undefined;
+    for (const update of updates) {
       const stopId = update.stopId;
       const time = toNumber(update.departure?.time ?? update.arrival?.time);
       if (!stopId || !time || time < now) continue;
       const list = byStop.get(stopId) ?? [];
-      list.push({ routeId, time });
+      list.push(terminalStopId ? { routeId, time, terminalStopId } : { routeId, time });
       byStop.set(stopId, list);
     }
   }
