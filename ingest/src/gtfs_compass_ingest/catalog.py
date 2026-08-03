@@ -92,6 +92,9 @@ def build_feed_rows(catalog_text: str, now: int) -> list[dict]:
                 # rows set real labels. Units default matches the seeds.
                 "direction_labels": None,
                 "units": "imperial",
+                # Mode is a curated-only fact; sync binds every spec column
+                # of every row, so catalog rows must carry it explicitly.
+                "mode": None,
             }
         )
     return feed_rows

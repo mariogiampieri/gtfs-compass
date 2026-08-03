@@ -13,7 +13,10 @@ import { type StopGroup, nearbyStops, nearestBeyond } from "./stops";
 
 export interface FeedInfo {
   id: string;
-  adapter: string; // 'nyct' | 'gtfs_rt' | 'gbfs' | ...
+  adapter: string; // 'nyct' | 'gtfs_rt' | 'gbfs' | ... — a parsing strategy
+  /** Product surface ('rail' | 'bus' | 'bike') from feeds.mode; null falls
+   * back to adapter inference (pre-migration rows). */
+  mode: string | null;
   directionLabels: string[] | null;
   units: string | null;
 }
@@ -124,6 +127,11 @@ export interface NearbyResponse {
 }
 
 export function modeForFeed(feed: FeedInfo): (typeof MODES)[number] {
+  // Explicit mode wins (adapter describes parsing, not product surface — a
+  // bus feed parses as plain gtfs_rt); adapter inference covers null rows.
+  if (feed.mode && (MODES as readonly string[]).includes(feed.mode)) {
+    return feed.mode as (typeof MODES)[number];
+  }
   return feed.adapter === "gbfs" ? "bike" : "rail";
 }
 
@@ -180,6 +188,7 @@ export interface SnapshotArrival {
   routeId: string;
   time: number;
   terminalStopId?: string;
+  directionId?: 0 | 1;
 }
 
 export interface GroupSnapshots {
@@ -196,11 +205,13 @@ async function composeRailSystem(
   limit: number,
   nowSec: number,
 ): Promise<RailSystem> {
+  // This feed's product surface: "rail" or "bus" (bike never routes here).
+  const mode = modeForFeed(feed) as "rail" | "bus";
   const units = { [feed.id]: feed.units };
   const stations = await nearbyStops(env.DB, { lat, lon, radiusM, feedIds: [feed.id], limit }, units);
   if (stations.length === 0) {
     return {
-      mode: "rail",
+      mode,
       direction_labels: feed.directionLabels,
       fetched_at: null,
       stops: [],
@@ -234,32 +245,58 @@ async function composeRailSystem(
   ]);
   const routesById = new Map(routeRows.map((r) => [r.route_id, r]));
 
-  // Collect every arrival's terminal id, then resolve names in one query.
+  // Direction and headsign strategies are adapter-keyed (like groupForRoute):
+  // NYCT platforms encode direction in their id suffix and publish full stop
+  // horizons (terminal-stop headsigns are trustworthy); plain GTFS-RT feeds
+  // (buses) carry direction on each trip and publish truncated horizons, so
+  // arrivals split by Arrival.directionId and headsigns come from the static
+  // route_directions dominants only — a mid-route stop must never render as
+  // a destination.
+  const suffixStrategy = feed.adapter === "nyct";
+
+  // Collect every arrival's terminal id, then resolve names in one query
+  // (terminal derivation is the suffix-strategy path only).
   const terminalIds = new Set<string>();
-  for (const { stops } of snapshots.results.values()) {
-    for (const arrivals of Object.values(stops)) {
-      for (const a of arrivals) if (a.terminalStopId) terminalIds.add(a.terminalStopId);
+  if (suffixStrategy) {
+    for (const { stops } of snapshots.results.values()) {
+      for (const arrivals of Object.values(stops)) {
+        for (const a of arrivals) if (a.terminalStopId) terminalIds.add(a.terminalStopId);
+      }
     }
   }
   const terminalNames = await loadStopNames(env, feed.id, [...terminalIds]);
 
   let suffixlessPlatforms = 0;
+  let directionlessArrivals = 0;
   const stops = stations.map((station): RailStop => {
     const { trunks, trunkByRoute } = buildTrunks(station, routesById);
     for (const platformId of station.stopIds) {
-      const directionId = nyctDirectionId(platformId);
-      if (directionId === null) {
-        suffixlessPlatforms++;
-        continue;
+      let platformDirection: 0 | 1 | null = null;
+      if (suffixStrategy) {
+        platformDirection = nyctDirectionId(platformId);
+        if (platformDirection === null) {
+          suffixlessPlatforms++;
+          continue;
+        }
       }
       for (const { stops: groupStops } of snapshots.results.values()) {
         for (const arrival of groupStops[platformId] ?? []) {
           const trunk = trunkByRoute.get(arrival.routeId);
           if (!trunk) continue; // realtime-only route unknown to static data
+          let directionId: 0 | 1;
+          if (suffixStrategy) {
+            directionId = platformDirection!;
+          } else if (arrival.directionId === 0 || arrival.directionId === 1) {
+            directionId = arrival.directionId;
+          } else {
+            directionlessArrivals++; // visible, never dropped
+            directionId = 0;
+          }
           const label = routesById.get(arrival.routeId)?.short_name || arrival.routeId;
-          const terminalName = arrival.terminalStopId
-            ? (terminalNames.get(arrival.terminalStopId) ?? null)
-            : null;
+          const terminalName =
+            suffixStrategy && arrival.terminalStopId
+              ? (terminalNames.get(arrival.terminalStopId) ?? null)
+              : null;
           const headsign =
             terminalName ?? fallbackHeadsigns.get(`${arrival.routeId}:${directionId}`) ?? null;
           trunk.directions[directionId].arrivals.push({
@@ -289,12 +326,15 @@ async function composeRailSystem(
   if (suffixlessPlatforms) {
     console.warn(`[nearby] ${feed.id}: ${suffixlessPlatforms} platform id(s) without a direction suffix dropped`);
   }
+  if (directionlessArrivals) {
+    console.warn(`[nearby] ${feed.id}: ${directionlessArrivals} arrival(s) without direction_id defaulted to direction 0`);
+  }
 
   const stamps = [...snapshots.results.values()]
     .map((g) => g.fetchedAt)
     .filter((t): t is number => t !== null);
   return {
-    mode: "rail",
+    mode,
     direction_labels: feed.directionLabels,
     fetched_at: stamps.length ? Math.min(...stamps) : null,
     ...(snapshots.anySourceFailed ? { partial: true as const } : {}),

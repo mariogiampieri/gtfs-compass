@@ -76,16 +76,23 @@ async function loadFeedInfo(env: Env, curatedFeeds: ReadonlySet<string>): Promis
   const ids = [...curatedFeeds];
   if (ids.length === 0) return [];
   const rows = await env.DB.prepare(
-    `SELECT id, adapter, direction_labels, units FROM feeds
+    `SELECT id, adapter, direction_labels, units, mode FROM feeds
      WHERE id IN (${ids.map(() => "?").join(", ")})`,
   )
     .bind(...ids)
-    .all<{ id: string; adapter: string | null; direction_labels: string | null; units: string | null }>();
+    .all<{
+      id: string;
+      adapter: string | null;
+      direction_labels: string | null;
+      units: string | null;
+      mode: string | null;
+    }>();
   return rows.results
     .filter((r) => r.adapter !== null)
     .map((r) => ({
       id: r.id,
       adapter: r.adapter!,
+      mode: r.mode,
       directionLabels: parseLabels(r.direction_labels),
       units: r.units,
     }));

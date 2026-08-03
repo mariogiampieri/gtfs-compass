@@ -14,6 +14,10 @@ from dataclasses import dataclass
 class CuratedFeed:
     row: dict  # feeds-table row, minus updated_at (stamped at load time)
     static_ingest: bool  # include in the default `static`/`all` feed set
+    # Authoritative static download list for multi-source feeds. None (the
+    # default) means the single row["static_url"]. For multi-source feeds the
+    # D1 static_url column is display-only; this list wins on every run.
+    static_sources: list[str] | None = None
 
 
 MTA_SUBWAY = CuratedFeed(
@@ -39,8 +43,50 @@ MTA_SUBWAY = CuratedFeed(
         # NYC subway platforms carry N/S suffixes mapping to direction_id 0/1.
         "direction_labels": '["Uptown","Downtown"]',
         "units": "imperial",
+        "mode": "rail",
     },
     static_ingest=True,
+)
+
+# One feed, six static sources: MTA publishes bus GTFS per borough plus the
+# MTA Bus Company set (all verified live 2026-08-03 on the same S3 bucket as
+# the subway zip). They ingest as a single mta-bus feed_id; the first URL
+# doubles as the display static_url.
+MTA_BUS_STATIC_SOURCES = [
+    "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_b.zip",  # Brooklyn
+    "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_bx.zip",  # Bronx
+    "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_m.zip",  # Manhattan
+    "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_q.zip",  # Queens
+    "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_si.zip",  # Staten Island
+    "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_busco.zip",  # MTA Bus Company
+]
+
+MTA_BUS = CuratedFeed(
+    row={
+        "id": "mta-bus",
+        "name": "MTA New York City Bus",
+        "static_url": MTA_BUS_STATIC_SOURCES[0],  # display only; sources win
+        # Citywide Bus Time trip updates: a plain single-group GTFS-RT feed,
+        # so the generic gtfs_rt adapter needs no new code. The key is
+        # documented-required but unenforced (verified live 2026-08-03);
+        # rt_needs_key drives the Worker's optional key injection.
+        "rt_trip_url": "https://gtfsrt.prod.obanyc.com/tripUpdates",
+        "rt_alert_url": None,  # bus alerts deferred (AlertDO can take it later)
+        "rt_needs_key": 1,
+        "adapter": "gtfs_rt",
+        "min_lat": 40.50,
+        "max_lat": 40.92,
+        "min_lon": -74.28,
+        "max_lon": -73.68,
+        "license_url": "https://www.mta.info/developers",
+        "status": "active",
+        # No platform suffixes on curb stops; the device renders compass tags.
+        "direction_labels": None,
+        "units": "imperial",
+        "mode": "bus",
+    },
+    static_ingest=True,
+    static_sources=MTA_BUS_STATIC_SOURCES,
 )
 
 CITIBIKE = CuratedFeed(
@@ -62,15 +108,18 @@ CITIBIKE = CuratedFeed(
         "status": "active",
         "direction_labels": None,  # bikes have no directions
         "units": "imperial",
+        "mode": "bike",
     },
     static_ingest=True,
 )
 
-CURATED_FEEDS = (MTA_SUBWAY, CITIBIKE)
+CURATED_FEEDS = (MTA_SUBWAY, MTA_BUS, CITIBIKE)
 
 # Mobility Database ids whose systems a curated row already covers.
 # mdb-511 = NYC Subway Supplemented (static), mdb-516 = NYC Subway (static);
 # the NYC subway gtfs_rt rows all reference mdb-516 and follow it.
+# TODO(beads follow-up): add the MTA-bus catalog ids once confirmed against
+# the live Mobility Database — they could not be derived offline.
 SUPPRESSED_CATALOG_IDS = frozenset({"mdb-511", "mdb-516"})
 
 SUPPRESSED_STATUS = "suppressed"
@@ -82,6 +131,21 @@ def curated_rows(now: int) -> list[dict]:
 
 def static_ingest_feed_ids() -> list[str]:
     return [feed.row["id"] for feed in CURATED_FEEDS if feed.static_ingest]
+
+
+def static_sources_for(feed_id: str) -> list[str] | None:
+    """Authoritative static source URLs for a curated feed; None for
+    unknown/catalog feeds (those resolve their single URL from D1).
+
+    Single-source curated feeds fall back to [static_url]; multi-source
+    feeds declare static_sources explicitly.
+    """
+    for feed in CURATED_FEEDS:
+        if feed.row["id"] == feed_id:
+            if feed.static_sources is not None:
+                return list(feed.static_sources)
+            return [feed.row["static_url"]]
+    return None
 
 
 def adapter_for(feed_id: str) -> str | None:

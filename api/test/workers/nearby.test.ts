@@ -2,7 +2,7 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
-import { type FeedInfo, composeNearby } from "../../src/nearby";
+import { type FeedInfo, composeNearby, modeForFeed } from "../../src/nearby";
 
 const ORIGIN = "https://rt.example";
 // Jay St–MetroTech
@@ -12,6 +12,7 @@ const JAY = { lat: 40.692338, lon: -73.987342 };
 
 interface TripFixture {
   routeId: string;
+  directionId?: number;
   stops: [string, number][]; // ordered; last = terminal
 }
 
@@ -21,7 +22,7 @@ function encodeTrips(headerTimestamp: number, trips: TripFixture[]): Uint8Array 
     entity: trips.map((trip, i) => ({
       id: `t${i}`,
       tripUpdate: {
-        trip: { tripId: `trip${i}`, routeId: trip.routeId },
+        trip: { tripId: `trip${i}`, routeId: trip.routeId, directionId: trip.directionId },
         stopTimeUpdate: trip.stops.map(([stopId, time]) => ({
           stopId,
           departure: { time },
@@ -88,7 +89,7 @@ beforeEach(async () => {
   }
   await env.DB.prepare(
     `CREATE TABLE feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, rt_alert_url TEXT,
-       adapter TEXT, direction_labels TEXT, units TEXT)`,
+       adapter TEXT, direction_labels TEXT, units TEXT, mode TEXT, rt_needs_key INTEGER)`,
   ).run();
   await env.DB.prepare(
     `CREATE TABLE stops (feed_id TEXT NOT NULL, stop_id TEXT NOT NULL, name TEXT,
@@ -122,11 +123,11 @@ let feedSerial = 0;
 async function seedRailFeed(): Promise<FeedInfo> {
   const id = `rail-${++feedSerial}-${Date.now() % 100000}`;
   await env.DB.prepare(
-    "INSERT INTO feeds (id, rt_trip_url, rt_alert_url, adapter, units) VALUES (?, ?, ?, 'nyct', 'imperial')",
+    "INSERT INTO feeds (id, rt_trip_url, rt_alert_url, adapter, units, mode) VALUES (?, ?, ?, 'nyct', 'imperial', 'rail')",
   )
     .bind(id, `${ORIGIN}/${id}`, `${ORIGIN}/${id}/alerts.json`)
     .run();
-  return { id, adapter: "nyct", directionLabels: ["Uptown", "Downtown"], units: "imperial" };
+  return { id, adapter: "nyct", mode: "rail", directionLabels: ["Uptown", "Downtown"], units: "imperial" };
 }
 
 const MERCURY = "transit_realtime.mercury_alert";
@@ -161,10 +162,23 @@ function alertsBody(
 
 async function seedBikeFeed(): Promise<FeedInfo> {
   const id = `bike-${++feedSerial}-${Date.now() % 100000}`;
-  await env.DB.prepare("INSERT INTO feeds (id, rt_trip_url, adapter, units) VALUES (?, ?, 'gbfs', 'imperial')")
+  await env.DB.prepare(
+    "INSERT INTO feeds (id, rt_trip_url, adapter, units, mode) VALUES (?, ?, 'gbfs', 'imperial', 'bike')",
+  )
     .bind(id, `${ORIGIN}/${id}/status.json`)
     .run();
-  return { id, adapter: "gbfs", directionLabels: null, units: "imperial" };
+  return { id, adapter: "gbfs", mode: "bike", directionLabels: null, units: "imperial" };
+}
+
+/** Plain GTFS-RT feed surfaced as the bus mode (feeds.mode, not adapter). */
+async function seedBusFeed(): Promise<FeedInfo> {
+  const id = `bus-${++feedSerial}-${Date.now() % 100000}`;
+  await env.DB.prepare(
+    "INSERT INTO feeds (id, rt_trip_url, adapter, units, mode) VALUES (?, ?, 'gtfs_rt', 'imperial', 'bus')",
+  )
+    .bind(id, `${ORIGIN}/${id}`)
+    .run();
+  return { id, adapter: "gtfs_rt", mode: "bus", directionLabels: null, units: "imperial" };
 }
 
 async function seedStation(
@@ -398,6 +412,7 @@ describe("composeNearby — rail", () => {
     const ghost: FeedInfo = {
       id: `ghost-${Date.now() % 100000}`,
       adapter: "nyct",
+      mode: "rail",
       directionLabels: null,
       units: "imperial",
     };
@@ -549,6 +564,98 @@ describe("composeNearby — bike and modes", () => {
       docks_open: null,
       capacity: 19,
     });
+  });
+
+  it("surfaces a gtfs_rt feed with mode 'bus' under the bus system, not rail", async () => {
+    const bus = await seedBusFeed();
+    await seedStation(bus.id, "300000", "Jay St & Willoughby", JAY.lat, JAY.lon, {
+      "300001": ["B62"],
+    });
+    await seedRoute(bus.id, "B62", "B62", null);
+    respondWith(`${ORIGIN}/${bus.id}`, () => ({ status: 200, body: encodeTrips(nowSec(), []) }));
+
+    const body = await composeWarm([bus], ["rail", "bus"]);
+    const busSystem: any = body.systems.find((s: any) => s.mode === "bus");
+    const railSystem: any = body.systems.find((s: any) => s.mode === "rail");
+    expect(busSystem.stops.map((s: any) => s.name)).toContain("Jay St & Willoughby");
+    expect(railSystem.stops).toEqual([]); // membership is mode-driven, not adapter-driven
+  });
+
+  it("splits bus arrivals by trip direction_id and never renders a truncated terminal as headsign", async () => {
+    const bus = await seedBusFeed();
+    const t0 = nowSec();
+    // One suffixless curb stop, plus a mid-route stop that a truncated
+    // horizon makes look like a terminal.
+    await seedStation(bus.id, "300001", "Jay St & Willoughby", JAY.lat, JAY.lon, {});
+    await env.DB.prepare(
+      "INSERT INTO stops (feed_id, stop_id, name, lat, lon) VALUES (?, 'MID9', 'Mid Route Av', 40.7, -73.9)",
+    )
+      .bind(bus.id)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO stop_routes (feed_id, stop_id, route_id) VALUES (?, '300001', 'B62')",
+    )
+      .bind(bus.id)
+      .run();
+    await seedRoute(bus.id, "B62", "B62", "00437D");
+    for (const [dir, headsign] of [[0, "Downtown Brooklyn"], [1, "Queens Plaza"]] as const) {
+      await env.DB.prepare(
+        "INSERT INTO route_directions (feed_id, route_id, direction_id, headsign) VALUES (?, 'B62', ?, ?)",
+      )
+        .bind(bus.id, dir, headsign)
+        .run();
+    }
+    respondWith(`${ORIGIN}/${bus.id}`, () => ({
+      status: 200,
+      body: encodeTrips(t0, [
+        // Truncated horizon: MID9 is this trip's last stop_time_update, but
+        // it is NOT the destination — the headsign must not become its name.
+        { routeId: "B62", directionId: 0, stops: [["300001", t0 + 300], ["MID9", t0 + 600]] },
+        { routeId: "B62", directionId: 1, stops: [["300001", t0 + 480]] },
+      ]),
+    }));
+
+    const body = await composeWarm([bus], ["bus"]);
+    const stop: any = (body.systems[0] as any).stops.find((s: any) => s.id === "300001");
+    const trunk = stop.trunks[0];
+    expect(trunk.directions[0].arrivals).toHaveLength(1);
+    expect(trunk.directions[1].arrivals).toHaveLength(1);
+    expect(trunk.directions[0].arrivals[0].headsign).toBe("Downtown Brooklyn");
+    expect(trunk.directions[1].arrivals[0].headsign).toBe("Queens Plaza");
+  });
+
+  it("defaults a directionless gtfs_rt arrival to direction 0, never dropping it", async () => {
+    const bus = await seedBusFeed();
+    const t0 = nowSec();
+    await seedStation(bus.id, "300002", "Bedford Av & N 7th", JAY.lat, JAY.lon, {});
+    await env.DB.prepare(
+      "INSERT INTO stop_routes (feed_id, stop_id, route_id) VALUES (?, '300002', 'B62')",
+    )
+      .bind(bus.id)
+      .run();
+    await seedRoute(bus.id, "B62", "B62", "00437D");
+    respondWith(`${ORIGIN}/${bus.id}`, () => ({
+      status: 200,
+      body: encodeTrips(t0, [{ routeId: "B62", stops: [["300002", t0 + 240]] }]),
+    }));
+
+    const body = await composeWarm([bus], ["bus"]);
+    const stop: any = (body.systems[0] as any).stops.find((s: any) => s.id === "300002");
+    expect(stop.trunks[0].directions[0].arrivals).toHaveLength(1);
+    expect(stop.trunks[0].directions[1].arrivals).toHaveLength(0);
+  });
+
+  it("falls back to adapter inference for a feed with null mode", async () => {
+    const legacy: FeedInfo = {
+      id: "legacy-1",
+      adapter: "gbfs",
+      mode: null,
+      directionLabels: null,
+      units: "imperial",
+    };
+    expect(modeForFeed(legacy)).toBe("bike");
+    expect(modeForFeed({ ...legacy, adapter: "nyct" })).toBe("rail");
+    expect(modeForFeed({ ...legacy, adapter: "gtfs_rt", mode: "bus" })).toBe("bus");
   });
 
   it("honors modes= as a filter and emits configured-empty systems", async () => {
@@ -752,7 +859,7 @@ describe("review-driven regressions", () => {
     )
       .bind(id, `${ORIGIN}/${id}`)
       .run();
-    const feed: FeedInfo = { id, adapter: "gtfs_rt", directionLabels: null, units: "imperial" };
+    const feed: FeedInfo = { id, adapter: "gtfs_rt", mode: "rail", directionLabels: null, units: "imperial" };
     const now = nowSec();
     await seedStation(id, "G1", "Generic Stop", JAY.lat, JAY.lon, { G1N: ["R1"] });
     await seedRoute(id, "R1", "R1", "3E86C0");

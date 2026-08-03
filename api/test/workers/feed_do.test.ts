@@ -1,8 +1,15 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
-import { FeedDO, IDLE_SUSPEND_MS, trimPerRoute } from "../../src/feed_do";
+import {
+  FeedDO,
+  IDLE_SUSPEND_MS,
+  MAX_CHUNKS,
+  feedKeys,
+  resetFeedKeysForTests,
+  trimPerRoute,
+} from "../../src/feed_do";
 
 const ORIGIN = "https://rt.example";
 const BASE_URL = `${ORIGIN}/gtfs`;
@@ -75,7 +82,7 @@ beforeEach(async () => {
     return new Response(body as BodyInit, { status: reply.status });
   }) as typeof fetch;
   await env.DB.prepare(
-    "CREATE TABLE IF NOT EXISTS feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, adapter TEXT)",
+    "CREATE TABLE IF NOT EXISTS feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, adapter TEXT, rt_needs_key INTEGER)",
   ).run();
   await env.DB.prepare(
     "INSERT OR REPLACE INTO feeds (id, rt_trip_url, adapter) VALUES ('mta-subway', ?, 'nyct')",
@@ -412,5 +419,301 @@ describe("batch read hardening", () => {
     const body = await res.json<any>();
     expect(body.stops["odd,idN"]).toHaveLength(1);
     assertNoPendingMocks();
+  });
+});
+
+// ---------- chunked snapshot persistence (bus scale) ----------
+
+const META_KEY = "snapshot_meta";
+const CHUNK_PREFIX = "snapshot_chunk:";
+const KV_VALUE_LIMIT = 128 * 1024;
+
+/** Compressible snapshot around a target JSON size (repetitive arrivals). */
+function makeSnapshot(targetBytes: number, salt = "x"): any {
+  const arrivals: Record<string, any[]> = {};
+  let size = 0;
+  let i = 0;
+  while (size < targetBytes) {
+    const stopId = `S${salt}${i++}`;
+    arrivals[stopId] = [
+      { routeId: "B62", time: 1_785_000_000 + i, directionId: i % 2 },
+      { routeId: "Q54", time: 1_785_000_100 + i, directionId: (i + 1) % 2 },
+    ];
+    size += 90; // rough per-stop JSON cost; exactness doesn't matter
+  }
+  return { arrivals, fetchedAtMs: 1_785_000_000_000, headerTimestamp: 1_785_000_000 };
+}
+
+/** Incompressible snapshot (random hex defeats gzip) for ceiling tests. */
+function makeIncompressibleSnapshot(targetBytes: number): any {
+  const arrivals: Record<string, any[]> = {};
+  const words = new Uint32Array(1024);
+  let size = 0;
+  let i = 0;
+  while (size < targetBytes) {
+    crypto.getRandomValues(words);
+    const blob = [...words].map((w) => w.toString(36)).join("");
+    arrivals[`R${i++}${blob.slice(0, 8)}`] = [{ routeId: blob.slice(0, 6000), time: 1 }];
+    size += 6100;
+  }
+  return { arrivals, fetchedAtMs: 1, headerTimestamp: 1 };
+}
+
+async function persistIn(stub: DurableObjectStub<FeedDO>, snapshot: any): Promise<void> {
+  await runInDurableObject(stub, async (instance: FeedDO) => {
+    (instance as any).identity = { feedId: "mta-bus", group: "all" };
+    await (instance as any).persistSnapshot(snapshot);
+  });
+}
+
+async function storageState(stub: DurableObjectStub<FeedDO>) {
+  return runInDurableObject(stub, async (_i, state) => {
+    const legacy = await state.storage.get("snapshot");
+    const meta = (await state.storage.get(META_KEY)) as any;
+    const chunkKeys = [...(await state.storage.list({ prefix: CHUNK_PREFIX })).keys()];
+    return { legacy, meta, chunkKeys };
+  });
+}
+
+async function restoreIn(stub: DurableObjectStub<FeedDO>): Promise<any> {
+  return runInDurableObject(stub, async (instance: FeedDO, state) => {
+    const meta = await state.storage.get(META_KEY);
+    if (!meta) return (await state.storage.get("snapshot")) ?? null;
+    return (instance as any).restoreChunked(meta);
+  });
+}
+
+describe("FeedDO — chunked snapshot persistence", () => {
+  it("oversized snapshot gzips, chunks, restores equal, and leaves no legacy key (AE3)", async () => {
+    const stub = stubFor("mta-bus:all#chunk-roundtrip");
+    const snapshot = makeSnapshot(2_600_000);
+    await persistIn(stub, snapshot);
+
+    const { legacy, meta, chunkKeys } = await storageState(stub);
+    expect(legacy).toBeUndefined();
+    expect(meta.encoding).toBe("gzip");
+    expect(meta.chunks).toBeGreaterThan(0);
+    expect(chunkKeys).toHaveLength(meta.chunks);
+    const restored = await restoreIn(stub);
+    expect(restored).toEqual(snapshot);
+  });
+
+  it("small snapshot keeps the legacy single-key format (subway regression)", async () => {
+    const stub = stubFor("mta-bus:all#legacy");
+    const snapshot = makeSnapshot(10_000);
+    await persistIn(stub, snapshot);
+
+    const { legacy, meta, chunkKeys } = await storageState(stub);
+    expect(legacy).toEqual(snapshot);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+    expect(await restoreIn(stub)).toEqual(snapshot);
+  });
+
+  it("shrinking within chunked format leaves no surplus chunk keys", async () => {
+    const stub = stubFor("mta-bus:all#shrink");
+    await persistIn(stub, makeIncompressibleSnapshot(1_200_000));
+    const big = await storageState(stub);
+    const smaller = makeIncompressibleSnapshot(400_000);
+    await persistIn(stub, smaller);
+
+    const state = await storageState(stub);
+    expect(state.meta.chunks).toBeLessThan(big.meta.chunks);
+    expect(state.chunkKeys).toHaveLength(state.meta.chunks);
+    expect(await restoreIn(stub)).toEqual(smaller);
+  });
+
+  it("chunked-to-legacy crossing deletes meta and all chunk keys", async () => {
+    const stub = stubFor("mta-bus:all#crossing");
+    await persistIn(stub, makeSnapshot(2_600_000));
+    const small = makeSnapshot(8_000, "y");
+    await persistIn(stub, small);
+
+    const { legacy, meta, chunkKeys } = await storageState(stub);
+    expect(legacy).toEqual(small);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+    expect(await restoreIn(stub)).toEqual(small);
+  });
+
+  it("torn chunked state restores as no-snapshot and deletes the bad keys", async () => {
+    const stub = stubFor("mta-bus:all#torn");
+    await persistIn(stub, makeSnapshot(2_600_000));
+    await runInDurableObject(stub, (_i, state) => state.storage.delete(`${CHUNK_PREFIX}1`));
+
+    expect(await restoreIn(stub)).toBeNull();
+    const { meta, chunkKeys } = await storageState(stub);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+  });
+
+  it("torn restore: a truncated chunk (bytes short of meta) clears and recovers", async () => {
+    const stub = stubFor("mta-bus:all#torn-short");
+    await persistIn(stub, makeSnapshot(2_600_000));
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put(`${CHUNK_PREFIX}1`, new ArrayBuffer(16)),
+    );
+
+    expect(await restoreIn(stub)).toBeNull();
+    const { meta, chunkKeys } = await storageState(stub);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+  });
+
+  it("torn restore: corrupt gzip bytes with correct lengths clears and recovers", async () => {
+    const stub = stubFor("mta-bus:all#torn-corrupt");
+    await persistIn(stub, makeSnapshot(2_600_000));
+    await runInDurableObject(stub, async (_i, state) => {
+      const original = (await state.storage.get(`${CHUNK_PREFIX}0`)) as ArrayBuffer;
+      const garbage = new Uint8Array(original.byteLength);
+      crypto.getRandomValues(garbage.subarray(0, Math.min(garbage.length, 65536)));
+      await state.storage.put(`${CHUNK_PREFIX}0`, garbage.buffer);
+    });
+
+    expect(await restoreIn(stub)).toBeNull(); // length checks pass; gunzip fails
+    const { meta, chunkKeys } = await storageState(stub);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+  });
+
+  it("splits by serialized bytes, never characters: every chunk fits the KV limit", async () => {
+    const stub = stubFor("mta-bus:all#multibyte");
+    // Non-ASCII-heavy payload: UTF-8 bytes ≈ 3× UTF-16 length — a char-based
+    // split would produce over-limit values here.
+    const arrivals: Record<string, any[]> = {};
+    for (let i = 0; i < 4000; i++) {
+      arrivals[`停留所${i}`] = [{ routeId: `路線${"号".repeat(120)}${i}`, time: 1_785_000_000 + i }];
+    }
+    const snapshot = { arrivals, fetchedAtMs: 1, headerTimestamp: 1 };
+    await persistIn(stub, snapshot);
+
+    await runInDurableObject(stub, async (_i, state) => {
+      const chunks = await state.storage.list({ prefix: CHUNK_PREFIX });
+      for (const value of chunks.values()) {
+        expect((value as ArrayBuffer).byteLength).toBeLessThanOrEqual(KV_VALUE_LIMIT);
+      }
+    });
+    expect(await restoreIn(stub)).toEqual(snapshot);
+  });
+
+  it("refuses a snapshot beyond the chunk ceiling, keeping the previous persisted state", async () => {
+    const stub = stubFor("mta-bus:all#ceiling");
+    const previous = makeSnapshot(20_000, "prev");
+    await persistIn(stub, previous);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // ~20 MB semi-compressible → compressed stays > MAX_CHUNKS × 90 KiB.
+      await persistIn(stub, makeIncompressibleSnapshot(20_000_000));
+      expect(errors).toHaveBeenCalledOnce();
+      expect(String(errors.mock.calls[0][0])).toContain(`max ${MAX_CHUNKS}`);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(await restoreIn(stub)).toEqual(previous);
+  });
+});
+
+// ---------- rt_needs_key fetch injection ----------
+
+describe("FeedDO — keyed fetch", () => {
+  const KEY = "sekret-abc123";
+
+  beforeEach(async () => {
+    resetFeedKeysForTests();
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO feeds (id, rt_trip_url, adapter, rt_needs_key) VALUES ('kf-feed', ?, 'gtfs_rt', 1)",
+    )
+      .bind(`${ORIGIN}/bus`)
+      .run();
+  });
+
+  afterEach(() => {
+    (env as any).RT_FEED_KEYS = undefined;
+    resetFeedKeysForTests();
+  });
+
+  function readBus(stub: DurableObjectStub<FeedDO>) {
+    return stub.fetch("https://do/stop/S1?feed=kf-feed&group=all");
+  }
+
+  it("appends the key from RT_FEED_KEYS to the upstream URL", async () => {
+    (env as any).RT_FEED_KEYS = JSON.stringify({ "kf-feed": KEY });
+    const stub = stubFor("kf-feed:all#keyed");
+    // The mock is keyed by exact URL — consuming it proves the key rode along.
+    mockFeedOnce(`/bus?key=${KEY}`, encodeFeed(nowSec(), [["B62", "S1", nowSec() + 300]]));
+
+    await readBus(stub);
+    await settleRefresh(stub);
+    const body = await (await readBus(stub)).json<any>();
+    expect(body.arrivals).toHaveLength(1);
+  });
+
+  it("polls keyless with a warning when no key entry exists (AE4)", async () => {
+    const warns = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const stub = stubFor("kf-feed:all#keyless");
+      mockFeedOnce("/bus", encodeFeed(nowSec(), [["B62", "S1", nowSec() + 300]]));
+
+      await readBus(stub);
+      await settleRefresh(stub);
+      const body = await (await readBus(stub)).json<any>();
+      expect(body.arrivals).toHaveLength(1);
+      const keylessWarns = warns.mock.calls.filter((c) => String(c[0]).includes("polling keyless"));
+      expect(keylessWarns).toHaveLength(1);
+    } finally {
+      warns.mockRestore();
+    }
+  });
+
+  it("treats a malformed RT_FEED_KEYS exactly like a missing one, leaking nothing", async () => {
+    (env as any).RT_FEED_KEYS = '{"kf-feed": "oops-trailing",}';
+    const warns = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(feedKeys(env)).toEqual({});
+      const stub = stubFor("kf-feed:all#badsecret");
+      mockFeedOnce("/bus", encodeFeed(nowSec(), [["B62", "S1", nowSec() + 300]]));
+      await readBus(stub);
+      await settleRefresh(stub);
+      const body = await (await readBus(stub)).json<any>();
+      expect(body.arrivals).toHaveLength(1);
+      for (const call of warns.mock.calls) {
+        expect(call.map(String).join(" ")).not.toContain("oops-trailing");
+      }
+    } finally {
+      warns.mockRestore();
+    }
+  });
+
+  it("flags a keyless 401 as probable enforcement onset", async () => {
+    const warns = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const stub = stubFor("kf-feed:all#enforced");
+      mockFeedOnce("/bus", "denied", 0, 401);
+      await readBus(stub);
+      await settleRefresh(stub);
+      const flagged = warns.mock.calls.filter((c) => String(c[0]).includes("enforcement"));
+      expect(flagged).toHaveLength(1);
+    } finally {
+      warns.mockRestore();
+    }
+  });
+
+  it("scrubs error-path logs for keyed fetches (the URL embeds the key)", async () => {
+    (env as any).RT_FEED_KEYS = JSON.stringify({ "kf-feed": KEY });
+    const warns = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const stub = stubFor("kf-feed:all#scrub");
+      // No mock for the keyed URL: the stub fetch throws an error whose
+      // message CONTAINS the full URL (and therefore the key).
+      await readBus(stub);
+      await settleRefresh(stub);
+      for (const call of warns.mock.calls) {
+        expect(call.map(String).join(" ")).not.toContain(KEY);
+      }
+      const scrubbed = warns.mock.calls.filter((c) => String(c[0]).includes("error scrubbed"));
+      expect(scrubbed).toHaveLength(1);
+    } finally {
+      warns.mockRestore();
+    }
   });
 });

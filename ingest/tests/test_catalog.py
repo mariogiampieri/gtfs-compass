@@ -52,6 +52,42 @@ def test_catalog_rows_carry_null_direction_labels_and_default_units():
     (feed,) = rows
     assert feed["direction_labels"] is None  # only curated rows set labels
     assert feed["units"] == "imperial"  # consistent with the curated seeds
+    assert feed["mode"] is None  # mode is curated-only; sync binds every column
+
+
+def test_curated_rows_carry_modes():
+    rows = {r["id"]: r for r in seeds.curated_rows(now=0)}
+    assert rows["mta-subway"]["mode"] == "rail"
+    assert rows["mta-bus"]["mode"] == "bus"
+    assert rows["citibike"]["mode"] == "bike"
+
+
+def test_mta_bus_seed_row_and_static_sources():
+    rows = {r["id"]: r for r in seeds.curated_rows(now=0)}
+    bus = rows["mta-bus"]
+    assert bus["adapter"] == "gtfs_rt"  # config-only realtime seam, no new adapter
+    assert bus["rt_needs_key"] == 1
+    assert bus["rt_trip_url"].startswith("https://")  # key must never ride cleartext
+    assert bus["rt_alert_url"] is None
+    assert bus["direction_labels"] is None  # device renders compass tags
+    assert bus["license_url"] == "https://www.mta.info/developers"
+    # Display URL is the first source; the six-zip list is authoritative.
+    sources = seeds.static_sources_for("mta-bus")
+    assert bus["static_url"] == sources[0]
+    assert [s.rsplit("/", 1)[1] for s in sources] == [
+        "gtfs_b.zip", "gtfs_bx.zip", "gtfs_m.zip",
+        "gtfs_q.zip", "gtfs_si.zip", "gtfs_busco.zip",
+    ]
+    assert all(s.startswith("https://rrgtfsfeeds.s3.amazonaws.com/") for s in sources)
+
+
+def test_static_sources_default_and_unknown():
+    # Single-source curated feeds fall back to [static_url]; catalog-only
+    # ids resolve None (their URL comes from D1).
+    assert seeds.static_sources_for("mta-subway") == [
+        seeds.MTA_SUBWAY.row["static_url"]
+    ]
+    assert seeds.static_sources_for("mdb-999") is None
 
 
 def test_curated_direction_labels_round_trip_as_json():
@@ -223,4 +259,5 @@ def test_dry_run_makes_no_d1_calls():
             return R()
 
     stats = run_catalog(None, now=1000, dry_run=True, session=FakeHTTP())
-    assert stats.unchanged == 3  # mdb-1 + curated mta-subway + citibike, nothing written
+    # mdb-1 + curated mta-subway + mta-bus + citibike, nothing written
+    assert stats.unchanged == 4

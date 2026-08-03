@@ -7,7 +7,7 @@
     // holds ~2,800 crowd-sourced catalog rows whose URLs must never be
     // fetched on an anonymous caller's say-so — reachability is by this
     // explicit allowlist. A second agency is a config change, not code.
-    "CURATED_FEEDS": ["mta-subway", "citibike"]
+    "CURATED_FEEDS": ["mta-subway", "mta-bus", "citibike"]
   },
   "d1_databases": [
     {

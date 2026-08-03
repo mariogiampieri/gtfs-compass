@@ -34,6 +34,9 @@ A Station is the parent place riders name ("Jay St–MetroTech"); Platforms are 
 ### Stop-Route Edge
 The derived fact that a route serves a stop, computed by joining trips against stop times during ingest. Edges are kept at Platform level; Station-level views aggregate them through the parent relationship.
 
+### Mode
+The device's three peer surfaces — rail, bus, bike — navigated by horizontal swipe. Mode is a property of a Feed (explicit data, not inferred from its Adapter): it decides which system a feed's stops appear under in the nearby response. (The Entry Buffer is decided separately, per route_type, not per mode.) A mode with no configured feeds still renders, as the device's empty state.
+
 ### Leave-By
 The product's headline number: minutes until the rider should start walking, computed server-side as arrival minus Walk Time. Negative leave-by is a real, renderable fact ("too late for this train") — distinct from zero ("leave now") and from no-data. Pre-Phase-5 the walk inputs arrive with the request; the server never guesses them.
 

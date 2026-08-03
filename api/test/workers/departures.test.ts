@@ -62,7 +62,7 @@ beforeEach(async () => {
   }
   await env.DB.prepare(
     `CREATE TABLE feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, rt_alert_url TEXT,
-       adapter TEXT, direction_labels TEXT, units TEXT)`,
+       adapter TEXT, direction_labels TEXT, units TEXT, rt_needs_key INTEGER)`,
   ).run();
   await env.DB.prepare(
     `CREATE TABLE stops (feed_id TEXT NOT NULL, stop_id TEXT NOT NULL, name TEXT,

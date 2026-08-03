@@ -66,11 +66,11 @@ say so and confirm before bypassing the pipeline.
 - **Worker CPU limits:** measure the actual parse cost of a full NYCT feed group before
   committing to in-DO parsing. If it blows the budget, move parsing to the ingest box and have
   the DO fetch pre-reduced JSON.
-- **MTA subway feeds** need no API key (as of 2024). **MTA Bus** needs one and is now a
-  **soon step** (Mario, 2026-08-03 — beads epic `gc-4wk`): subway + bus + Citi Bike = the
-  NYC three-system coverage goal. Verify current MTA Bus Time API terms/endpoints before
-  building; the key is a Worker secret + `.env.example` entry — prompt Mario for the real
-  value.
+- **MTA subway feeds** need no API key (as of 2024). **MTA Bus is built** (beads epic
+  `gc-4wk`, plan `docs/plans/2026-08-03-003-feat-mta-bus-third-mode-plan.md`): the Bus Time
+  key is documented-required but unenforced (verified live 2026-08-03) — key custody exists
+  via the `RT_FEED_KEYS` Worker secret and the feed polls keyless until Mario installs a
+  real key; a keyless 401/403 logs a distinct enforcement-onset warning.
 
 ## Decisions that require Mario
 

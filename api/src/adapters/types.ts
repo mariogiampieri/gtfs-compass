@@ -6,8 +6,16 @@ export interface Arrival {
    * The trip's terminal stop (last stop_time_update): branched routes need
    * per-train headsigns, and a dominant per-direction label is wrong for
    * roughly half of southbound A trains. Absent when the feed omits it.
+   * Only trustworthy for NYCT-style full-horizon feeds — MTA Bus publishes
+   * truncated horizons, so bus composition ignores it.
    */
   terminalStopId?: string;
+  /**
+   * The trip's direction from TripDescriptor.direction_id. Stops without a
+   * directional platform-id suffix (buses) split their arrivals by this.
+   * Absent when the feed omits it.
+   */
+  directionId?: 0 | 1;
 }
 
 export interface FeedAdapter {
