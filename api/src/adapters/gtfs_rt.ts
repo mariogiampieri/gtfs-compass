@@ -31,7 +31,11 @@ export function parseGtfsRt(buf: Uint8Array, now: number): Map<string, Arrival[]
     // NYCT-style feeds list every remaining stop, so the last entry is this
     // train's terminal — the per-arrival headsign source.
     const terminalStopId = updates.length ? updates[updates.length - 1].stopId ?? undefined : undefined;
-    const rawDirection = tripUpdate.trip?.directionId;
+    // Proto2 presence: an absent direction_id reads as the prototype default
+    // (0) on plain access — only an own property means the wire carried it.
+    const trip = tripUpdate.trip;
+    const rawDirection =
+      trip && Object.hasOwn(trip, "directionId") ? trip.directionId : undefined;
     const directionId = rawDirection === 0 || rawDirection === 1 ? rawDirection : undefined;
     for (const update of updates) {
       const stopId = update.stopId;
