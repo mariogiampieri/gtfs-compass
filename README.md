@@ -280,9 +280,13 @@ ways to provision:
   `SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local"` — seeded into
   NVS on first boot only.
 
-To pin the board to a fixed location during development (e.g. test a
-station you're not at), set `CONFIG_GC_DEV_FIXED_LAT`/`_LON` the same way —
-the device then uses the GET path and skips WiFi scanning.
+To pin the board to a fixed location (e.g. test a station you're not at,
+or work around thin BeaconDB coverage in your area), type
+`loc_set <lat> <lon>` in the console — the device then uses the GET path
+and skips WiFi scanning; `loc_clear` returns to scan-based location.
+A build-time seed via `CONFIG_GC_DEV_FIXED_LAT`/`_LON` (same
+`sdkconfig.local` mechanism) behaves identically; the console value wins
+when both exist.
 
 ### Host tests
 
