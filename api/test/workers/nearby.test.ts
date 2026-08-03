@@ -12,6 +12,7 @@ const JAY = { lat: 40.692338, lon: -73.987342 };
 
 interface TripFixture {
   routeId: string;
+  directionId?: number;
   stops: [string, number][]; // ordered; last = terminal
 }
 
@@ -21,7 +22,7 @@ function encodeTrips(headerTimestamp: number, trips: TripFixture[]): Uint8Array 
     entity: trips.map((trip, i) => ({
       id: `t${i}`,
       tripUpdate: {
-        trip: { tripId: `trip${i}`, routeId: trip.routeId },
+        trip: { tripId: `trip${i}`, routeId: trip.routeId, directionId: trip.directionId },
         stopTimeUpdate: trip.stops.map(([stopId, time]) => ({
           stopId,
           departure: { time },
@@ -578,6 +579,70 @@ describe("composeNearby — bike and modes", () => {
     const railSystem: any = body.systems.find((s: any) => s.mode === "rail");
     expect(busSystem.stops.map((s: any) => s.name)).toContain("Jay St & Willoughby");
     expect(railSystem.stops).toEqual([]); // membership is mode-driven, not adapter-driven
+  });
+
+  it("splits bus arrivals by trip direction_id and never renders a truncated terminal as headsign", async () => {
+    const bus = await seedBusFeed();
+    const t0 = nowSec();
+    // One suffixless curb stop, plus a mid-route stop that a truncated
+    // horizon makes look like a terminal.
+    await seedStation(bus.id, "300001", "Jay St & Willoughby", JAY.lat, JAY.lon, {});
+    await env.DB.prepare(
+      "INSERT INTO stops (feed_id, stop_id, name, lat, lon) VALUES (?, 'MID9', 'Mid Route Av', 40.7, -73.9)",
+    )
+      .bind(bus.id)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO stop_routes (feed_id, stop_id, route_id) VALUES (?, '300001', 'B62')",
+    )
+      .bind(bus.id)
+      .run();
+    await seedRoute(bus.id, "B62", "B62", "00437D");
+    for (const [dir, headsign] of [[0, "Downtown Brooklyn"], [1, "Queens Plaza"]] as const) {
+      await env.DB.prepare(
+        "INSERT INTO route_directions (feed_id, route_id, direction_id, headsign) VALUES (?, 'B62', ?, ?)",
+      )
+        .bind(bus.id, dir, headsign)
+        .run();
+    }
+    respondWith(`${ORIGIN}/${bus.id}`, () => ({
+      status: 200,
+      body: encodeTrips(t0, [
+        // Truncated horizon: MID9 is this trip's last stop_time_update, but
+        // it is NOT the destination — the headsign must not become its name.
+        { routeId: "B62", directionId: 0, stops: [["300001", t0 + 300], ["MID9", t0 + 600]] },
+        { routeId: "B62", directionId: 1, stops: [["300001", t0 + 480]] },
+      ]),
+    }));
+
+    const body = await composeWarm([bus], ["bus"]);
+    const stop: any = (body.systems[0] as any).stops.find((s: any) => s.id === "300001");
+    const trunk = stop.trunks[0];
+    expect(trunk.directions[0].arrivals).toHaveLength(1);
+    expect(trunk.directions[1].arrivals).toHaveLength(1);
+    expect(trunk.directions[0].arrivals[0].headsign).toBe("Downtown Brooklyn");
+    expect(trunk.directions[1].arrivals[0].headsign).toBe("Queens Plaza");
+  });
+
+  it("defaults a directionless gtfs_rt arrival to direction 0, never dropping it", async () => {
+    const bus = await seedBusFeed();
+    const t0 = nowSec();
+    await seedStation(bus.id, "300002", "Bedford Av & N 7th", JAY.lat, JAY.lon, {});
+    await env.DB.prepare(
+      "INSERT INTO stop_routes (feed_id, stop_id, route_id) VALUES (?, '300002', 'B62')",
+    )
+      .bind(bus.id)
+      .run();
+    await seedRoute(bus.id, "B62", "B62", "00437D");
+    respondWith(`${ORIGIN}/${bus.id}`, () => ({
+      status: 200,
+      body: encodeTrips(t0, [{ routeId: "B62", stops: [["300002", t0 + 240]] }]),
+    }));
+
+    const body = await composeWarm([bus], ["bus"]);
+    const stop: any = (body.systems[0] as any).stops.find((s: any) => s.id === "300002");
+    expect(stop.trunks[0].directions[0].arrivals).toHaveLength(1);
+    expect(stop.trunks[0].directions[1].arrivals).toHaveLength(0);
   });
 
   it("falls back to adapter inference for a feed with null mode", async () => {
