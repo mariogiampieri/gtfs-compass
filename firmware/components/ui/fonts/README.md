@@ -5,7 +5,7 @@ LVGL 4-bpp bitmap faces (`gc_plex_<px>.c`) rendered from **IBM Plex Sans**
 — 14–40 px ASCII+punctuation (plus `° · — … ‹ ← →` — the arrows carry the §7
 empty-mode swipe hints), and an 84 px digits-only hero face; Plex digits
 are tabular by default, which is the handoff's hard requirement. The 15/16/20 px
-faces merge the `⇅` (U+21C5) flip-direction glyph from DejaVu Sans, which Plex
+faces merge the `⇅` (U+21C5) flip-direction glyph from DejaVu Sans (license: `DEJAVU-LICENSE.txt` in this directory), which Plex
 lacks. Regenerate with `../../../tools/genfonts.sh` (needs node + curl; every
 invocation is pinned there — the generated files are committed so builds never
 need node). Licensing: IBM Plex Sans is © IBM Corp., SIL Open Font License 1.1

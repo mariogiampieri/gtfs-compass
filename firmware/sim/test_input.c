@@ -186,6 +186,23 @@ int main(void) {
   step(20, 470, false);
   CHECK(g_n_tap == 1, "tap after a swipe press still works (got %d)", g_n_tap);
 
+  printf("scenario 3b: swipe crossing threshold ONLY on the release sample\n");
+  /* Review (both heavy reviewers, independently): fire_swipe from the
+   * release path used to call lv_indev_wait_release AFTER LVGL had already
+   * cleared the flag for this press — poisoning the NEXT press entirely
+   * (no PRESSED event, no taps). The fix gates the call on being
+   * mid-press; this scenario locks it in. */
+  reset_recorder();
+  step(300, 470, true);
+  step(270, 470, true);  /* 30 px — under threshold while pressed */
+  step(230, 470, false); /* 70 px, crossing happens on the release sample */
+  CHECK(g_n_swipe == 1, "release-sample swipe fires (got %d)", g_n_swipe);
+  CHECK(g_last_swipe == UI_SWIPE_LEFT, "direction is left (got %d)", (int)g_last_swipe);
+  reset_recorder();
+  step(20, 470, true); /* the next press must be alive */
+  step(20, 470, false);
+  CHECK(g_n_tap == 1, "press AFTER a release-sample swipe still taps (got %d)", g_n_tap);
+
   printf("scenario 4: vertical drag on scrollable engages scroll, tracker stands down\n");
   reset_recorder();
   step(200, 300, true);

@@ -28,18 +28,10 @@ static lv_color_t hex(uint32_t rgb) { return lv_color_hex(rgb); }
 
 /* Same length-adaptive rule as the board header (handoff §1/§3: "header
  * same as board, minus direction pill"). */
-static const lv_font_t *header_font(size_t name_len, bool *two_line) {
-  *two_line = false;
-  if (name_len <= 12) return TK_FONT_TITLE_LG;
-  if (name_len <= 18) return TK_FONT_TITLE_MD;
-  *two_line = true;
-  return TK_FONT_TITLE_SM;
-}
-
 static void build_header(lv_obj_t *content, const model_bike_station_t *s) {
   bool two_line = false;
   lv_obj_t *name = ui_make_label(content, s->name,
-                                 header_font(strlen(s->name), &two_line), TK_TEXT_PRIMARY);
+                                 ui_header_font(strlen(s->name), &two_line), TK_TEXT_PRIMARY);
   lv_obj_set_width(name, TK_SCREEN_W - 2 * TK_SIDE_INSET);
   lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
   lv_obj_set_pos(name, TK_SIDE_INSET, TK_HEADER_TOP);

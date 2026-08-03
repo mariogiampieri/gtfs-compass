@@ -30,18 +30,10 @@ static bool g_degraded; /* offline/stale: rows render ~ countdowns */
 
 /* ---------- header ---------- */
 
-static const lv_font_t *header_font(size_t name_len, bool *two_line) {
-  *two_line = false;
-  if (name_len <= 12) return TK_FONT_TITLE_LG;
-  if (name_len <= 18) return TK_FONT_TITLE_MD;
-  *two_line = true;
-  return TK_FONT_TITLE_SM;
-}
-
 static void build_header(lv_obj_t *content, const model_rail_system_t *rail,
                          const model_stop_t *stop, bool *two_line, ui_board_hits_t *hits) {
   lv_obj_t *name = ui_make_label(content, stop->name,
-                                 header_font(strlen(stop->name), two_line), TK_TEXT_PRIMARY);
+                                 ui_header_font(strlen(stop->name), two_line), TK_TEXT_PRIMARY);
   lv_obj_set_width(name, TK_SCREEN_W - 2 * TK_SIDE_INSET);
   lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
   lv_obj_set_pos(name, TK_SIDE_INSET, TK_HEADER_TOP);

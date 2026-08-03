@@ -13,6 +13,10 @@
 #include "ui_state.h"
 
 /* Shared builders (ui_views.c owns the definitions). */
+/* Length-adaptive station-title face (handoff 24–30/700). Shared by the rail
+ * board and bike station headers — was duplicated, review P1. */
+const lv_font_t *ui_header_font(size_t name_len, bool *two_line);
+
 lv_obj_t *ui_make_label(lv_obj_t *parent, const char *text, const lv_font_t *font,
                         uint32_t color);
 void ui_style_plain(lv_obj_t *o);

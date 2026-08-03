@@ -350,7 +350,8 @@ horizontal swipe exits without changing it). Capture a fresh live fixture with
 `curl <worker>/v1/nearby?lat=..&lon=.. > firmware/fixtures/name.json`.
 
 Headless capture: `GC_DUMP=/tmp/f.ppm ./build/sim` renders one frame and
-exits; `GC_VIEW=detail[:N] | bike | bus | nearby` sets the view first, so
+exits; `GC_VIEW=detail[:N] | bike | bus | nearby` sets the view first and
+`GC_DIR=1` flips the rendered direction, so
 every screen is reachable without a window.
 
 The sim build also produces `./build/test_input`, a headless scripted-pointer
@@ -389,7 +390,12 @@ when both exist.
 ```bash
 cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 ./build/test_model                   # model parser suite (ASAN)
+./build/test_nav                     # navigation/reconciler transitions
+./build/test_bike_layout             # bike hero/capacity-bar math
 ```
+
+(The sim build also produces `firmware/sim/build/test_input`, the headless
+gesture-tracker suite.)
 
 ### Fonts
 
@@ -397,7 +403,7 @@ The UI renders IBM Plex Sans (OFL 1.1) converted to LVGL bitmap faces at
 the design ramp with tabular numerals. The generated `.c` files live in
 `firmware/components/ui/fonts/` and are committed, so ordinary builds need
 nothing extra. To change sizes, weights, or glyph ranges, edit and re-run
-`firmware/tools/genfonts.sh` (needs node + curl; it downloads the pinned
+`firmware/tools/genfonts.sh` (needs node + curl + unzip; it downloads the pinned
 TTF releases into a gitignored cache). Attribution and license text:
 `firmware/components/ui/fonts/README.md` and `OFL.txt`.
 

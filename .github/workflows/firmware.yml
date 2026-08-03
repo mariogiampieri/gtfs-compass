@@ -20,6 +20,8 @@ jobs:
           cmake -B build -G "Unix Makefiles" .
           cmake --build build
           ASAN_OPTIONS=detect_leaks=1 ./build/test_model
+          ASAN_OPTIONS=detect_leaks=1 ./build/test_nav
+          ASAN_OPTIONS=detect_leaks=1 ./build/test_bike_layout
 
   device-build:
     # Minutes: full ESP-IDF compile in the pinned container (no hardware).

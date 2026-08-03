@@ -49,6 +49,14 @@ static bool g_skeleton_shown;    /* skeleton owns content opacity (its shimmer
 
 static lv_color_t hex(uint32_t rgb) { return lv_color_hex(rgb); }
 
+const lv_font_t *ui_header_font(size_t name_len, bool *two_line) {
+  *two_line = false;
+  if (name_len <= 12) return TK_FONT_TITLE_LG;
+  if (name_len <= 18) return TK_FONT_TITLE_MD;
+  *two_line = true;
+  return TK_FONT_TITLE_SM;
+}
+
 lv_obj_t *ui_make_label(lv_obj_t *parent, const char *text, const lv_font_t *font,
                         uint32_t color) {
   lv_obj_t *l = lv_label_create(parent);
@@ -410,8 +418,10 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
     build_mode_dots(state->sys);
     return;
   }
-  if (model == NULL) {
-    build_skeleton(); /* LOADING, or OFFLINE before anything ever arrived */
+  if (model == NULL || state->conn == UI_CONN_LOADING) {
+    build_skeleton(); /* LOADING (M1 semantics — review: the sim's '1' key
+                         regressed to a live board), or OFFLINE before
+                         anything ever arrived */
     build_mode_dots(state->sys);
     return;
   }

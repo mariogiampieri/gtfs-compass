@@ -7,6 +7,8 @@
  * fields, free the tree in one exit path; never store pointers into the
  * tree; every field access is null-checked (the Worker is ours, the network
  * is not).
+  * M2: identity fields (stop id / trunk key / bike station id) land here
+ * for the reconciler — plan U1.
  */
 #include "model.h"
 

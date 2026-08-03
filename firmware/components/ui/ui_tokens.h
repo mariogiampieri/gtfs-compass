@@ -87,10 +87,6 @@
 #define TK_DETAIL_HINT_BOTTOM 36   /* footer hint center */
 #define TK_TEXT_FLIP_GLYPH 0x68686E /* ⇅ in the detail header */
 
-/* Nearby stub (U3; U5 owns the full §4 geometry) */
-/* Detail / nearby stubs (U3; U4/U5 own the full §2/§4 geometry) */
-#define TK_DETAIL_HEADER_TOP 44 /* §2 header top */
-
 /* Bike station (handoff §3) */
 #define TK_BIKE_CLASSIC 0x3FC9C0  /* hero + classic segment */
 #define TK_BIKE_ELECTRIC 0xF0C419 /* electric segment */

@@ -51,8 +51,15 @@ void ui_input_set_animating(bool animating) { g_animating = animating; }
 static void fire_swipe(ui_swipe_t dir) {
   g_trk.swipe_fired = true;
   /* Swallow the remainder of the press: no CLICKED on whatever object the
-   * finger happens to lift over. */
-  lv_indev_wait_release(g_trk.indev);
+   * finger happens to lift over. Guarded: LVGL clears wait_until_release at
+   * the START of its release processing, so when the swipe resolves on the
+   * final (release) sample the flag would outlive this press and silently
+   * swallow the ENTIRE next press (no PRESSED event, no taps, no scroll —
+   * both review teams hit this independently). Only mid-press needs the
+   * swallow; at release there is nothing left to suppress. */
+  if (lv_indev_get_state(g_trk.indev) == LV_INDEV_STATE_PRESSED) {
+    lv_indev_wait_release(g_trk.indev);
+  }
   if (g_trk.cbs.on_swipe) g_trk.cbs.on_swipe(dir, g_trk.cbs.user);
 }
 

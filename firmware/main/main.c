@@ -167,7 +167,18 @@ static void consume_cb(lv_timer_t *t) {
                                      displaced message needs no freeing */
     g_staged_have_status = true;
   }
-  if (ui_input_busy()) return; /* defer: coalesced apply after release */
+  /* Deferral ceiling (review): a sustained accidental press — pocket, palm,
+   * object resting on the glass — would otherwise defer applies and board
+   * renders indefinitely (staleness accounting stays honest, but content
+   * freezes). A press this long is not interaction; apply through it. */
+  static int64_t busy_since_ms;
+  if (ui_input_busy()) {
+    if (busy_since_ms == 0) busy_since_ms = now_ms();
+    if (now_ms() - busy_since_ms < 15000) return; /* defer: apply after release */
+    ESP_LOGW(TAG, "deferral ceiling hit (15 s press) — applying through it");
+  } else {
+    busy_since_ms = 0;
+  }
   if (g_staged_have_status) {
     gc_apply_staged();
   } else if (g_render_pending) {
@@ -313,7 +324,19 @@ static lv_display_t *gc_display_start(void) {
  */
 static lv_indev_t *gc_touch_start(lv_display_t *disp) {
   esp_lcd_touch_handle_t tp = NULL;
-  ESP_ERROR_CHECK(bsp_touch_new(NULL, &tp));
+  /* Review: a transient I2C probe failure under ESP_ERROR_CHECK would
+   * abort → reboot → fail again — a panic loop on an unproven path. Retry
+   * once, then boot without touch: the M1 read-only board still works. */
+  esp_err_t terr = bsp_touch_new(NULL, &tp);
+  if (terr != ESP_OK) {
+    ESP_LOGW(TAG, "touch probe failed (%s) — retrying once", esp_err_to_name(terr));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    terr = bsp_touch_new(NULL, &tp);
+  }
+  if (terr != ESP_OK) {
+    ESP_LOGE(TAG, "touch unavailable (%s) — booting read-only", esp_err_to_name(terr));
+    return NULL;
+  }
   lv_indev_t *indev = lvgl_port_add_touch(&(lvgl_port_touch_cfg_t){.disp = disp, .handle = tp});
   assert(indev);
   ESP_LOGI(TAG, "touch up: FT3168 enumerated, event-mode indev registered");
@@ -363,11 +386,13 @@ void app_main(void) {
   lv_display_t *disp = gc_display_start();
   bsp_display_backlight_on();
   lv_indev_t *touch = gc_touch_start(disp);
-  bsp_display_lock(0);
-  ui_input_attach(touch, &(ui_input_callbacks_t){.on_press = gc_input_press,
-                                                 .on_tap = gc_input_tap,
-                                                 .on_swipe = gc_input_swipe});
-  bsp_display_unlock();
+  if (touch) {
+    bsp_display_lock(0);
+    ui_input_attach(touch, &(ui_input_callbacks_t){.on_press = gc_input_press,
+                                                   .on_tap = gc_input_tap,
+                                                   .on_swipe = gc_input_swipe});
+    bsp_display_unlock();
+  }
 
   g_ui_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
   g_staged_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
