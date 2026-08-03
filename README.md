@@ -262,8 +262,8 @@ a specific error. Bike favorites are `/v1/nearby` territory.
 
 ```json
 {"ts":1754236082,"fetched_at":1754236075,
- "d":[{"s":"mta-subway:A41N","r":"A","c":"0039A6","t":"FFFFFF","m":[3,11,18],"l":[1,9,16]},
-      {"s":"mta-subway:A41S","r":"A","c":"0039A6","t":"FFFFFF","m":[6,14],"l":[4,12]}],
+ "d":[{"s":"mta-subway:A41N","r":"A","c":"0039A6","t":"FFFFFF","m":[3,11,18],"l":[-5,3,10]},
+      {"s":"mta-subway:A41S","r":"A","c":"0039A6","t":"FFFFFF","m":[6,14],"l":[-3,5]}],
  "w":{"mta-subway:A41N":{"s":510,"src":"manual"},
       "mta-subway:A41S":{"s":510,"src":"manual"}}}
 ```

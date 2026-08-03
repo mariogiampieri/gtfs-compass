@@ -174,10 +174,12 @@ describe("composeDepartures — contract", () => {
     const t0 = nowSec();
     respondWith(`${ORIGIN}/${feed}-ace`, () => ({
       status: 200,
+      // Mid-minute anchors (+45 s slack) so elapsed test time can't cross a
+      // floor boundary: t0+225 stays m=3 for any elapsed < 45 s.
       body: encodeTrips(t0, [
-        { routeId: "A", stops: [["A41N", t0 + 180], ["A41N", t0 + 660], ["A41N", t0 + 1080], ["A41N", t0 + 1500]] },
-        { routeId: "C", stops: [["A41N", t0 + 300]] },
-        { routeId: "A", stops: [["A41S", t0 + 360], ["A41S", t0 + 840]] },
+        { routeId: "A", stops: [["A41N", t0 + 225], ["A41N", t0 + 705], ["A41N", t0 + 1125], ["A41N", t0 + 1545]] },
+        { routeId: "C", stops: [["A41N", t0 + 345]] },
+        { routeId: "A", stops: [["A41S", t0 + 405], ["A41S", t0 + 885]] },
       ]),
     }));
 
@@ -407,6 +409,20 @@ describe("composeDepartures — contract", () => {
     expect(["000000", "FFFFFF"]).toContain(busEntry.t);
   });
 
+  it("degrades a ref whose feed is absent from the adapters map to partial, never a throw", async () => {
+    const feed = await seedNyctFeed();
+    await seedRoute(feed, "A", "A", "0039A6");
+    await seedPlatform(feed, "A41N", ["A"]);
+
+    // Route-layer validation makes this unreachable; the belt-and-suspenders
+    // branch must still degrade honestly if it ever fires.
+    const body = await composeDepartures(env, adapterMap(), params({ refs: refs(feed, "A41N") }));
+
+    expect(body.partial).toBe(true);
+    expect(body.d).toEqual([]);
+    expect(body.fetched_at).toBeNull();
+  });
+
   it("drops realtime arrivals for routes absent from static data with the request intact", async () => {
     const feed = await seedNyctFeed();
     await seedRoute(feed, "A", "A", "0039A6");
@@ -493,7 +509,14 @@ describe("/v1/departures route", () => {
   });
 
   it("rejects malformed walk triplets and walk refs not present in stops", async () => {
-    for (const bad of ["mta-subway:X1:abc", "mta-subway:X1:-1", "mta-subway:X1:7201", "600"]) {
+    for (const bad of [
+      "mta-subway:X1:abc",
+      "mta-subway:X1:-1",
+      "mta-subway:X1:7201",
+      "mta-subway:X1:", // empty seconds: Number("") is 0 — must not pass as a real walk
+      "mta-subway:X1:1e2", // exponent notation: digits only
+      "600",
+    ]) {
       const res = await get(`/v1/departures?stops=mta-subway:X1&walk=${bad}`);
       expect(res.status).toBe(400);
       expect(((await res.json()) as { error: string }).error).toContain("walk");
@@ -503,6 +526,41 @@ describe("/v1/departures route", () => {
     expect(((await stray.json()) as { error: string }).error).toBe(
       "walk ref not in stops: mta-subway:X2",
     );
+  });
+
+  it("rejects malformed percent-encoding in stops/walk with 400, not 500", async () => {
+    for (const path of [
+      "/v1/departures?stops=%GG",
+      "/v1/departures?stops=mta-subway:X1&walk=%GG",
+    ]) {
+      const res = await get(path);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("percent-encoding");
+    }
+  });
+
+  it("serves the heuristic walk tier end to end from lat/lon/acc (AE3)", async () => {
+    await seedRoute("mta-subway", "G", "G", "6CBE45");
+    await seedPlatform("mta-subway", "G30N", ["G"]);
+    const t0 = nowSec();
+    respondWith(`${ORIGIN}/mta-g`, () => ({
+      status: 200,
+      body: encodeTrips(t0, [{ routeId: "G", stops: [["G30N", t0 + 900]] }]),
+    }));
+
+    const path = `/v1/departures?stops=mta-subway:G30N&lat=${ORIGIN_650M.lat}&lon=${ORIGIN_650M.lon}&acc=30`;
+    expect((await get(path)).status).toBe(200); // cold read arms the poller
+    await new Promise((r) => setTimeout(r, 150));
+
+    const body = (await (await get(path)).json()) as {
+      d: { l?: number[] }[];
+      w?: Record<string, { s: number; src: string }>;
+    };
+    const w = body.w?.["mta-subway:G30N"];
+    expect(w?.src).toBe("heuristic");
+    expect(w?.s).toBeGreaterThanOrEqual(735); // ~650 m + 90 s rail buffer
+    expect(w?.s).toBeLessThanOrEqual(745);
+    expect(body.d[0].l).toHaveLength(1);
   });
 
   it("requires a complete gated origin: lat+lon+acc together, in range", async () => {

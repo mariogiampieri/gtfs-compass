@@ -1,3 +1,4 @@
+import { ARRIVALS_PER_ROUTE } from "./feed_do";
 import { fetchGroupSnapshots, groupForRoute } from "./nearby";
 import { normalizeColor, paletteColor, textColorFor } from "./presentation";
 import { type WalkOrigin, computeWalk, walkMaxAccuracyM } from "./walk";
@@ -27,7 +28,8 @@ export interface DeparturesParams {
 }
 
 export const DEFAULT_ARRIVALS = 3;
-export const MAX_ARRIVALS = 8; // FeedDO's per-route trim depth — deeper asks are unsatisfiable
+// FeedDO's per-route trim depth is the ceiling — deeper asks are unsatisfiable.
+export const MAX_ARRIVALS = ARRIVALS_PER_ROUTE;
 export const MAX_STOP_REFS = 20; // 6 favorites × 2 directions with headroom, and payload sanity
 
 export interface DepartureEntry {

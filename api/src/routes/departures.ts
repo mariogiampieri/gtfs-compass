@@ -21,6 +21,7 @@ import {
 } from "../departures";
 import { batchIdsParam } from "../do_shared";
 import { MANUAL_WALK_MAX_S, type WalkOrigin } from "../walk";
+import { validCoords } from "./nearby";
 
 export async function routeDepartures(
   request: Request,
@@ -32,7 +33,16 @@ export async function routeDepartures(
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
-  const rawRefs = batchIdsParam(url, "stops");
+  let rawRefs: string[] | null;
+  let rawWalk: string[];
+  try {
+    rawRefs = batchIdsParam(url, "stops");
+    rawWalk = batchIdsParam(url, "walk") ?? [];
+  } catch {
+    // Malformed percent-encoding passes the regex verbatim but throws on
+    // decode (index.ts decode-catch precedent) — a caller bug, not a 500.
+    return Response.json({ error: "malformed percent-encoding in stops/walk" }, { status: 400 });
+  }
   if (!rawRefs || rawRefs.length === 0) {
     return Response.json({ error: "stops required" }, { status: 400 });
   }
@@ -69,10 +79,13 @@ export async function routeDepartures(
   }
 
   const walkSeconds = new Map<string, number>();
-  for (const raw of batchIdsParam(url, "walk") ?? []) {
+  for (const raw of rawWalk) {
     const lastColon = raw.lastIndexOf(":");
     const key = lastColon > 0 ? raw.slice(0, lastColon) : "";
-    const seconds = lastColon > 0 ? Number(raw.slice(lastColon + 1)) : Number.NaN;
+    // Digit-shape check before Number(): Number("") is 0 and Number("1e2")
+    // is 100, both of which would slip through a range check alone.
+    const secStr = lastColon > 0 ? raw.slice(lastColon + 1) : "";
+    const seconds = /^\d+$/.test(secStr) ? Number(secStr) : Number.NaN;
     if (!Number.isInteger(seconds) || seconds < 0 || seconds > MANUAL_WALK_MAX_S) {
       return Response.json(
         { error: `malformed walk entry: ${raw} (expected feed:stop:seconds, 0..${MANUAL_WALK_MAX_S})` },
@@ -135,12 +148,7 @@ function parseOrigin(url: URL): WalkOrigin | null | Response {
   const lat = latRaw === null || latRaw === "" ? Number.NaN : Number(latRaw);
   const lon = lonRaw === null || lonRaw === "" ? Number.NaN : Number(lonRaw);
   const acc = accRaw === null || accRaw === "" ? Number.NaN : Number(accRaw);
-  if (
-    !Number.isFinite(lat) ||
-    !Number.isFinite(lon) ||
-    Math.abs(lat) > 90 ||
-    Math.abs(lon) > 180
-  ) {
+  if (!validCoords(lat, lon)) {
     return Response.json({ error: "origin requires valid lat and lon" }, { status: 400 });
   }
   if (!Number.isFinite(acc) || acc <= 0) {

@@ -53,7 +53,8 @@ export async function routeNearby(
   return Response.json({ location: { lat, lon, accuracy }, ...body });
 }
 
-function validCoords(lat: number, lon: number): boolean {
+/** Shared with routes/departures.ts's origin validation. */
+export function validCoords(lat: number, lon: number): boolean {
   return (
     Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180
   );
