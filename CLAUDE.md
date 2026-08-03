@@ -15,6 +15,12 @@ guiding spec for device fundamentals (core/hal split, staleness honesty, burn-in
 
 - **Machine split:** the opti box takes API/ingest tasks (long-running background); Mario's Mac
   takes firmware/UI work and flashing (the device connects there).
+- **Task tracking: beads (`bd`), Dolt-backed, in `.beads/`.** All cross-machine work items live
+  there — check `bd ready` before picking up work, create issues for newly discovered work, and
+  update status as you go. Sync channel is `.beads/issues.jsonl` committed through git
+  (auto-export is on): pull → `bd import .beads/issues.jsonl` to pick up the other machine's
+  changes; commit the regenerated JSONL when you change issues. Labels mark the machine
+  (`mac`/`opti`) and `mario` marks decisions/actions only Mario can take.
 - Phase 4 milestone 1 = read-only board against the production API. Touch/gestures/detail
   views (M2) and the IMU wake/deep-sleep power model (M3) are explicitly deferred — don't
   build ahead of the milestone without a plan.
@@ -60,8 +66,11 @@ say so and confirm before bypassing the pipeline.
 - **Worker CPU limits:** measure the actual parse cost of a full NYCT feed group before
   committing to in-DO parsing. If it blows the budget, move parsing to the ingest box and have
   the DO fetch pre-reduced JSON.
-- **MTA subway feeds** need no API key (as of 2024); MTA Bus needs one and is deferred to
-  Phase 6 territory — don't build key custody now.
+- **MTA subway feeds** need no API key (as of 2024). **MTA Bus** needs one and is now a
+  **soon step** (Mario, 2026-08-03 — beads epic `gc-4wk`): subway + bus + Citi Bike = the
+  NYC three-system coverage goal. Verify current MTA Bus Time API terms/endpoints before
+  building; the key is a Worker secret + `.env.example` entry — prompt Mario for the real
+  value.
 
 ## Decisions that require Mario
 
