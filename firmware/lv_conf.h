@@ -11,6 +11,7 @@
 #ifdef SIM_BUILD
 #define LV_USE_SDL 1
 #define LV_SDL_INCLUDE_PATH <SDL2/SDL.h>
+#define LV_USE_SNAPSHOT 1 /* headless frame dumps (GC_DUMP=path ./sim ...) */
 /* Simulator uses libc malloc so ASAN can see LVGL allocations. */
 #define LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB
 #define LV_USE_STDLIB_STRING LV_STDLIB_CLIB

@@ -106,6 +106,40 @@ int main(int argc, char **argv) {
 
   lv_timer_create(tick_timer, 1000, NULL);
 
+  /* Headless frame dump: GC_DUMP=/path/frame.ppm renders one frame, writes
+   * it as binary PPM, and exits — used to eyeball a payload without a
+   * window (debugging aid, not part of the product). */
+  const char *dump = getenv("GC_DUMP");
+  if (dump) {
+    for (int i = 0; i < 30; i++) {
+      lv_timer_handler();
+      lv_delay_ms(5);
+    }
+    lv_draw_buf_t *snap = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_XRGB8888);
+    if (!snap) {
+      fprintf(stderr, "snapshot failed\n");
+      return 1;
+    }
+    FILE *out = fopen(dump, "wb");
+    if (!out) {
+      fprintf(stderr, "cannot open %s\n", dump);
+      return 1;
+    }
+    fprintf(out, "P6\n%u %u\n255\n", snap->header.w, snap->header.h);
+    for (uint32_t y = 0; y < snap->header.h; y++) {
+      const uint8_t *row = snap->data + (size_t)y * snap->header.stride;
+      for (uint32_t x = 0; x < snap->header.w; x++) {
+        const uint8_t *px = row + x * 4; /* XRGB8888 little-endian: B G R X */
+        fputc(px[2], out);
+        fputc(px[1], out);
+        fputc(px[0], out);
+      }
+    }
+    fclose(out);
+    printf("dumped %ux%u to %s\n", snap->header.w, snap->header.h, dump);
+    return 0;
+  }
+
   while (1) {
     lv_timer_handler();
     lv_delay_ms(5);

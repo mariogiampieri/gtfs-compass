@@ -139,26 +139,66 @@ static void tick_cb(lv_timer_t *t) {
 }
 
 /*
- * The BSP allocates its LVGL draw buffer with plain malloc, which lands in
- * PSRAM under SPIRAM_USE_MALLOC — so every flush makes spi_master allocate
- * an internal DMA bounce buffer the size of the whole transaction, which
- * starts failing (dropped flushes, error spam) once WiFi+TLS fragment the
- * internal heap. Replace it with an internal DMA-capable buffer claimed at
- * boot, before the radio takes the heap. 50 rows ≈ 40 KB keeps the claim
- * modest; LVGL just flushes in more, smaller chunks.
+ * Display bring-up WITHOUT bsp_display_start: the BSP registers this QSPI
+ * panel through lvgl_port_add_disp_rgb, which types the display as RGB —
+ * and for RGB-typed displays esp_lvgl_port calls lv_disp_flush_ready
+ * immediately after QUEUING the async SPI DMA, so LVGL re-renders into the
+ * buffer while DMA is still reading it. The stock config only survives
+ * because its draw buffer lands in PSRAM (not DMA-capable), forcing
+ * spi_master to bounce-copy the pixels synchronously before queuing — the
+ * same per-flush copy that fails under WiFi/TLS heap pressure and caused
+ * the original SPI error spam.
+ *
+ * So: init the panel via the BSP's public bsp_display_new (QSPI wiring,
+ * vendor init commands, gap), then register it with lvgl_port_add_disp,
+ * whose non-RGB path wires flush-ready to the SPI transfer-done callback.
+ * That makes a DMA-capable internal draw buffer safe. 38 rows = 31,160 B
+ * keeps each stripe under the S3's 32 KB single-DMA-transaction cap, and
+ * even row counts keep stripe starts 2-aligned for the CO5300 (rounder
+ * mirrored from the BSP).
  */
-#define GC_DRAW_BUF_ROWS 50
-static void gc_use_dma_draw_buffer(lv_display_t *disp) {
-  size_t size = BSP_LCD_H_RES * GC_DRAW_BUF_ROWS * 2; /* RGB565 */
-  void *buf = heap_caps_aligned_alloc(64, size, MALLOC_CAP_DMA);
-  if (buf == NULL) {
-    ESP_LOGW(TAG, "no internal DMA draw buffer — keeping BSP default");
-    return;
-  }
-  bsp_display_lock(0);
-  lv_display_set_buffers(disp, buf, NULL, size, LV_DISPLAY_RENDER_MODE_PARTIAL);
-  bsp_display_unlock();
-  ESP_LOGI(TAG, "draw buffer: %u B internal DMA (%d rows)", (unsigned)size, GC_DRAW_BUF_ROWS);
+#define GC_DRAW_BUF_ROWS 38
+
+static void gc_rounder_cb(lv_event_t *e) {
+  lv_area_t *area = (lv_area_t *)lv_event_get_param(e);
+  area->x1 &= ~1; /* start down to even */
+  area->y1 &= ~1;
+  area->x2 |= 1; /* end up to odd */
+  area->y2 |= 1;
+}
+
+static lv_display_t *gc_display_start(void) {
+  lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+  /* The default 7168-byte LVGL task stack overflows during the first full
+   * board render (deep flex layout over 8 trunks): TCB corruption, then
+   * LoadProhibited in vTaskSwitchContext. Seen on hardware. */
+  port_cfg.task_stack = 16384;
+  ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
+
+  const bsp_display_config_t bsp_cfg = {
+      .max_transfer_sz = BSP_LCD_H_RES * GC_DRAW_BUF_ROWS * 2,
+  };
+  esp_lcd_panel_handle_t panel = NULL;
+  esp_lcd_panel_io_handle_t io = NULL;
+  ESP_ERROR_CHECK(bsp_display_new(&bsp_cfg, &panel, &io));
+  ESP_ERROR_CHECK(bsp_display_brightness_init());
+
+  const lvgl_port_display_cfg_t lv_cfg = {
+      .io_handle = io,
+      .panel_handle = panel,
+      .buffer_size = BSP_LCD_H_RES * GC_DRAW_BUF_ROWS, /* pixels */
+      .double_buffer = false,
+      .hres = BSP_LCD_H_RES,
+      .vres = BSP_LCD_V_RES,
+      .monochrome = false,
+      .color_format = LV_COLOR_FORMAT_RGB565,
+      .rotation = {.swap_xy = false, .mirror_x = false, .mirror_y = false},
+      .flags = {.buff_dma = true, .swap_bytes = true},
+  };
+  lv_display_t *disp = lvgl_port_add_disp(&lv_cfg);
+  assert(disp);
+  lv_display_add_event_cb(disp, gc_rounder_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+  return disp;
 }
 
 void app_main(void) {
@@ -175,22 +215,7 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(nvs_err);
 
-  /* The BSP's default LVGL task stack (7168) overflows during the first
-   * full board render — deep flex layout over 8 trunks — corrupting the
-   * TCB and panicking the scheduler (LoadProhibited in vTaskSwitchContext,
-   * seen on first live fetch). The lvgl_port_cfg member is the one part of
-   * this struct bsp_display_start_with_config actually honors; the buffer
-   * fields below are ignored by the BSP (gc_use_dma_draw_buffer fixes the
-   * buffer after init instead). */
-  bsp_display_cfg_t disp_cfg = {
-      .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
-      .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT,
-      .double_buffer = 0,
-      .flags = {.buff_dma = false, .buff_spiram = true},
-  };
-  disp_cfg.lvgl_port_cfg.task_stack = 16384;
-  lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
-  gc_use_dma_draw_buffer(disp);
+  gc_display_start();
   bsp_display_backlight_on();
 
   g_ui_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
