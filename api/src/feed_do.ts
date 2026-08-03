@@ -1,21 +1,23 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { type Arrival, ParseError, feedHeaderTimestamp, getAdapter, groupUrlsFor } from "./adapters";
+import {
+  type DoIdentity,
+  FETCH_TIMEOUT_MS,
+  IDLE_SUSPEND_MS,
+  MissingFeedError,
+  doTag,
+} from "./do_shared";
+
+export { FETCH_TIMEOUT_MS, IDLE_SUSPEND_MS } from "./do_shared";
 
 export const POLL_INTERVAL_MS = 20_000;
-export const IDLE_SUSPEND_MS = 10 * 60_000;
-export const FETCH_TIMEOUT_MS = 10_000; // safely under the poll cadence
 export const ARRIVALS_PER_ROUTE = 4; // per (stop, route): Phase 3 needs n=3 per route
 
 interface Snapshot {
   arrivals: Record<string, Arrival[]>;
   fetchedAtMs: number; // wall clock at fetch start
   headerTimestamp: number; // feed generation time (epoch seconds)
-}
-
-interface Identity {
-  feedId: string;
-  group: string;
 }
 
 interface FeedConfig {
@@ -32,7 +34,7 @@ interface FeedConfig {
  */
 export class FeedDO extends DurableObject<Env> {
   private snapshot: Snapshot | null = null;
-  private identity: Identity | null = null;
+  private identity: DoIdentity | null = null;
   private lastReadMs = 0;
   private lastPersistedReadMs = 0;
   private refreshInFlight = false;
@@ -46,7 +48,7 @@ export class FeedDO extends DurableObject<Env> {
       const stored = await ctx.storage.get<unknown>(["snapshot", "identity", "last_read"]);
       const map = stored as Map<string, unknown>;
       this.snapshot = (map.get("snapshot") as Snapshot | undefined) ?? null;
-      this.identity = (map.get("identity") as Identity | undefined) ?? null;
+      this.identity = (map.get("identity") as DoIdentity | undefined) ?? null;
       this.lastReadMs = (map.get("last_read") as number | undefined) ?? 0;
       this.lastPersistedReadMs = this.lastReadMs;
     });
@@ -114,7 +116,7 @@ export class FeedDO extends DurableObject<Env> {
   }
 
   private tag(): string {
-    return this.identity ? `[${this.identity.feedId}:${this.identity.group}]` : "[unbound]";
+    return doTag(this.identity);
   }
 
   /** Fetch + parse + store, single-flight, newer-only. Never throws. */
@@ -216,13 +218,6 @@ export class FeedDO extends DurableObject<Env> {
       group,
       arrivals,
     });
-  }
-}
-
-class MissingFeedError extends Error {
-  constructor(feedId: string) {
-    super(`no feeds row for ${feedId}`);
-    this.name = "MissingFeedError";
   }
 }
 
