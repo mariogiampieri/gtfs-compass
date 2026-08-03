@@ -22,6 +22,12 @@ An independently fetched slice of a Feed's realtime data (NYC subway publishes e
 ### Snapshot
 The cached, reduced realtime state for one Feed Group: upcoming arrivals per Platform plus the freshness stamp consumers judge staleness by. Snapshots are replaced whole, only ever by strictly newer data, and survive the poller's sleep so a waking reader is served instantly — a Snapshot that has never existed is a distinct fact ("no data yet") from an empty one ("no service").
 
+### Trunk Alert
+The single service advisory a trunk carries in the nearby response: severity ("delay" = your ride is disrupted now — delays, suspensions, skipped stops, reduced service; "info" = everything else), rider-facing text, and the directions it applies to. Only alerts whose active period covers the present moment qualify; when several compete for one trunk, higher severity then newer update wins. A null alert deliberately conflates "no alert", "alerts source down", and "alerts data stale".
+
+### Agency-Wide Alert
+An alert whose selectors name only the agency, not routes — the systemwide-disruption case. It travels under a sentinel key and attaches to every trunk, because the highest-impact alerts are exactly the ones published without route enumeration.
+
 ### Station and Platform
 A Station is the parent place riders name ("Jay St–MetroTech"); Platforms are its directional children where vehicles actually stop. Realtime and schedule data reference Platforms; user-facing grouping happens by rolling Platforms up to their parent Station at query time.
 

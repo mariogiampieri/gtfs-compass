@@ -378,8 +378,11 @@ function attachAlerts(
 }
 
 function truncateAtWhitespace(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const cut = text.slice(0, max);
+  // MTA copy carries embedded newlines (multi-clause advisories); the device
+  // renders a single sub-line, so whitespace collapses to spaces first.
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  const cut = flat.slice(0, max);
   const lastSpace = cut.lastIndexOf(" ");
   return `${cut.slice(0, lastSpace > max / 2 ? lastSpace : max)}…`;
 }

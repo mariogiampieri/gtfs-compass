@@ -901,3 +901,19 @@ describe("trunk alerts", () => {
     expect(trunk.alert.text).toBe("C only");
   });
 });
+
+describe("alert text normalization", () => {
+  it("collapses embedded newlines to single spaces", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], text: "No [2] between stations\nTrains run every 20 minutes" }]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe(
+      "No [2] between stations Trains run every 20 minutes",
+    );
+  });
+});
