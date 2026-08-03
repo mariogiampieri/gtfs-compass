@@ -24,6 +24,7 @@ add_executable(sim
   main.c
   ${FW}/components/model/model.c
   ${FW}/components/ui/ui_board.c
+  ${FW}/components/ui/ui_state.c
   ${FW}/third_party/cjson/cJSON.c
 )
 target_include_directories(sim PRIVATE

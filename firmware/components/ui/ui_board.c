@@ -473,7 +473,8 @@ void ui_board_show(const model_nearby_t *model, const ui_state_t *state) {
   }
 
   const model_rail_system_t *rail = &model->rail;
-  uint8_t idx = state->stop_idx < rail->stop_count ? state->stop_idx : 0;
+  uint8_t idx =
+      state->stop_idx[UI_SYS_RAIL] < rail->stop_count ? state->stop_idx[UI_SYS_RAIL] : 0;
   if (rail->stop_count == 0) {
     /* empty-but-live: handoff empty-mode with nearest distance */
     lv_obj_t *title = make_label(g_content, "No trains nearby", &lv_font_montserrat_24,

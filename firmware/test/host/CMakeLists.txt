@@ -13,11 +13,15 @@ add_executable(test_model
   test_model.c
   unity/unity.c
   ${FW}/components/model/model.c
+  # ui_state.c is LVGL-free by design (plan U1) — the reconciler's races are
+  # host-testable facts, so it compiles here with no LVGL on the path.
+  ${FW}/components/ui/ui_state.c
   ${FW}/third_party/cjson/cJSON.c
 )
 target_include_directories(test_model PRIVATE
   unity
   ${FW}/components/model/include
+  ${FW}/components/ui/include
   ${FW}/third_party/cjson
 )
 target_compile_definitions(test_model PRIVATE

@@ -35,6 +35,14 @@ extern "C" {
 #define MODEL_ALERT_TEXT_LEN 224 /* API truncates at ~200; margin for the ellipsis */
 #define MODEL_DIR_LABEL_LEN 16   /* "Downtown" */
 #define MODEL_UNITS_LEN 10       /* "imperial" */
+/* Identity caps (plan U1/R6 — reconciliation keys, never rendered).
+ * Stop ids are GTFS parent-station ids ("A41"); 24 gives feed-agnostic
+ * margin (design constraint: no hardcoded stop ID formats). Trunk keys are
+ * the API's color-group keys ("0039a6"). Bike ids are GBFS UUIDs (36 chars —
+ * the longest identity the API sends). */
+#define MODEL_STOP_ID_LEN 24
+#define MODEL_TRUNK_KEY_LEN 16
+#define MODEL_BIKE_ID_LEN 40
 
 typedef enum {
   MODEL_SHAPE_CIRCLE = 0,
@@ -72,6 +80,7 @@ typedef struct {
 } model_alert_t;
 
 typedef struct {
+  char key[MODEL_TRUNK_KEY_LEN]; /* stable across refreshes; "" if absent */
   uint32_t color;      /* 0xRRGGBB */
   uint32_t text_color; /* 0xRRGGBB */
   model_route_t routes[MODEL_MAX_ROUTES_PER_TRUNK];
@@ -81,6 +90,7 @@ typedef struct {
 } model_trunk_t;
 
 typedef struct {
+  char id[MODEL_STOP_ID_LEN]; /* parent-station id — the reconcile key */
   char name[MODEL_NAME_LEN];
   char distance_label[MODEL_DISTANCE_LEN];
   model_trunk_t trunks[MODEL_MAX_TRUNKS];
@@ -89,6 +99,7 @@ typedef struct {
 } model_stop_t;
 
 typedef struct {
+  char id[MODEL_BIKE_ID_LEN]; /* GBFS station id — the reconcile key */
   char name[MODEL_NAME_LEN];
   char distance_label[MODEL_DISTANCE_LEN];
   /* -1 = unknown (status source down); >=0 = real count (0 = actually empty) */
