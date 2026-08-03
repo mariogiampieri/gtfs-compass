@@ -74,6 +74,16 @@ bool ui_nav_open_nearby(ui_state_t *st, const model_nearby_t *model) {
   return true;
 }
 
+bool ui_nav_select_station(ui_state_t *st, const model_nearby_t *model, uint8_t idx) {
+  if (st->view != UI_VIEW_BIKE_NEARBY || model == NULL) return false;
+  const model_bike_system_t *bike = &model->bike;
+  if (!bike->present || idx >= bike->station_count) return false;
+  st->stop_idx[UI_SYS_BIKE] = idx;
+  id_copy(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, bike->stations[idx].id);
+  st->view = UI_VIEW_BOARD; /* §4: tap a row → that station, back to board */
+  return true;
+}
+
 bool ui_nav_back(ui_state_t *st) {
   if (st->view == UI_VIEW_BOARD) return false;
   st->view = UI_VIEW_BOARD;

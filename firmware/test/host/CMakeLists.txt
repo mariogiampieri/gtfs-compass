@@ -52,6 +52,21 @@ target_compile_definitions(test_nav PRIVATE
   CJSON_NESTING_LIMIT=48
 )
 
+# Bike screen layout math (plan U5): ui_bike_layout.c is LVGL-free by
+# design — hero strings and bar proportions under the R5 degraded
+# permutations are host facts.
+add_executable(test_bike_layout
+  test_bike_layout.c
+  unity/unity.c
+  ${FW}/components/ui/ui_bike_layout.c
+)
+target_include_directories(test_bike_layout PRIVATE
+  unity
+  ${FW}/components/model/include
+  ${FW}/components/ui/include
+)
+
 enable_testing()
 add_test(NAME model COMMAND test_model)
 add_test(NAME nav COMMAND test_nav)
+add_test(NAME bike_layout COMMAND test_bike_layout)

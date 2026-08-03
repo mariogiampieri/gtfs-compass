@@ -77,9 +77,31 @@
 
 /* Detail / nearby stubs (U3; U4/U5 own the full §2/§4 geometry) */
 #define TK_DETAIL_HEADER_TOP 44 /* §2 header top */
+
+/* Bike station (handoff §3) */
+#define TK_BIKE_CLASSIC 0x3FC9C0  /* hero + classic segment */
+#define TK_BIKE_ELECTRIC 0xF0C419 /* electric segment */
+#define TK_BIKE_EMPTY 0x2A2A2E    /* empty (open dock) segment */
+#define TK_BIKE_HERO_TOP 158
+#define TK_BIKE_HERO_LS (-3)  /* 84 px number letter-spacing */
+#define TK_BIKE_LABEL_LS 2    /* BIKES/DOCKS caps: handoff 1.8, LVGL int px */
+#define TK_BIKE_BAR_TOP 312
+#define TK_BIKE_BAR_H 14
+#define TK_BIKE_BAR_R 7
+#define TK_BIKE_BAR_GAP 2
+#define TK_BIKE_LEGEND_GAP 14 /* below the bar */
+#define TK_BIKE_LEGEND_DOT 9
+#define TK_BIKE_HINT_BOTTOM 52
+
+/* Bike nearby compare (handoff §4) */
 #define TK_NEARBY_HEADER_TOP 48 /* §4 header top */
+#define TK_NEARBY_HEADER_LS 2   /* handoff 1.5, LVGL int px */
 #define TK_NEARBY_ROWS_TOP 120
-#define TK_NEARBY_ROW_H 72
+#define TK_NEARBY_ROWS_BOTTOM 46
+#define TK_NEARBY_VISIBLE 3     /* §4: 3 visible rows, no scrolling (KTD-2) */
+#define TK_NEARBY_BAR_H 10
+#define TK_NEARBY_BAR_R 5
+#define TK_NEARBY_BAR_GAP 9 /* name → mini bar */
 
 /* Jitter (spec burn-in requirement) */
 #define TK_JITTER_PX 4

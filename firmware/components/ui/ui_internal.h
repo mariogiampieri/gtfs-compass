@@ -37,4 +37,20 @@ typedef struct {
 void ui_board_render(lv_obj_t *content, const model_rail_system_t *rail,
                      const ui_state_t *state, bool degraded, ui_board_hits_t *hits);
 
+/* Nearby-compare tap targets (plan U5): rows map 1:1 onto stations[0..n)
+ * (§4 shows the nearest TK_NEARBY_VISIBLE, already distance-sorted). */
+typedef struct {
+  lv_obj_t *back;
+  lv_obj_t *rows[MODEL_MAX_BIKE_STATIONS]; /* first TK_NEARBY_VISIBLE used */
+  uint8_t row_count;
+} ui_nearby_hits_t;
+
+/* The bike renderers (ui_bike.c, handoff §3–4). The system-level degraded
+ * states (no_data skeleton, zero-stations empty mode) stay in ui_views.c's
+ * bike dispatch; these assume station_count > 0. */
+void ui_bike_board_render(lv_obj_t *content, const model_bike_system_t *bike,
+                          const ui_state_t *state);
+void ui_bike_nearby_render(lv_obj_t *content, const model_bike_system_t *bike,
+                           const ui_state_t *state, ui_nearby_hits_t *hits);
+
 #endif /* GTFS_COMPASS_UI_INTERNAL_H */

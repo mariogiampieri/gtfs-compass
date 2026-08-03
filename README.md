@@ -345,7 +345,8 @@ Keys (routed through the same navigation code the device gestures use):
 The mouse drives the same gesture tracker and tap/swipe routing as the
 device touch panel: swipe left/right for systems, up/down for stops, tap a
 trunk row for detail, tap the `⇅` pill to flip, tap the bike screen for the
-nearby list. Capture a fresh live fixture with
+nearby list, tap a nearby row to make that station current (`‹ back` or a
+horizontal swipe exits without changing it). Capture a fresh live fixture with
 `curl <worker>/v1/nearby?lat=..&lon=.. > firmware/fixtures/name.json`.
 
 Headless capture: `GC_DUMP=/tmp/f.ppm ./build/sim` renders one frame and

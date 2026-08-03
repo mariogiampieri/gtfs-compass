@@ -23,8 +23,9 @@
  * between press and release, so press-time and release-time hit-testing
  * see the same objects (KTD-2's snapshot requirement).
  *
- * DETAIL and BIKE_NEARBY render minimal honest stubs (station/trunk facts +
- * back affordance) that U4/U5 replace; navigation to/from them is real.
+ * DETAIL renders a minimal honest stub (trunk facts + back affordance) that
+ * U4 replaces; the bike board and BIKE_NEARBY are the real §3–4 renderers
+ * (ui_bike.c, plan U5).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,8 +42,9 @@ static lv_obj_t *g_jitter;  /* full-screen container carrying the offset */
 static lv_obj_t *g_content; /* everything below the chip */
 static lv_obj_t *g_chip_dot;
 static lv_obj_t *g_chip_label;
-static lv_obj_t *g_back;         /* ‹ back affordance of detail/nearby stubs */
+static lv_obj_t *g_back;         /* ‹ back affordance of the detail stub */
 static ui_board_hits_t g_hits;   /* rail board tap targets */
+static ui_nearby_hits_t g_nearby_hits; /* §4 nearby-compare tap targets (U5) */
 static bool g_skeleton_shown;    /* skeleton owns content opacity (its shimmer
                                     anim would fight the 60% degraded set) */
 
@@ -313,15 +315,17 @@ static void render_bus_board(lv_obj_t *content, const model_nearby_t *model,
                 "Swipe \xE2\x86\x92 for bikes, \xE2\x86\x90 for trains.", NULL);
 }
 
-/* Minimal live bike board — station identity + honest counts. U5 replaces
- * this with the §3 hero screen; the dispatch/selection seam is already the
- * real one (stop_idx/stop_id[UI_SYS_BIKE], reconciled by identity). */
+/* Bike board (U5, handoff §3): the R5 degraded trio splits across layers —
+ * no_data → skeleton (cold source: bones, honest, same treatment as
+ * pre-first-fetch), zero stations LIVE → §7 empty mode with the nearest
+ * distance (a different fact from "no data"), and per-station -1 sentinels
+ * are ui_bike.c's job ("—" heroes + hidden bar + muted note). */
 static void render_bike_board(lv_obj_t *content, const model_nearby_t *model,
                               const ui_state_t *state, bool degraded) {
   (void)degraded;
   const model_bike_system_t *bike = &model->bike;
   if (!bike->present || bike->no_data) {
-    build_skeleton(); /* cold: R5's no_data treatment, refined in U5 */
+    build_skeleton();
     return;
   }
   if (bike->station_count == 0) {
@@ -334,30 +338,7 @@ static void render_bike_board(lv_obj_t *content, const model_nearby_t *model,
                   "Swipe \xE2\x86\x90 for trains.");
     return;
   }
-
-  uint8_t idx = state->stop_idx[UI_SYS_BIKE] < bike->station_count
-                    ? state->stop_idx[UI_SYS_BIKE]
-                    : 0;
-  const model_bike_station_t *s = &bike->stations[idx];
-
-  lv_obj_t *name = ui_make_label(content, s->name, TK_FONT_TITLE_SM, TK_TEXT_PRIMARY);
-  lv_obj_set_width(name, TK_SCREEN_W - 2 * TK_SIDE_INSET);
-  lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 170);
-
-  lv_obj_t *dist = ui_make_label(content, s->distance_label, TK_FONT_SUB, TK_TEXT_MUTED);
-  lv_obj_align(dist, LV_ALIGN_TOP_MID, 0, 240);
-
-  /* -1 sentinels (status source down) render as "—", never as zero (R5) */
-  char bikes[8] = "—", docks[8] = "—", counts[40];
-  if (s->bikes_classic >= 0 && s->bikes_electric >= 0) {
-    snprintf(bikes, sizeof(bikes), "%d", s->bikes_classic + s->bikes_electric);
-  }
-  if (s->docks_open >= 0) snprintf(docks, sizeof(docks), "%d", s->docks_open);
-  snprintf(counts, sizeof(counts), "%s bikes · %s docks", bikes, docks);
-  lv_obj_t *c = ui_make_label(content, counts, TK_FONT_DIRECTION, TK_TEXT_BODY);
-  lv_obj_align(c, LV_ALIGN_TOP_MID, 0, 280);
+  ui_bike_board_render(content, bike, state);
 }
 
 typedef void (*sys_render_fn)(lv_obj_t *content, const model_nearby_t *model,
@@ -410,25 +391,16 @@ static void render_detail_stub(lv_obj_t *content, const model_nearby_t *model,
   lv_obj_align(r, LV_ALIGN_TOP_MID, 0, 200);
 }
 
-static void render_nearby_stub(lv_obj_t *content, const model_nearby_t *model,
-                               const ui_state_t *state) {
-  (void)state;
+/* Nearby compare (U5, handoff §4). The reconciler pops this view when the
+ * station list empties under a refresh; the guard is belt-and-braces. */
+static void render_nearby(lv_obj_t *content, const model_nearby_t *model,
+                          const ui_state_t *state) {
   const model_bike_system_t *bike = &model->bike;
-
-  lv_obj_t *title = ui_make_label(content, "NEARBY STATIONS", TK_FONT_CHIP, TK_TEXT_MUTED);
-  lv_obj_set_pos(title, TK_SIDE_INSET, TK_NEARBY_HEADER_TOP);
-  g_back = build_back(content);
-
-  for (int i = 0; i < bike->station_count; i++) {
-    int y = TK_NEARBY_ROWS_TOP + i * TK_NEARBY_ROW_H;
-    const model_bike_station_t *s = &bike->stations[i];
-    lv_obj_t *name = ui_make_label(content, s->name, TK_FONT_HEADSIGN, TK_TEXT_BODY);
-    lv_obj_set_width(name, TK_SCREEN_W - 2 * TK_SIDE_INSET - 70);
-    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(name, TK_SIDE_INSET, y);
-    lv_obj_t *dist = ui_make_label(content, s->distance_label, TK_FONT_PILL, TK_TEXT_MUTED);
-    lv_obj_align(dist, LV_ALIGN_TOP_RIGHT, -TK_SIDE_INSET, y);
+  if (!bike->present || bike->no_data || bike->station_count == 0) {
+    render_bike_board(content, model, state, false);
+    return;
   }
+  ui_bike_nearby_render(content, bike, state, &g_nearby_hits);
 }
 
 /* ---------- public seams ---------- */
@@ -456,6 +428,7 @@ void ui_jitter_nudge(void) {
 
 void ui_render(const model_nearby_t *model, const ui_state_t *state) {
   memset(&g_hits, 0, sizeof(g_hits));
+  memset(&g_nearby_hits, 0, sizeof(g_nearby_hits));
   g_back = NULL;
   g_skeleton_shown = false;
 
@@ -491,7 +464,7 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
                                                                degraded);
       break;
     case UI_VIEW_DETAIL: render_detail_stub(g_content, model, state); break;
-    case UI_VIEW_BIKE_NEARBY: render_nearby_stub(g_content, model, state); break;
+    case UI_VIEW_BIKE_NEARBY: render_nearby(g_content, model, state); break;
   }
   build_mode_dots(state->sys);
 
@@ -532,10 +505,23 @@ bool ui_views_on_tap(int32_t x, int32_t y, const model_nearby_t *model, ui_state
       }
       return false;
     case UI_VIEW_DETAIL:
-    case UI_VIEW_BIKE_NEARBY:
-      /* stubs: only the back affordance is live (rows/flip land in U4/U5) */
+      /* stub: only the back affordance is live (rows/flip land in U4) */
       if (g_back && ui_input_hit(g_back, x, y, UI_INPUT_HIT_MIN_PX)) {
         return ui_nav_back(state);
+      }
+      return false;
+    case UI_VIEW_BIKE_NEARBY:
+      /* ‹ back exits without touching the selection (R2); a row tap is the
+       * only path that changes the current station (U5) */
+      if (g_nearby_hits.back &&
+          ui_input_hit(g_nearby_hits.back, x, y, UI_INPUT_HIT_MIN_PX)) {
+        return ui_nav_back(state);
+      }
+      for (uint8_t i = 0; i < g_nearby_hits.row_count; i++) {
+        if (g_nearby_hits.rows[i] &&
+            ui_input_hit(g_nearby_hits.rows[i], x, y, UI_INPUT_HIT_MIN_PX)) {
+          return ui_nav_select_station(state, model, i);
+        }
       }
       return false;
   }
