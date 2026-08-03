@@ -300,6 +300,12 @@ as the norm.
 Origin coordinates and walk parameters are request-scoped only: never
 persisted, never logged (the same posture as BSSIDs on `/v1/locate`).
 
+One request may consult every feed group its stops span (up to all eight
+NYCT groups); each read arms that group's 20-second poll loop, which
+self-suspends after 10 idle minutes. That wake amplification is the
+accepted pre-auth cost posture — bounded by the per-IP rate limit and the
+curated-feed allowlist, and closed properly by Phase 5 device tokens.
+
 ## Feed data licensing
 
 This project redistributes transit data published by agencies under their
