@@ -78,7 +78,15 @@ static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 static void full_render(void) {
   g_render_pending = false;
+  /* R11 instrumentation: render+layout cost and LVGL-task stack headroom,
+   * logged per full render — the numbers that decide R9 motion and catch
+   * the M1 stack-overflow class before it panics. Flush happens async after
+   * the timer callback returns, so this is build cost, not wire time. */
+  int64_t t0 = esp_timer_get_time();
   ui_render(g_have_model ? g_ui_model : NULL, &g_state);
+  ESP_LOGI(TAG, "render: view=%d sys=%d %lld ms, lvgl stack free %u B",
+           g_state.view, g_state.sys, (esp_timer_get_time() - t0) / 1000,
+           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
 }
 
 /* THE render-request path: every non-navigation full-render trigger (model
