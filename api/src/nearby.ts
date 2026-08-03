@@ -188,6 +188,7 @@ export interface SnapshotArrival {
   routeId: string;
   time: number;
   terminalStopId?: string;
+  directionId?: 0 | 1;
 }
 
 export interface GroupSnapshots {

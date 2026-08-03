@@ -18,7 +18,11 @@ const aceFixture = new Uint8Array(
 
 /** Build a minimal encoded feed for boundary tests. */
 function encodeFeed(
-  trips: { routeId: string; stops: { stopId?: string; arrival?: number; departure?: number }[] }[],
+  trips: {
+    routeId: string;
+    directionId?: number;
+    stops: { stopId?: string; arrival?: number; departure?: number }[];
+  }[],
 ): Uint8Array {
   // Generated with --no-create: encode() accepts plain objects directly.
   return transit_realtime.FeedMessage.encode({
@@ -26,7 +30,7 @@ function encodeFeed(
     entity: trips.map((trip, i) => ({
       id: `t${i}`,
       tripUpdate: {
-        trip: { tripId: `trip${i}`, routeId: trip.routeId },
+        trip: { tripId: `trip${i}`, routeId: trip.routeId, directionId: trip.directionId },
         stopTimeUpdate: trip.stops.map((s) => ({
           stopId: s.stopId,
           arrival: s.arrival ? { time: s.arrival } : undefined,
@@ -85,6 +89,18 @@ describe("gtfs_rt / nyct parse", () => {
       { routeId: "A", stops: [{ departure: 2000 }] },
     ]);
     expect(nyct.parse(buf, 1000).size).toBe(0);
+  });
+
+  it("carries trip direction_id onto arrivals and omits it when the feed does", () => {
+    const buf = encodeFeed([
+      { routeId: "B62", directionId: 1, stops: [{ stopId: "305231", departure: 2_000 }] },
+      { routeId: "B62", directionId: 0, stops: [{ stopId: "305231", departure: 2_100 }] },
+      { routeId: "B62", stops: [{ stopId: "305231", departure: 2_200 }] },
+    ]);
+    const arrivals = getAdapter("gtfs_rt").parse(buf, 1_000).get("305231")!;
+    expect(arrivals.map((a) => a.directionId)).toEqual([1, 0, undefined]);
+    // The field must survive a JSON round trip (snapshot persistence path).
+    expect(JSON.parse(JSON.stringify(arrivals))[0].directionId).toBe(1);
   });
 
   it("returns an empty map for an entity-less feed; ParseError on garbage/empty", () => {
