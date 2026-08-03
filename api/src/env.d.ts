@@ -1,3 +1,4 @@
+import type { AlertDO } from "./alerts_do";
 import type { FeedDO } from "./feed_do";
 import type { GbfsDO } from "./gbfs_do";
 
@@ -6,6 +7,7 @@ declare global {
     DB: D1Database;
     FEED_DO: DurableObjectNamespace<FeedDO>;
     GBFS_DO: DurableObjectNamespace<GbfsDO>;
+    ALERT_DO: DurableObjectNamespace<AlertDO>;
     /** Curated-feed allowlist (wrangler vars, JSON array of feed ids). */
     CURATED_FEEDS?: string[];
     /** Accuracy gate for locate results, meters (default 500). */

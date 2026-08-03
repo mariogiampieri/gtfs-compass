@@ -1,7 +1,10 @@
 /**
- * Lifecycle pieces shared *verbatim* by FeedDO and GbfsDO. Only code that is
- * identical between the two lives here (the plan forbids speculative
- * abstraction) — cadence, snapshot shape, config loading all stay per-DO.
+ * Lifecycle pieces shared *verbatim* by the sibling pollers (FeedDO, GbfsDO,
+ * AlertDO — update this list when a new poller starts importing). Only code
+ * that is byte-identical across siblings lives here (the boundary is
+ * documented in docs/solutions/architecture-patterns/
+ * sibling-do-poller-extraction-boundary.md) — cadence, snapshot shape, and
+ * config loading all stay per-DO.
  */
 
 export const IDLE_SUSPEND_MS = 10 * 60_000;

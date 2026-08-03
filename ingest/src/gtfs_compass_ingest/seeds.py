@@ -24,7 +24,10 @@ MTA_SUBWAY = CuratedFeed(
         # Base (1234567S) feed; the eight NYCT group endpoints are an
         # adapter concern settled in Phase 2.
         "rt_trip_url": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs",
-        "rt_alert_url": None,
+        # Mercury JSON variant (verified live 2026-08-03, no key): the protobuf
+        # feed's standard `effect` field is uniformly UNKNOWN_EFFECT, so the
+        # alerts adapter reads Mercury's alert_type from the JSON body.
+        "rt_alert_url": "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/camsys%2Fsubway-alerts.json",
         "rt_needs_key": 0,
         "adapter": "nyct",
         "min_lat": 40.50,

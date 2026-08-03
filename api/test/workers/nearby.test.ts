@@ -1,4 +1,4 @@
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { transit_realtime } from "../../src/gen/gtfs-realtime.js";
@@ -87,8 +87,8 @@ beforeEach(async () => {
     await env.DB.prepare(`DROP TABLE IF EXISTS ${table}`).run();
   }
   await env.DB.prepare(
-    `CREATE TABLE feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, adapter TEXT,
-       direction_labels TEXT, units TEXT)`,
+    `CREATE TABLE feeds (id TEXT PRIMARY KEY NOT NULL, rt_trip_url TEXT, rt_alert_url TEXT,
+       adapter TEXT, direction_labels TEXT, units TEXT)`,
   ).run();
   await env.DB.prepare(
     `CREATE TABLE stops (feed_id TEXT NOT NULL, stop_id TEXT NOT NULL, name TEXT,
@@ -121,10 +121,42 @@ let feedSerial = 0;
 
 async function seedRailFeed(): Promise<FeedInfo> {
   const id = `rail-${++feedSerial}-${Date.now() % 100000}`;
-  await env.DB.prepare("INSERT INTO feeds (id, rt_trip_url, adapter, units) VALUES (?, ?, 'nyct', 'imperial')")
-    .bind(id, `${ORIGIN}/${id}`)
+  await env.DB.prepare(
+    "INSERT INTO feeds (id, rt_trip_url, rt_alert_url, adapter, units) VALUES (?, ?, ?, 'nyct', 'imperial')",
+  )
+    .bind(id, `${ORIGIN}/${id}`, `${ORIGIN}/${id}/alerts.json`)
     .run();
   return { id, adapter: "nyct", directionLabels: ["Uptown", "Downtown"], units: "imperial" };
+}
+
+const MERCURY = "transit_realtime.mercury_alert";
+
+function alertsBody(
+  fixtures: {
+    routes?: string[];
+    agency?: boolean;
+    alertType?: string;
+    text?: string;
+    stops?: string[];
+    updatedAt?: number;
+  }[],
+): string {
+  return JSON.stringify({
+    header: { timestamp: nowSec() },
+    entity: fixtures.map((f, i) => ({
+      id: `lmm:alert:${i}`,
+      alert: {
+        informed_entity: [
+          ...(f.routes ?? []).map((r) => ({ route_id: r })),
+          ...(f.stops ?? []).map((s) => ({ route_id: f.routes?.[0], stop_id: s })),
+          ...(f.agency ? [{ agency_id: "MTASBWY" }] : []),
+        ],
+        active_period: [],
+        header_text: { translation: [{ language: "en", text: f.text ?? "Trains delayed" }] },
+        [MERCURY]: { alert_type: f.alertType ?? "Delays", updated_at: f.updatedAt ?? 1785700000 },
+      },
+    })),
+  });
 }
 
 async function seedBikeFeed(): Promise<FeedInfo> {
@@ -228,9 +260,11 @@ describe("composeNearby — rail", () => {
 
     respondWith(`${ORIGIN}/${feed.id}-ace`, () => ({
       status: 200,
+      // Mid-minute offsets (+150/+330): an exact-minute boundary flips the
+      // floor()ed eta when composition lands a second later than `now`.
       body: encodeTrips(now, [
-        { routeId: "A", stops: [["A41S", now + 120], ["A65S", now + 1800]] },
-        { routeId: "C", stops: [["A41N", now + 300], ["A09N", now + 2400]] },
+        { routeId: "A", stops: [["A41S", now + 150], ["A65S", now + 1800]] },
+        { routeId: "C", stops: [["A41N", now + 330], ["A09N", now + 2400]] },
       ]),
     }));
 
@@ -731,5 +765,208 @@ describe("review-driven regressions", () => {
     const system = railSystem(body);
     expect(system.fetched_at).toBeGreaterThan(0);
     expect(system.stops[0].trunks[0].directions[0].arrivals).toHaveLength(1);
+  });
+});
+
+describe("trunk alerts", () => {
+  it("fills trunk.alert with the design shape for an alerted member route", async () => {
+    const feed = await seedRailFeed();
+    const now = nowSec();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A", "C"], A41S: ["A", "C"] });
+    await seedStation(feed.id, "G22", "Court Sq", JAY.lat + 0.001, JAY.lon, { G22N: ["G"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    await seedRoute(feed.id, "C", "C", "0039A6");
+    await seedRoute(feed.id, "G", "G", "6CBE45");
+    respondWith(`${ORIGIN}/${feed.id}-ace`, () => ({
+      status: 200,
+      body: encodeTrips(now, [{ routeId: "A", stops: [["A41N", now + 120]] }]),
+    }));
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], alertType: "Delays", text: "Delays · signal problem" }]),
+    }));
+
+    const body: any = await composeWarm([feed], ["rail"]);
+    const stops = railSystem(body).stops;
+    const jay = stops.find((s: any) => s.id === "A41");
+    expect(jay.trunks[0].alert).toEqual({
+      severity: "delay",
+      text: "Delays · signal problem",
+      directions: [0, 1], // no direction selectors → both
+    });
+    const courtSq = stops.find((s: any) => s.id === "G22");
+    expect(courtSq.trunks[0].alert).toBeNull(); // G not alerted
+  });
+
+  it("scopes stop-selector alerts to the shown station and derives directions from suffixes", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41S: ["A"] });
+    await seedStation(feed.id, "A48", "Other St", JAY.lat + 0.002, JAY.lon, { A48S: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], stops: ["A41S"], text: "Downtown A at Jay St only" }]),
+    }));
+
+    const body: any = await composeWarm([feed], ["rail"]);
+    const stops = railSystem(body).stops;
+    const jay = stops.find((s: any) => s.id === "A41");
+    expect(jay.trunks[0].alert.text).toBe("Downtown A at Jay St only");
+    expect(jay.trunks[0].alert.directions).toEqual([1]); // S suffix
+    const other = stops.find((s: any) => s.id === "A48");
+    expect(other.trunks[0].alert).toBeNull(); // out of scope
+  });
+
+  it("applies agency-wide alerts to every trunk at every station", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedStation(feed.id, "R29", "Court St", JAY.lat + 0.001, JAY.lon, { R29N: ["R"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    await seedRoute(feed.id, "R", "R", "FCCC0A");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ agency: true, alertType: "Delays", text: "Systemwide suspension" }]),
+    }));
+
+    const body: any = await composeWarm([feed], ["rail"]);
+    for (const stop of railSystem(body).stops) {
+      for (const trunk of stop.trunks) {
+        expect(trunk.alert?.text).toBe("Systemwide suspension");
+      }
+    }
+  });
+
+  it("picks delay over info, then newer updatedAt, one alert per trunk", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([
+        { routes: ["A"], alertType: "Boarding Change", text: "older info", updatedAt: 100 },
+        { routes: ["A"], alertType: "Delays", text: "the delay", updatedAt: 50 },
+        { routes: ["A"], alertType: "Boarding Change", text: "newer info", updatedAt: 200 },
+      ]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe("the delay");
+  });
+
+  it("truncates long alert text at a whitespace boundary", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    const long = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], text: long }]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    const text = railSystem(body).stops[0].trunks[0].alert.text;
+    expect(text.length).toBeLessThanOrEqual(201); // 200 + ellipsis
+    expect(text.endsWith("…")).toBe(true);
+    expect(text.slice(0, -1).endsWith("word")).toBe(false); // cut at whitespace, not mid-word
+  });
+
+  it("degrades to null alerts when the AlertDO source fails, without touching partial", async () => {
+    const feed = await seedRailFeed();
+    const now = nowSec();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}-ace`, () => ({
+      status: 200,
+      body: encodeTrips(now, [{ routeId: "A", stops: [["A41N", now + 60]] }]),
+    }));
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({ status: 500, body: "" }));
+
+    const body: any = await composeWarm([feed], ["rail"]);
+    const system = railSystem(body);
+    expect(system.stops[0].trunks[0].alert).toBeNull();
+    expect(system.partial).toBeUndefined(); // alerts are an overlay
+    expect(system.stops[0].trunks[0].directions[0].arrivals).toHaveLength(1); // arrivals unaffected
+  });
+
+  it("attaches the alert to a multi-route trunk when only one member is alerted", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A", "C"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    await seedRoute(feed.id, "C", "C", "0039A6"); // same trunk
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["C"], text: "C only" }]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    const trunk = railSystem(body).stops[0].trunks[0];
+    expect(trunk.routes.map((r: any) => r.label).sort()).toEqual(["A", "C"]);
+    expect(trunk.alert.text).toBe("C only");
+  });
+});
+
+describe("alert text normalization", () => {
+  it("collapses embedded newlines to single spaces", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], text: "No [2] between stations\nTrains run every 20 minutes" }]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe(
+      "No [2] between stations Trains run every 20 minutes",
+    );
+  });
+});
+
+describe("alert overlay review regressions", () => {
+  it("suppresses alerts older than the freshness horizon", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], text: "current incident" }]),
+    }));
+    const warm: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(warm).stops[0].trunks[0].alert).not.toBeNull();
+
+    // Backdate the AlertDO's snapshot past the 30-minute horizon.
+    const stub = env.ALERT_DO.get(env.ALERT_DO.idFromName(`${feed.id}:alerts`));
+    await runInDurableObject(stub, async (instance: any, state: DurableObjectState) => {
+      const stale = { ...instance.snapshot, fetchedAtMs: Date.now() - 31 * 60_000 };
+      await state.storage.put("snapshot", stale);
+      instance.snapshot = stale;
+      // keep the pending alarm from re-freshening it mid-test
+      await state.storage.deleteAlarm();
+    });
+    const after: any = await compose([feed], ["rail"]);
+    expect(railSystem(after).stops[0].trunks[0].alert).toBeNull(); // stale → honest null
+  });
+
+  it("breaks same-severity ties by newer updatedAt", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([
+        { routes: ["A"], alertType: "Boarding Change", text: "older info", updatedAt: 100 },
+        { routes: ["A"], alertType: "Boarding Change", text: "newer info", updatedAt: 200 },
+      ]),
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe("newer info"); // recency isolated
+  });
+
+  it("matches stop selectors against the bare parent station id", async () => {
+    const feed = await seedRailFeed();
+    await seedStation(feed.id, "A41", "Jay St", JAY.lat, JAY.lon, { A41N: ["A"] });
+    await seedRoute(feed.id, "A", "A", "0039A6");
+    respondWith(`${ORIGIN}/${feed.id}/alerts.json`, () => ({
+      status: 200,
+      body: alertsBody([{ routes: ["A"], stops: ["A41"], text: "parent-scoped" }]), // parent id, no suffix
+    }));
+    const body: any = await composeWarm([feed], ["rail"]);
+    expect(railSystem(body).stops[0].trunks[0].alert.text).toBe("parent-scoped");
   });
 });

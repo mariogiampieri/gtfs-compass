@@ -1,7 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { ParseError } from "./adapters";
-import { type StationStatus, parseStationStatus } from "./adapters/gbfs";
+import {
+  AGENCY_WIDE_KEY,
+  type AlertItem,
+  isActiveNow,
+  parseMtaAlerts,
+} from "./adapters/mta_alerts";
 import {
   batchIdsParam,
   type DoIdentity,
@@ -11,37 +16,39 @@ import {
   doTag,
 } from "./do_shared";
 
-export const POLL_INTERVAL_MS = 60_000; // the GBFS feed's ttl; polling faster is wasted
+export const POLL_INTERVAL_MS = 60_000; // alerts move slowly; faster is wasted
 // Persist last_read at FeedDO's 20 s bound rather than the 60 s cadence, so
 // the suspend decision's staleness error stays capped at 20 s here too.
 export const LAST_READ_PERSIST_MS = 20_000;
 
 interface Snapshot {
-  stations: Record<string, StationStatus>;
+  byRoute: Record<string, AlertItem[]>;
   fetchedAtMs: number; // wall clock at fetch start
-  lastUpdated: number; // GBFS top-level last_updated (epoch seconds)
+  headerTimestamp: number; // feed generation time (epoch seconds)
 }
 
-interface GbfsConfig {
-  statusUrl: string;
+interface AlertsConfig {
+  alertUrl: string;
 }
 
 /**
- * One DO per GBFS feed ("{feed_id}:all" — station_status is a single
- * document, so there is exactly one group). Sibling of FeedDO with the same
- * lifecycle discipline (docs/solutions/architecture-patterns/
- * durable-object-alarm-loop-discipline.md): reschedule-first alarm that never
- * throws, one refresh in flight, storage-await-only read-path arming,
- * newer-only stores, 10-idle-minute self-suspend. Only the cadence (60 s ttl),
- * snapshot shape (station counts vs arrivals), and parse differ.
+ * One DO per alerts feed ("{feed_id}:alerts" — the feed is a single document).
+ * Third sibling of FeedDO/GbfsDO with the same lifecycle discipline
+ * (docs/solutions/architecture-patterns/durable-object-alarm-loop-discipline.md):
+ * reschedule-first alarm that never throws, one refresh in flight,
+ * storage-await-only read-path arming, newer-only stores, far-future clamp,
+ * 10-idle-minute self-suspend. Only the cadence, snapshot shape (route →
+ * alerts), and parse differ. Active-now filtering is THIS read path's job —
+ * active_period windows open and close between polls, so composition consumes
+ * an already-active-only snapshot (alert-layer plan, canonical locus).
  */
-export class GbfsDO extends DurableObject<Env> {
+export class AlertDO extends DurableObject<Env> {
   private snapshot: Snapshot | null = null;
   private identity: DoIdentity | null = null;
   private lastReadMs = 0;
   private lastPersistedReadMs = 0;
   private refreshInFlight = false;
-  private configPromise: Promise<GbfsConfig> | null = null;
+  private configPromise: Promise<AlertsConfig> | null = null;
   private configMissing = false;
   private configMissingSinceMs = 0;
 
@@ -62,9 +69,8 @@ export class GbfsDO extends DurableObject<Env> {
     const url = new URL(request.url);
     const feedId = url.searchParams.get("feed");
     const group = url.searchParams.get("group");
-    const single = url.pathname.match(/^\/station\/([^/]+)$/);
-    const batchIds = url.pathname === "/stations" ? batchIdsParam(url) : null;
-    if ((!single && batchIds === null) || !feedId || !group) {
+    const batchIds = url.pathname === "/routes" ? batchIdsParam(url) : null;
+    if (batchIds === null || !feedId || !group) {
       return Response.json({ error: "bad request" }, { status: 400 });
     }
     if (this.configMissing) {
@@ -97,9 +103,7 @@ export class GbfsDO extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(now + POLL_INTERVAL_MS);
     }
 
-    const response = single
-      ? this.stationResponse(decodeURIComponent(single[1]))
-      : this.stationsResponse(batchIds ?? []);
+    const response = this.routesResponse(batchIds, now);
     if (arming) {
       this.ctx.waitUntil(this.refresh());
     }
@@ -141,42 +145,70 @@ export class GbfsDO extends DurableObject<Env> {
       const config = await this.loadConfig(this.identity.feedId);
       this.configMissing = false; // a later-fixed feeds row must recover reads
 
-      const upstream = await fetch(config.statusUrl, {
+      const upstream = await fetch(config.alertUrl, {
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!upstream.ok) {
         console.warn(`${this.tag()} upstream ${upstream.status}; keeping old snapshot`);
         return;
       }
-      const parsed = parseStationStatus(await upstream.text());
+      const parsed = parseMtaAlerts(await upstream.text());
 
-      // A far-future last_updated (ms-instead-of-s glitch, clock skew) must
-      // never become the persisted high-water mark — it would reject every
-      // correct body forever, with no recovery even across restarts.
-      if (parsed.lastUpdated > Math.floor(fetchStartMs / 1000) + 300) {
-        console.warn(`${this.tag()} implausible last_updated ${parsed.lastUpdated}; ignoring timestamp`);
-        parsed.lastUpdated = 0;
+      // Severity-signal loss must be distinguishable from calm: a partial
+      // vendor migration greys most alerts to info just as silently as a
+      // total one, so the gate is a ratio collapse, not only absence.
+      if (parsed.entitiesParsed >= 10 && parsed.entitiesWithMercury / parsed.entitiesParsed < 0.5) {
+        console.warn(
+          `${this.tag()} mercury extension on only ${parsed.entitiesWithMercury}/${parsed.entitiesParsed} entities — severity signal degrading`,
+        );
+      }
+      if (parsed.unparseablePeriodValues > 0) {
+        console.warn(
+          `${this.tag()} ${parsed.unparseablePeriodValues} active_period value(s) present but uncoercible — timestamp-shape drift`,
+        );
       }
 
-      // Frozen upstream: HTTP 200 but the feed hasn't advanced. Treat as a
-      // failed fetch so staleness becomes visible (spec constraint #5).
-      // A body that omits last_updated (0) skips this gate.
-      if (this.snapshot && parsed.lastUpdated > 0 && parsed.lastUpdated <= this.snapshot.lastUpdated) {
-        console.warn(`${this.tag()} last_updated not advancing (${parsed.lastUpdated}); keeping old snapshot`);
+      // A far-future header timestamp must never become the persisted
+      // high-water mark — it would reject every correct body forever.
+      if (parsed.timestamp > Math.floor(fetchStartMs / 1000) + 300) {
+        console.warn(`${this.tag()} implausible header timestamp ${parsed.timestamp}; ignoring`);
+        parsed.timestamp = 0;
+      }
+      // DELIBERATE DIVERGENCE from the sibling frozen-upstream gate: the
+      // Mercury header timestamp advances on CONTENT change, not per
+      // generation (verified live — frozen for 20+ quiet minutes). An
+      // unchanged document is the healthy steady state for slow-moving
+      // alerts, so a successful unchanged fetch refreshes the staleness
+      // stamp (or composition's 30-min horizon would null every alert on a
+      // quiet night) while keeping the existing content.
+      if (this.snapshot && parsed.timestamp > 0 && parsed.timestamp <= this.snapshot.headerTimestamp) {
+        if (fetchStartMs > this.snapshot.fetchedAtMs) {
+          const restamped: Snapshot = { ...this.snapshot, fetchedAtMs: fetchStartMs };
+          await this.ctx.storage.put("snapshot", restamped);
+          this.snapshot = restamped;
+        }
         return;
       }
       if (this.snapshot && fetchStartMs <= this.snapshot.fetchedAtMs) {
         return; // stale-ordered write from an older interleaved fetch
       }
 
-      const stations: Record<string, StationStatus> = Object.create(null); // no prototype keys
-      for (const [id, status] of parsed.stations) {
-        stations[id] = status;
+      // Snapshot hygiene: fully-expired planned work (every bounded period
+      // already over) never becomes readable again — don't store it.
+      const nowSec = Math.floor(fetchStartMs / 1000);
+      const byRoute: Record<string, AlertItem[]> = Object.create(null); // no prototype keys
+      for (const [routeId, items] of parsed.byRoute) {
+        const live = items.filter(
+          (item) =>
+            item.activePeriods.length === 0 ||
+            item.activePeriods.some((p) => p.end === undefined || p.end >= nowSec),
+        );
+        if (live.length > 0) byRoute[routeId] = live;
       }
       const snapshot: Snapshot = {
-        stations,
+        byRoute,
         fetchedAtMs: fetchStartMs,
-        lastUpdated: parsed.lastUpdated,
+        headerTimestamp: parsed.timestamp,
       };
       // Persist first, then flip memory: a failed put must not leave the live
       // instance serving data that regresses on the next warm restart.
@@ -187,7 +219,7 @@ export class GbfsDO extends DurableObject<Env> {
         this.configMissing = true;
         this.configMissingSinceMs = Date.now();
       } else if (error instanceof ParseError) {
-        console.warn(`${this.tag()} unparseable station_status; keeping old snapshot:`, error.message);
+        console.warn(`${this.tag()} unparseable alerts body; keeping old snapshot:`, error.message);
       } else {
         console.warn(`${this.tag()} refresh failed; keeping old snapshot:`, error);
       }
@@ -196,18 +228,16 @@ export class GbfsDO extends DurableObject<Env> {
     }
   }
 
-  private loadConfig(feedId: string): Promise<GbfsConfig> {
+  private loadConfig(feedId: string): Promise<AlertsConfig> {
     if (!this.configPromise) {
       this.configPromise = (async () => {
-        const row = await this.env.DB.prepare(
-          "SELECT rt_trip_url FROM feeds WHERE id = ?",
-        )
+        const row = await this.env.DB.prepare("SELECT rt_alert_url FROM feeds WHERE id = ?")
           .bind(feedId)
-          .first<{ rt_trip_url: string | null }>();
-        if (!row?.rt_trip_url) {
+          .first<{ rt_alert_url: string | null }>();
+        if (!row?.rt_alert_url) {
           throw new MissingFeedError(feedId);
         }
-        return { statusUrl: row.rt_trip_url }; // rt_trip_url = station_status URL for GBFS feeds
+        return { alertUrl: row.rt_alert_url };
       })();
       // Clear on rejection so a transient D1 error doesn't pin failure.
       this.configPromise.catch(() => {
@@ -217,35 +247,33 @@ export class GbfsDO extends DurableObject<Env> {
     return this.configPromise;
   }
 
-  private stationResponse(stationId: string): Response {
+  /**
+   * Batch read: every requested id present (FeedDO convention — alerts are
+   * route-keyed like arrivals, not presence-keyed like stations), plus the
+   * agency-wide sentinel when it carries anything. Active-now filtered here,
+   * with this DO's clock — the canonical locus.
+   */
+  private routesResponse(routeIds: string[], nowMs: number): Response {
     if (!this.snapshot) {
-      // First-ever read: "no data yet" — distinct from unknown-station (fetched_at null).
-      return Response.json({ fetched_at: null, station: null });
+      const empty: Record<string, AlertItem[]> = Object.create(null);
+      for (const id of routeIds) empty[id] = [];
+      return Response.json({ fetched_at: null, routes: empty });
     }
-    // hasOwn guard: station ids are caller-controlled and storage round-trips
-    // restore Object.prototype, so "constructor" etc. must not hit the chain.
-    const station = Object.hasOwn(this.snapshot.stations, stationId)
-      ? this.snapshot.stations[stationId]
-      : null;
-    return Response.json({
-      fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
-      station,
-    });
-  }
-
-  private stationsResponse(ids: string[]): Response {
-    if (!this.snapshot) {
-      return Response.json({ fetched_at: null, stations: {} });
-    }
-    const stations: Record<string, StationStatus> = Object.create(null); // "__proto__" id must not hit the setter
-    for (const id of ids) {
-      if (Object.hasOwn(this.snapshot.stations, id)) {
-        stations[id] = this.snapshot.stations[id]; // missing ids omitted
+    const nowSec = Math.floor(nowMs / 1000);
+    const routes: Record<string, AlertItem[]> = Object.create(null);
+    for (const id of new Set([...routeIds, AGENCY_WIDE_KEY])) {
+      const stored = Object.hasOwn(this.snapshot.byRoute, id) ? this.snapshot.byRoute[id] : [];
+      const active = stored.filter((item) => isActiveNow(item, nowSec));
+      // The auto-added sentinel is omitted when empty; an EXPLICITLY requested
+      // id — sentinel included — is always present (the documented contract).
+      if (id === AGENCY_WIDE_KEY && active.length === 0 && !routeIds.includes(AGENCY_WIDE_KEY)) {
+        continue;
       }
+      routes[id] = active;
     }
     return Response.json({
       fetched_at: Math.floor(this.snapshot.fetchedAtMs / 1000),
-      stations,
+      routes,
     });
   }
 }

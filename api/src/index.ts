@@ -4,6 +4,7 @@ import { routeNearby } from "./routes/nearby";
 
 export { FeedDO } from "./feed_do";
 export { GbfsDO } from "./gbfs_do";
+export { AlertDO } from "./alerts_do";
 
 /**
  * Curated feeds reachable through the public routes come from wrangler
@@ -81,6 +82,8 @@ const ROUTE = /^\/internal\/([^/]+)\/([^/]+)\/stop\/([^/]+)$/;
 // operator debug surface mirrors FeedDO's so a stuck bike poll is inspectable
 // without composing a full /v1/nearby response.
 const STATION_ROUTE = /^\/internal\/([^/]+)\/all\/station\/([^/]+)$/;
+// Same parity for the alerts poller: route-keyed, "alerts" pseudo-group.
+const ALERTS_ROUTE = /^\/internal\/([^/]+)\/alerts\/route\/([^/]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -114,6 +117,28 @@ async function route(request: Request, env: Env): Promise<Response> {
         return routeNearby(request, env, url, curatedFeeds(env));
       }
       return routeLocate(request, env, url);
+    }
+
+    const alertsMatch = url.pathname.match(ALERTS_ROUTE);
+    if (alertsMatch && request.method === "GET") {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (rateLimited(ip, Date.now())) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      let feedId: string;
+      let routeId: string;
+      try {
+        [, feedId, routeId] = alertsMatch.map(decodeURIComponent) as [string, string, string];
+      } catch {
+        return Response.json({ error: "not found" }, { status: 404 });
+      }
+      if (!curatedFeeds(env).has(feedId)) {
+        return Response.json({ error: `unknown feed: ${feedId}` }, { status: 404 });
+      }
+      const stub = env.ALERT_DO.get(env.ALERT_DO.idFromName(`${feedId}:alerts`));
+      return stub.fetch(
+        `https://do/routes?ids=${encodeURIComponent(routeId)}&feed=${encodeURIComponent(feedId)}&group=alerts`,
+      );
     }
 
     const stationMatch = url.pathname.match(STATION_ROUTE);

@@ -129,6 +129,7 @@ documented below):
 ```bash
 curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/mta-subway/ace/stop/A32N"
 curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/citibike/all/station/<station-id>"
+curl "https://gtfs-compass-api.<your-subdomain>.workers.dev/internal/mta-subway/alerts/route/A"
 ```
 
 `npm run deploy` applies any pending D1 migrations first — new Worker code
@@ -177,6 +178,16 @@ distinct from a located-but-empty board. Each system carries `fetched_at`
 shows stale data as live. When the bike status source is unavailable,
 `bikes_classic`/`bikes_electric`/`docks_open` are `null` (capacity stays
 real) — `null` means "no data", `0` means "actually empty".
+
+Rail trunks carry live **service alerts** from the
+[MTA's Mercury alerts feed](https://api.mta.info/):
+`alert: {"severity": "delay"|"info", "text": "...", "directions": [0,1]}`.
+`"delay"` marks active disruptions (delays, suspensions, skipped stops,
+reduced service); planned work and notices render as `"info"`. Only alerts
+whose active period covers *now* are shown, scoped to the station when the
+alert names specific stops. `alert: null` means no active alert **or** the
+alerts source is down/stale (older than 30 minutes) — the device renders
+those identically by design. `note` remains a null stub.
 
 **`POST /v1/locate`** — the bare geolocation step, for diagnostics and the
 config UI:
