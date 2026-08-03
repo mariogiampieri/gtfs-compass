@@ -41,6 +41,7 @@ def test_all_runs_catalog_then_static_in_order(recorder):
     assert recorder.calls[0][0] == "catalog"
     assert [c[:2] for c in recorder.calls[1:]] == [
         ("static", "mta-subway"),
+        ("static", "mta-bus"),
         ("gbfs", "citibike"),
     ]
     assert recorder.released  # D1 lock released on success
@@ -131,3 +132,35 @@ def test_lost_d1_lock_mid_run_aborts_before_static(recorder, monkeypatch):
     monkeypatch.setattr(cli, "renew_lock", lambda client, holder: False)
     assert cli.main(["all"]) == 1
     assert not [c for c in recorder.calls if c[0] == "static"]
+
+
+def test_prune_refused_feed_contained_and_run_continues(recorder, monkeypatch):
+    from gtfs_compass_ingest.load import PruneRefused
+
+    def refuse_first(client, feed_id, **kwargs):
+        recorder.calls.append(("static", feed_id, kwargs))
+        if feed_id == "mta-subway":
+            raise PruneRefused("mta-subway: prune skipped after upserts")
+
+    monkeypatch.setattr(cli, "run_static", refuse_first)
+    # The refusal is contained to its feed: the other feeds still ingest,
+    # and the exit code stays non-zero for cron to notice.
+    assert cli.main(["static"]) == 1
+    assert [c[:2] for c in recorder.calls] == [
+        ("static", "mta-subway"),
+        ("static", "mta-bus"),
+        ("gbfs", "citibike"),
+    ]
+    assert recorder.released  # lock still released after the failure
+
+
+def test_renew_lock_callback_threaded_into_run_static(recorder):
+    assert cli.main(["static", "mta-subway"]) == 0
+    (_, _, kwargs) = recorder.calls[0]
+    assert callable(kwargs["renew_lock"])  # connected run renews between sources
+
+
+def test_dry_run_passes_no_renew_lock_callback(recorder):
+    assert cli.main(["--dry-run", "static", "mta-subway"]) == 0
+    (_, _, kwargs) = recorder.calls[0]
+    assert kwargs["renew_lock"] is None  # no D1 lock exists in dry-run

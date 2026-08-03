@@ -99,21 +99,39 @@ def _run(args: argparse.Namespace) -> int:
         now = int(time.time())
         if args.command in ("catalog", "all"):
             run_catalog(client, now=now, dry_run=dry_run, force=args.force)
+        failed_feeds = []
         if args.command in ("static", "all"):
             cli_ids = getattr(args, "feed_ids", None)
+            renew = None if dry_run else (lambda: renew_lock(client, holder))
             for feed_id in static_feed_ids(cli_ids):
                 # Re-extend the D1 lock before each phase so a long run
                 # (backoff, slow network) can never outlive its claim.
                 if not dry_run and not renew_lock(client, holder):
                     log.error("lost the D1 ingest lock mid-run; aborting")
                     return EXIT_FAILURE
-                # Dispatch on the feed's adapter (from the seeds registry —
-                # only curated feeds are static-ingested): a GBFS JSON pushed
-                # through the zip pipeline would be a BadZipFile crash.
-                if seeds.adapter_for(feed_id) == "gbfs":
-                    run_gbfs_static(client, feed_id, dry_run=dry_run, force=args.force)
-                else:
-                    run_static(client, feed_id, dry_run=dry_run, force=args.force)
+                # A refused prune is contained to its feed: the upserts
+                # already landed (superset state) and the other feeds still
+                # deserve their nightly run. The exit code stays non-zero.
+                try:
+                    # Dispatch on the feed's adapter (from the seeds registry —
+                    # only curated feeds are static-ingested): a GBFS JSON pushed
+                    # through the zip pipeline would be a BadZipFile crash.
+                    if seeds.adapter_for(feed_id) == "gbfs":
+                        run_gbfs_static(client, feed_id, dry_run=dry_run, force=args.force)
+                    else:
+                        run_static(
+                            client,
+                            feed_id,
+                            dry_run=dry_run,
+                            force=args.force,
+                            renew_lock=renew,
+                        )
+                except PruneRefused as exc:
+                    log.error("%s", exc)
+                    failed_feeds.append(feed_id)
+        if failed_feeds:
+            log.error("static ingest finished with failed feeds: %s", ", ".join(failed_feeds))
+            return EXIT_FAILURE
         return EXIT_OK
     except PruneRefused as exc:
         log.error("%s", exc)

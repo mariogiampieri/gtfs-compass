@@ -3,6 +3,13 @@
 Streams straight out of the zip with stdlib csv. Load order is fixed so no
 reader ever sees an edge pointing at a missing stop: upsert stops and routes
 before stop_routes; prune stop_routes before stops and routes.
+
+A feed may be built from several source zips (mta-bus: five boroughs plus
+the MTA Bus Company set under one feed_id). Sources parse sequentially —
+one zip's stop_times in memory at a time — and merge into accumulated row
+dicts; Sync runs once with the merged sets so the prune keep-set spans every
+source. Any failed, oversized, hollow, or conflicting source keeps the
+healthy upserts but refuses the feed's prune (superset over deletion).
 """
 
 from __future__ import annotations
@@ -13,12 +20,13 @@ import logging
 import re
 import zipfile
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import requests
 
 from . import seeds
-from .load import D1Client, parse_optional_float, prune_only, sync
+from .load import D1Client, PruneRefused, parse_optional_float, prune_only, sync
 from .tables import ROUTE_DIRECTIONS, ROUTES, STOP_ROUTES, STOPS
 
 log = logging.getLogger(__name__)
@@ -36,6 +44,30 @@ NYCT_TRIP_DIRECTION = re.compile(r"\.\.([NS])")
 # vehicle stops — loading them would surface entrance ids in proximity results.
 LOADED_LOCATION_TYPES = ("", "0", "1")
 
+# Streamed per-source download cap: ~10x the largest observed borough zip
+# (~8 MB). A breach mid-stream is treated exactly like a failed download.
+MAX_SOURCE_BYTES = 80 * 1024 * 1024
+
+# Absolute per-source health floors for multi-source feeds (R3): D1 keeps no
+# per-source provenance under the single feed_id, so last-run comparisons are
+# unavailable, and one hollow borough (~15-20% of the merged feed) slips under
+# the 50% deletion guard. Staten Island, the smallest real source, carries
+# roughly 600 stops and ~30 routes. Single-source feeds keep the existing
+# sync-level guards (empty keep-set / 50% threshold).
+MIN_SOURCE_STOPS = 200
+MIN_SOURCE_ROUTES = 10
+
+
+class SourceTooLarge(RuntimeError):
+    """A static source exceeded MAX_SOURCE_BYTES mid-download."""
+
+
+# A source counts as failed on network errors, a corrupt zip, a zip missing a
+# required member (KeyError from ZipFile.open), or blowing the download cap.
+# Fetch+parse never touches D1, so a failure here can only cost this source's
+# rows — never already-landed upserts.
+SOURCE_FAILURES = (requests.RequestException, zipfile.BadZipFile, KeyError, SourceTooLarge)
+
 
 @dataclass
 class StaticStats:
@@ -46,6 +78,19 @@ class StaticStats:
     pruned: int = 0
     skipped_locations: int = 0
     skipped_directionless: int = 0
+    sources_failed: int = 0
+    duplicates_deduped: int = 0  # normalized-identical rows across sources
+    duplicate_conflicts: int = 0  # same id, different payload across sources
+
+
+@dataclass
+class _MergedFeed:
+    """Rows accumulated across a feed's sources, keyed by table PK."""
+
+    stops: dict[str, dict] = field(default_factory=dict)
+    routes: dict[str, dict] = field(default_factory=dict)
+    edges: dict[tuple[str, str], dict] = field(default_factory=dict)
+    direction_votes: dict[tuple[str, int], Counter] = field(default_factory=dict)
 
 
 def run_static(
@@ -55,42 +100,112 @@ def run_static(
     dry_run: bool = False,
     force: bool = False,
     http_session: requests.Session | None = None,
+    renew_lock: Callable[[], bool] | None = None,
 ) -> StaticStats:
-    url = resolve_static_url(client, feed_id)
-    data = _fetch_zip(url, http_session)
+    sources = seeds.static_sources_for(feed_id)
+    if sources is None:  # catalog-only feed: single URL from D1
+        sources = [resolve_static_url(client, feed_id)]
+    multi_source = len(sources) > 1
 
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        stop_rows, skipped = _parse_stops(zf, feed_id)
-        route_rows = _parse_routes(zf, feed_id)
-        edge_rows = _derive_edges(zf, feed_id, stop_rows, route_rows)
-        direction_rows, skipped_directionless = _derive_route_directions(zf, feed_id)
+    stats = StaticStats()
+    merged = _MergedFeed()
+    refusals: list[str] = []  # any entry blocks this feed's prune
 
-    log.info(
-        "%s: parsed %d stops (%d non-stop locations skipped), %d routes, %d edges, "
-        "%d route directions",
-        feed_id,
-        len(stop_rows),
-        skipped,
-        len(route_rows),
-        len(edge_rows),
-        len(direction_rows),
-    )
-    stats = StaticStats(
-        skipped_locations=skipped, skipped_directionless=skipped_directionless
-    )
+    for index, url in enumerate(sources):
+        if index and renew_lock is not None and not renew_lock():
+            # Writing on past a lost claim risks two hosts converging D1 at
+            # once; this is fatal for the whole run, not just this feed.
+            raise RuntimeError(f"{feed_id}: lost the D1 ingest lock between static sources")
+        try:
+            data = _fetch_zip(url, http_session)
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                stop_rows, skipped = _parse_stops(zf, feed_id)
+                route_rows = _parse_routes(zf, feed_id)
+                edge_rows = _derive_edges(zf, feed_id, stop_rows, route_rows)
+                votes, skipped_directionless = _collect_direction_votes(zf, feed_id)
+        except SOURCE_FAILURES as exc:
+            stats.sources_failed += 1
+            reason = f"source {url} failed: {exc.__class__.__name__}: {exc}"
+            log.error("%s: %s — feed prune disabled, healthy upserts still land", feed_id, reason)
+            refusals.append(reason)
+            continue
+
+        log.info(
+            "%s: %s parsed %d stops (%d non-stop locations skipped), %d routes, "
+            "%d edges, %d directed routes",
+            feed_id, url, len(stop_rows), skipped, len(route_rows), len(edge_rows), len(votes),
+        )
+        stats.skipped_locations += skipped
+        stats.skipped_directionless += skipped_directionless
+
+        if multi_source and (
+            len(stop_rows) < MIN_SOURCE_STOPS or len(route_rows) < MIN_SOURCE_ROUTES
+        ):
+            reason = (
+                f"source {url} is hollow: {len(stop_rows)} stops / "
+                f"{len(route_rows)} routes (floors {MIN_SOURCE_STOPS}/{MIN_SOURCE_ROUTES})"
+            )
+            log.error("%s: %s — feed prune disabled", feed_id, reason)
+            refusals.append(reason)
+
+        # Merge into the accumulated feed. Rows land regardless of health —
+        # upserts are convergent and the prune is already refused above —
+        # but a genuine payload conflict also refuses the prune, loudly.
+        for accum, rows, key_column, table_name in (
+            (merged.stops, stop_rows, "stop_id", STOPS.name),
+            (merged.routes, route_rows, "route_id", ROUTES.name),
+        ):
+            deduped, conflicts = _merge_source_rows(
+                accum, rows, key_column, table_name, feed_id, url
+            )
+            stats.duplicates_deduped += deduped
+            stats.duplicate_conflicts += conflicts
+            if conflicts:
+                refusals.append(f"{conflicts} conflicting {table_name} rows from {url}")
+        # Edge rows are pure PK tuples: cross-source repeats are always
+        # identical, so union silently.
+        merged.edges.update(((row["stop_id"], row["route_id"]), row) for row in edge_rows)
+        # route_directions merge at the vote level; dominants are picked once
+        # after every source has voted, never row-level last-wins.
+        for key, counter in votes.items():
+            merged.direction_votes.setdefault(key, Counter()).update(counter)
+
+    stop_rows = list(merged.stops.values())
+    route_rows = list(merged.routes.values())
+    edge_rows = [merged.edges[key] for key in sorted(merged.edges)]
+    direction_rows = _directions_from_votes(feed_id, merged.direction_votes)
+
+    if multi_source:
+        log.info(
+            "%s: merged %d stops, %d routes, %d edges, %d route directions "
+            "from %d sources (%d failed)",
+            feed_id, len(stop_rows), len(route_rows), len(edge_rows),
+            len(direction_rows), len(sources), stats.sources_failed,
+        )
     if dry_run:
+        if refusals:
+            raise PruneRefused(f"{feed_id}: {'; '.join(refusals)}")
         return stats
 
+    prune = not refusals
     scope = {"scope_where": "feed_id = ?", "scope_params": [feed_id]}
 
     stats.stops_written = sync(client, STOPS, stop_rows, prune=False, **scope).written
     stats.routes_written = sync(client, ROUTES, route_rows, prune=False, **scope).written
-    edge_stats = sync(client, STOP_ROUTES, edge_rows, force=force, **scope)
+    edge_stats = sync(client, STOP_ROUTES, edge_rows, prune=prune, force=force, **scope)
     stats.edges_written = edge_stats.written
     stats.pruned = edge_stats.deleted
-    direction_stats = sync(client, ROUTE_DIRECTIONS, direction_rows, force=force, **scope)
+    direction_stats = sync(
+        client, ROUTE_DIRECTIONS, direction_rows, prune=prune, force=force, **scope
+    )
     stats.directions_written = direction_stats.written
     stats.pruned += direction_stats.deleted
+
+    if not prune:
+        # Upserts above all landed; leaving stale rows behind (superset) is
+        # the safe failure. Raising here rides the existing PruneRefused
+        # path so the run exits non-zero.
+        raise PruneRefused(f"{feed_id}: prune skipped after upserts — {'; '.join(refusals)}")
 
     stats.pruned += prune_only(
         client,
@@ -107,6 +222,61 @@ def run_static(
         **scope,
     )
     return stats
+
+
+def _normalized_payload(row: dict) -> tuple:
+    """Comparison view of a row: trimmed/case-folded text and 5-decimal
+    coordinates, so cross-source duplicates differing only in cosmetic noise
+    compare equal (the six bus zips are generated independently)."""
+    normalized = []
+    for column in sorted(row):
+        value = row[column]
+        if isinstance(value, str):
+            value = value.strip().casefold()
+        elif isinstance(value, float):
+            value = round(value, 5)
+        normalized.append((column, value))
+    return tuple(normalized)
+
+
+def _merge_source_rows(
+    accum: dict[str, dict],
+    rows: list[dict],
+    key_column: str,
+    table_name: str,
+    feed_id: str,
+    source: str,
+) -> tuple[int, int]:
+    """Merge one source's rows into the accumulated dict; returns
+    (deduped, conflicts). Normalized-equal duplicates dedupe silently;
+    conflicting payloads keep the first-seen row (the caller refuses the
+    feed's prune so the disagreement degrades to a loud nightly warning,
+    never a deletion or a run-killing error)."""
+    deduped = conflicts = 0
+    examples: list[str] = []
+    for row in rows:
+        key = row[key_column]
+        seen = accum.get(key)
+        if seen is None:
+            accum[key] = row
+        elif _normalized_payload(seen) == _normalized_payload(row):
+            deduped += 1
+        else:
+            conflicts += 1
+            if len(examples) < 5:
+                examples.append(key)
+    if deduped:
+        log.info(
+            "%s: %d normalized-identical duplicate %s rows from %s deduped",
+            feed_id, deduped, table_name, source,
+        )
+    if conflicts:
+        log.error(
+            "%s: %d CONFLICTING duplicate %s rows from %s (e.g. %s) — keeping "
+            "first-seen values and refusing this feed's prune",
+            feed_id, conflicts, table_name, source, examples,
+        )
+    return deduped, conflicts
 
 
 def resolve_static_url(client: D1Client | None, feed_id: str) -> str:
@@ -129,9 +299,20 @@ def resolve_static_url(client: D1Client | None, feed_id: str) -> str:
 
 
 def _fetch_zip(url: str, session: requests.Session | None) -> bytes:
-    resp = (session or requests).get(url, timeout=300)
+    """Streamed download with a hard byte cap.
+
+    The cap is counted over received bytes, not Content-Length, so a lying
+    or absent header can't sneak an unbounded body into memory.
+    """
+    resp = (session or requests).get(url, timeout=300, stream=True)
     resp.raise_for_status()
-    return resp.content
+    chunks, total = [], 0
+    for chunk in resp.iter_content(chunk_size=1 << 20):
+        total += len(chunk)
+        if total > MAX_SOURCE_BYTES:
+            raise SourceTooLarge(f"{url} exceeded {MAX_SOURCE_BYTES} bytes mid-download")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _open_member(zf: zipfile.ZipFile, name: str):
@@ -230,14 +411,14 @@ def _derive_edges(
     ]
 
 
-def _derive_route_directions(
+def _collect_direction_votes(
     zf: zipfile.ZipFile, feed_id: str
-) -> tuple[list[dict], int]:
-    """Dominant trip_headsign per (route_id, direction_id) from trips.txt.
+) -> tuple[dict[tuple[str, int], Counter], int]:
+    """Headsign vote counters per (route_id, direction_id) from trips.txt.
 
-    Counted vote with a deterministic tie-break (highest count, then
-    lexicographically smallest headsign). The result is the composition-time
-    fallback when a realtime trip's terminal is missing or unresolvable.
+    Votes stay counters here so a multi-source feed can union them across
+    sources before dominants are picked (_directions_from_votes); picking
+    per source would silently make the last source's dominant win.
     """
     votes: dict[tuple[str, int], Counter] = {}
     ns_votes: Counter = Counter()  # (direction_id, 'N'|'S') observed pairs
@@ -268,8 +449,19 @@ def _derive_route_directions(
             skipped_directionless,
         )
     _verify_ns_convention(feed_id, ns_votes)
+    return votes, skipped_directionless
 
-    rows = [
+
+def _directions_from_votes(
+    feed_id: str, votes: dict[tuple[str, int], Counter]
+) -> list[dict]:
+    """Dominant trip_headsign per (route_id, direction_id) from merged votes.
+
+    Counted vote with a deterministic tie-break (highest count, then
+    lexicographically smallest headsign). The result is the composition-time
+    fallback when a realtime trip's terminal is missing or unresolvable.
+    """
+    return [
         {
             "feed_id": feed_id,
             "route_id": route_id,
@@ -278,7 +470,6 @@ def _derive_route_directions(
         }
         for (route_id, direction_id), counter in sorted(votes.items())
     ]
-    return rows, skipped_directionless
 
 
 def _dominant(counter: Counter) -> str | None:
