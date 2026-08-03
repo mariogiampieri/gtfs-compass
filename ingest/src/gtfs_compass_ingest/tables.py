@@ -34,6 +34,7 @@ FEEDS = TableSpec(
         "updated_at",
         "direction_labels",
         "units",
+        "mode",
     ),
     pk_columns=("id",),
 )

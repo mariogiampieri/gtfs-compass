@@ -39,6 +39,7 @@ MTA_SUBWAY = CuratedFeed(
         # NYC subway platforms carry N/S suffixes mapping to direction_id 0/1.
         "direction_labels": '["Uptown","Downtown"]',
         "units": "imperial",
+        "mode": "rail",
     },
     static_ingest=True,
 )
@@ -62,6 +63,7 @@ CITIBIKE = CuratedFeed(
         "status": "active",
         "direction_labels": None,  # bikes have no directions
         "units": "imperial",
+        "mode": "bike",
     },
     static_ingest=True,
 )

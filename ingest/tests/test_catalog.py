@@ -52,6 +52,13 @@ def test_catalog_rows_carry_null_direction_labels_and_default_units():
     (feed,) = rows
     assert feed["direction_labels"] is None  # only curated rows set labels
     assert feed["units"] == "imperial"  # consistent with the curated seeds
+    assert feed["mode"] is None  # mode is curated-only; sync binds every column
+
+
+def test_curated_rows_carry_modes():
+    rows = {r["id"]: r for r in seeds.curated_rows(now=0)}
+    assert rows["mta-subway"]["mode"] == "rail"
+    assert rows["citibike"]["mode"] == "bike"
 
 
 def test_curated_direction_labels_round_trip_as_json():

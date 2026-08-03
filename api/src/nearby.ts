@@ -13,7 +13,10 @@ import { type StopGroup, nearbyStops, nearestBeyond } from "./stops";
 
 export interface FeedInfo {
   id: string;
-  adapter: string; // 'nyct' | 'gtfs_rt' | 'gbfs' | ...
+  adapter: string; // 'nyct' | 'gtfs_rt' | 'gbfs' | ... — a parsing strategy
+  /** Product surface ('rail' | 'bus' | 'bike') from feeds.mode; null falls
+   * back to adapter inference (pre-migration rows). */
+  mode: string | null;
   directionLabels: string[] | null;
   units: string | null;
 }
@@ -124,6 +127,11 @@ export interface NearbyResponse {
 }
 
 export function modeForFeed(feed: FeedInfo): (typeof MODES)[number] {
+  // Explicit mode wins (adapter describes parsing, not product surface — a
+  // bus feed parses as plain gtfs_rt); adapter inference covers null rows.
+  if (feed.mode && (MODES as readonly string[]).includes(feed.mode)) {
+    return feed.mode as (typeof MODES)[number];
+  }
   return feed.adapter === "gbfs" ? "bike" : "rail";
 }
 
@@ -196,11 +204,13 @@ async function composeRailSystem(
   limit: number,
   nowSec: number,
 ): Promise<RailSystem> {
+  // This feed's product surface: "rail" or "bus" (bike never routes here).
+  const mode = modeForFeed(feed) as "rail" | "bus";
   const units = { [feed.id]: feed.units };
   const stations = await nearbyStops(env.DB, { lat, lon, radiusM, feedIds: [feed.id], limit }, units);
   if (stations.length === 0) {
     return {
-      mode: "rail",
+      mode,
       direction_labels: feed.directionLabels,
       fetched_at: null,
       stops: [],
@@ -294,7 +304,7 @@ async function composeRailSystem(
     .map((g) => g.fetchedAt)
     .filter((t): t is number => t !== null);
   return {
-    mode: "rail",
+    mode,
     direction_labels: feed.directionLabels,
     fetched_at: stamps.length ? Math.min(...stamps) : null,
     ...(snapshots.anySourceFailed ? { partial: true as const } : {}),
