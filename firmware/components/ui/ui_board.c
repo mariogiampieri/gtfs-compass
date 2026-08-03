@@ -351,6 +351,13 @@ static void build_rows(const model_stop_t *stop, bool two_line) {
 
 /* ---------- state screens ---------- */
 
+/* Proper two-arg anim trampoline: casting the three-arg style setter into
+ * lv_anim_exec_xcb_t hands LVGL a garbage style selector (the sim froze on
+ * exactly that). */
+static void skeleton_opa_cb(void *var, int32_t v) {
+  lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+
 static void build_skeleton(void) {
   /* board bones: name bar, pill bar, 3 rows of circle+bars; opacity sweep */
   lv_obj_t *name = lv_obj_create(g_content);
@@ -386,7 +393,7 @@ static void build_skeleton(void) {
   lv_anim_set_duration(&a, 1400);
   lv_anim_set_playback_duration(&a, 1400);
   lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-  lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_obj_set_style_opa);
+  lv_anim_set_exec_cb(&a, skeleton_opa_cb);
   lv_anim_start(&a);
 }
 
