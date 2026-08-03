@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 4 M2 — touch, system carousel, detail views, bike screens, fonts"
 type: feat
-status: active
+status: completed
 date: 2026-08-03
 origin: docs/design/transit-watch-handoff.md (product source of truth) + docs/plans/01-guiding-spec.md (device fundamentals) + docs/plans/2026-08-03-002-feat-phase-4-firmware-bringup-plan.md (M1, "Deferred to Follow-Up Work → M2")
 ---
