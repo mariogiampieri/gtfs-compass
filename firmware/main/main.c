@@ -1,6 +1,10 @@
 /*
  * main.c — the M1 vertical slice (plan U5).
  *
+ * M2 U2 adds FT3168 touch (bsp_touch_new + lvgl_port_add_touch on the same
+ * bypass-aware path) and wires the ui_input gesture tracker (log-only until
+ * U3's view dispatcher consumes the callbacks).
+ *
  * Boot: display + loading skeleton immediately, console + battery, then the
  * net task. The LVGL side owns all rendering: a 250 ms queue consumer copies
  * fresh models and full-renders (jitter applies); a 1 s tick updates the
@@ -14,6 +18,7 @@
 
 #include "battery.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/touch.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -23,6 +28,7 @@
 #include "net_task.h"
 #include "nvs_flash.h"
 #include "ui.h"
+#include "ui_input.h"
 #include "wifi_creds.h"
 
 extern void gc_console_start(void); /* console.c */
@@ -201,6 +207,43 @@ static lv_display_t *gc_display_start(void) {
   return disp;
 }
 
+/*
+ * FT3168 touch (plan U2, R1). Same bypass rule as the display: never through
+ * bsp_display_start. bsp_touch_new + lvgl_port_add_touch is exactly what the
+ * BSP's own indev init does, minus the bsp_display_start wrapper — I2C probe
+ * at 0x38 via the FT5x06 driver, INT on GPIO 38 (event-mode indev), touch
+ * reset on GPIO 9 (separate from LCD reset 8; the BSP comment claiming
+ * shared is stale).
+ */
+static lv_indev_t *gc_touch_start(lv_display_t *disp) {
+  esp_lcd_touch_handle_t tp = NULL;
+  ESP_ERROR_CHECK(bsp_touch_new(NULL, &tp));
+  lv_indev_t *indev = lvgl_port_add_touch(&(lvgl_port_touch_cfg_t){.disp = disp, .handle = tp});
+  assert(indev);
+  ESP_LOGI(TAG, "touch up: FT3168 enumerated, event-mode indev registered");
+  return indev;
+}
+
+/*
+ * U2 gesture callbacks: log-only until U3's view dispatcher consumes them.
+ * on_press doubles as the raw-coordinate proof that touch works end-to-end.
+ */
+static void gc_input_press(int32_t x, int32_t y, void *user) {
+  (void)user;
+  ESP_LOGI(TAG, "input: press %ld,%ld", (long)x, (long)y);
+}
+
+static void gc_input_tap(int32_t x, int32_t y, void *user) {
+  (void)user;
+  ESP_LOGI(TAG, "input: tap %ld,%ld", (long)x, (long)y);
+}
+
+static void gc_input_swipe(ui_swipe_t dir, void *user) {
+  (void)user;
+  static const char *names[] = {"left", "right", "up", "down"};
+  ESP_LOGI(TAG, "input: swipe %s", names[dir]);
+}
+
 void app_main(void) {
   ESP_LOGI(TAG, "gtfs-compass firmware — M1 vertical slice");
   int64_t t0 = now_ms();
@@ -215,8 +258,14 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(nvs_err);
 
-  gc_display_start();
+  lv_display_t *disp = gc_display_start();
   bsp_display_backlight_on();
+  lv_indev_t *touch = gc_touch_start(disp);
+  bsp_display_lock(0);
+  ui_input_attach(touch, &(ui_input_callbacks_t){.on_press = gc_input_press,
+                                                 .on_tap = gc_input_tap,
+                                                 .on_swipe = gc_input_swipe});
+  bsp_display_unlock();
 
   g_ui_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
   assert(g_ui_model);

@@ -5,6 +5,10 @@
  *
  * Keys: 1 loading · 2 live · 3 stale · 4 offline · 5 no-location
  *       j/k next/prev stop · f toggle "now" flash · q quit
+ *
+ * Mouse (plan U2, R10): the SDL pointer drives the same LVGL indev machinery
+ * and ui_input gesture tracker the device touch uses; resolved gestures
+ * print as "input: ..." lines (U3 consumes them as navigation).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +17,7 @@
 #include "lvgl.h"
 #include "model.h"
 #include "ui.h"
+#include "ui_input.h"
 
 static model_nearby_t g_model;
 static ui_state_t g_state = {
@@ -66,6 +71,27 @@ static void key_cb(lv_event_t *e) {
   rerender();
 }
 
+/* U2: gesture debug prints, wired exactly as the device wires them (U3
+ * replaces these with view navigation). */
+static void input_press(int32_t x, int32_t y, void *user) {
+  (void)user;
+  printf("input: press %d,%d\n", (int)x, (int)y);
+  fflush(stdout);
+}
+
+static void input_tap(int32_t x, int32_t y, void *user) {
+  (void)user;
+  printf("input: tap %d,%d\n", (int)x, (int)y);
+  fflush(stdout);
+}
+
+static void input_swipe(ui_swipe_t dir, void *user) {
+  (void)user;
+  static const char *names[] = {"left", "right", "up", "down"};
+  printf("input: swipe %s\n", names[dir]);
+  fflush(stdout);
+}
+
 static void tick_timer(lv_timer_t *t) {
   (void)t;
   if (g_state.conn == UI_CONN_LIVE || g_state.conn == UI_CONN_STALE ||
@@ -94,6 +120,10 @@ int main(int argc, char **argv) {
   lv_group_t *grp = lv_group_create();
   lv_group_set_default(grp);
   lv_indev_set_group(kb, grp);
+  lv_indev_t *mouse = lv_sdl_mouse_create();
+  ui_input_attach(mouse, &(ui_input_callbacks_t){.on_press = input_press,
+                                                 .on_tap = input_tap,
+                                                 .on_swipe = input_swipe});
 
   ui_init();
   rerender();
