@@ -1,6 +1,7 @@
 import { adapterGroups } from "./adapters";
 
 export { FeedDO } from "./feed_do";
+export { GbfsDO } from "./gbfs_do";
 
 /**
  * Curated feeds reachable through the group-addressed route. The D1 feeds
