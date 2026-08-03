@@ -54,8 +54,12 @@ MAX_SOURCE_BYTES = 80 * 1024 * 1024
 # the 50% deletion guard. Staten Island, the smallest real source, carries
 # roughly 600 stops and ~30 routes. Single-source feeds keep the existing
 # sync-level guards (empty keep-set / 50% threshold).
-MIN_SOURCE_STOPS = 200
-MIN_SOURCE_ROUTES = 10
+# Calibrated against the live per-source counts (2026-08-03): the smallest
+# zips carried ~1,400 stops (Queens) and 92 routes (busco), so 500/40
+# catches a truncated-but-parseable zip at ~1/3 of the smallest healthy
+# source while leaving real publication variance ample headroom.
+MIN_SOURCE_STOPS = 500
+MIN_SOURCE_ROUTES = 40
 
 
 class SourceTooLarge(RuntimeError):
@@ -109,7 +113,8 @@ def run_static(
 
     stats = StaticStats()
     merged = _MergedFeed()
-    refusals: list[str] = []  # any entry blocks this feed's prune
+    refusals: list[str] = []  # availability/health: --force may override
+    conflict_refusals: list[str] = []  # data disagreement: never overridable
 
     for index, url in enumerate(sources):
         if index and renew_lock is not None and not renew_lock():
@@ -161,7 +166,9 @@ def run_static(
             stats.duplicates_deduped += deduped
             stats.duplicate_conflicts += conflicts
             if conflicts:
-                refusals.append(f"{conflicts} conflicting {table_name} rows from {url}")
+                conflict_refusals.append(
+                    f"{conflicts} conflicting {table_name} rows from {url}"
+                )
         # Edge rows are pure PK tuples: cross-source repeats are always
         # identical, so union silently.
         merged.edges.update(((row["stop_id"], row["route_id"]), row) for row in edge_rows)
@@ -182,12 +189,23 @@ def run_static(
             feed_id, len(stop_rows), len(route_rows), len(edge_rows),
             len(direction_rows), len(sources), stats.sources_failed,
         )
+    all_refusals = refusals + conflict_refusals
+    if force and refusals and not conflict_refusals:
+        # Operator override for a permanently-dead or hollow source (the
+        # long-term fix is a seeds.py edit): prune converges on the
+        # surviving sources. Conflicts are data disagreements and stay
+        # force-proof.
+        log.warning(
+            "%s: --force overriding %d source refusal(s); pruning on the "
+            "surviving sources", feed_id, len(refusals),
+        )
+        all_refusals = []
     if dry_run:
-        if refusals:
-            raise PruneRefused(f"{feed_id}: {'; '.join(refusals)}")
+        if all_refusals:
+            raise PruneRefused(f"{feed_id}: {'; '.join(all_refusals)}")
         return stats
 
-    prune = not refusals
+    prune = not all_refusals
     scope = {"scope_where": "feed_id = ?", "scope_params": [feed_id]}
 
     stats.stops_written = sync(client, STOPS, stop_rows, prune=False, **scope).written
@@ -205,7 +223,9 @@ def run_static(
         # Upserts above all landed; leaving stale rows behind (superset) is
         # the safe failure. Raising here rides the existing PruneRefused
         # path so the run exits non-zero.
-        raise PruneRefused(f"{feed_id}: prune skipped after upserts — {'; '.join(refusals)}")
+        raise PruneRefused(
+            f"{feed_id}: prune skipped after upserts — {'; '.join(all_refusals)}"
+        )
 
     stats.pruned += prune_only(
         client,

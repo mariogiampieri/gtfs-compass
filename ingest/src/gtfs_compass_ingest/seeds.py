@@ -70,7 +70,7 @@ MTA_BUS = CuratedFeed(
         # so the generic gtfs_rt adapter needs no new code. The key is
         # documented-required but unenforced (verified live 2026-08-03);
         # rt_needs_key drives the Worker's optional key injection.
-        "rt_trip_url": "http://gtfsrt.prod.obanyc.com/tripUpdates",
+        "rt_trip_url": "https://gtfsrt.prod.obanyc.com/tripUpdates",
         "rt_alert_url": None,  # bus alerts deferred (AlertDO can take it later)
         "rt_needs_key": 1,
         "adapter": "gtfs_rt",

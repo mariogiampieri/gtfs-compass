@@ -67,7 +67,7 @@ def test_mta_bus_seed_row_and_static_sources():
     bus = rows["mta-bus"]
     assert bus["adapter"] == "gtfs_rt"  # config-only realtime seam, no new adapter
     assert bus["rt_needs_key"] == 1
-    assert bus["rt_trip_url"] == "http://gtfsrt.prod.obanyc.com/tripUpdates"
+    assert bus["rt_trip_url"].startswith("https://")  # key must never ride cleartext
     assert bus["rt_alert_url"] is None
     assert bus["direction_labels"] is None  # device renders compass tags
     assert bus["license_url"] == "https://www.mta.info/developers"

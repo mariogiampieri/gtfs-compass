@@ -547,6 +547,35 @@ describe("FeedDO — chunked snapshot persistence", () => {
     expect(chunkKeys).toEqual([]);
   });
 
+  it("torn restore: a truncated chunk (bytes short of meta) clears and recovers", async () => {
+    const stub = stubFor("mta-bus:all#torn-short");
+    await persistIn(stub, makeSnapshot(2_600_000));
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put(`${CHUNK_PREFIX}1`, new ArrayBuffer(16)),
+    );
+
+    expect(await restoreIn(stub)).toBeNull();
+    const { meta, chunkKeys } = await storageState(stub);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+  });
+
+  it("torn restore: corrupt gzip bytes with correct lengths clears and recovers", async () => {
+    const stub = stubFor("mta-bus:all#torn-corrupt");
+    await persistIn(stub, makeSnapshot(2_600_000));
+    await runInDurableObject(stub, async (_i, state) => {
+      const original = (await state.storage.get(`${CHUNK_PREFIX}0`)) as ArrayBuffer;
+      const garbage = new Uint8Array(original.byteLength);
+      crypto.getRandomValues(garbage.subarray(0, Math.min(garbage.length, 65536)));
+      await state.storage.put(`${CHUNK_PREFIX}0`, garbage.buffer);
+    });
+
+    expect(await restoreIn(stub)).toBeNull(); // length checks pass; gunzip fails
+    const { meta, chunkKeys } = await storageState(stub);
+    expect(meta).toBeUndefined();
+    expect(chunkKeys).toEqual([]);
+  });
+
   it("splits by serialized bytes, never characters: every chunk fits the KV limit", async () => {
     const stub = stubFor("mta-bus:all#multibyte");
     // Non-ASCII-heavy payload: UTF-8 bytes ≈ 3× UTF-16 length — a char-based

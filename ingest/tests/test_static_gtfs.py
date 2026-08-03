@@ -457,6 +457,66 @@ def test_hollow_source_refuses_prune_but_upserts_land(two_source_feed, caplog, b
     assert any("hollow" in r.message for r in caplog.records)
 
 
+def test_hollow_route_operand_refuses_independently(two_source_feed, caplog):
+    # Healthy stop count, empty routes file: the route floor must fire on its
+    # own, not only alongside the stop floor.
+    client, session = multi_client()
+    http = FakeMultiHTTP(
+        {SRC_A: zip_a(), SRC_B: zip_b(routes="route_id,route_short_name,route_long_name,route_color,route_text_color,route_type\n")}
+    )
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(PruneRefused, match="hollow"):
+            run_static(client, "multi-bus", http_session=http)
+    assert delete_calls(session) == []
+
+
+def test_force_overrides_source_refusals_but_never_conflicts(two_source_feed, caplog):
+    # A permanently-dead source with --force: prune converges on survivors.
+    client, session = multi_client(
+        {"stops": [{"feed_id": "multi-bus", "stop_id": "OLD", "name": None, "lat": None,
+                    "lon": None, "parent_station": None, "capacity": None}]}
+    )
+    http = FakeMultiHTTP({SRC_A: zip_a(), SRC_B: requests.ConnectionError("boom")})
+    with caplog.at_level(logging.WARNING):
+        run_static(client, "multi-bus", http_session=http, force=True)  # no raise
+    assert any("--force overriding" in r.message for r in caplog.records)
+
+    # A genuine data conflict stays force-proof.
+    b_conflict = (
+        "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+        "B1,Somewhere Else,40.75,-73.95,,\n"
+        "Q1,Main St,40.70,-73.80,,\n"
+        "Q2,Kissena Blvd,40.7010,-73.8010,,\n"
+    )
+    client2, _ = multi_client()
+    http2 = FakeMultiHTTP({SRC_A: zip_a(), SRC_B: zip_b(stops=b_conflict)})
+    with pytest.raises(PruneRefused, match="conflicting"):
+        run_static(client2, "multi-bus", http_session=http2, force=True)
+
+
+def test_same_name_drift_tolerance_edges(two_source_feed):
+    # ~150 m with an identical name: inside the same-name allowance, dedupes.
+    near = (
+        "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+        "B1,Court St,40.69135,-73.99,,\n"
+        "Q1,Main St,40.70,-73.80,,\n"
+        "Q2,Kissena Blvd,40.7010,-73.8010,,\n"
+    )
+    client, _ = multi_client()
+    run_static(client, "multi-bus", http_session=FakeMultiHTTP({SRC_A: zip_a(), SRC_B: zip_b(stops=near)}))
+
+    # ~300 m even with an identical name: outside the allowance, a conflict.
+    far = (
+        "stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station\n"
+        "B1,Court St,40.6927,-73.99,,\n"
+        "Q1,Main St,40.70,-73.80,,\n"
+        "Q2,Kissena Blvd,40.7010,-73.8010,,\n"
+    )
+    client2, _ = multi_client()
+    with pytest.raises(PruneRefused, match="conflicting"):
+        run_static(client2, "multi-bus", http_session=FakeMultiHTTP({SRC_A: zip_a(), SRC_B: zip_b(stops=far)}))
+
+
 def test_normalized_identical_duplicate_deduped_and_counted(two_source_feed, caplog):
     # B republishes stop B1 with cosmetic noise only: spacing, case, and a
     # coordinate that rounds equal at 5 decimals.

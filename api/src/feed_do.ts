@@ -106,6 +106,7 @@ export class FeedDO extends DurableObject<Env> {
   private configMissing = false;
   private configMissingSinceMs = 0;
   private keylessWarned = false;
+  private enforcementWarned = false;
   private lastFetchKeyed = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -121,13 +122,15 @@ export class FeedDO extends DurableObject<Env> {
         "last_read",
       ]);
       const map = stored as Map<string, unknown>;
+      // Identity first: restoreChunked's failure log should carry the real
+      // feed:group tag, not "[unbound]".
+      this.identity = (map.get("identity") as DoIdentity | undefined) ?? null;
       const meta = map.get(META_KEY) as SnapshotMeta | undefined;
       if (meta) {
         this.snapshot = await this.restoreChunked(meta);
       } else {
         this.snapshot = (map.get(LEGACY_SNAPSHOT_KEY) as Snapshot | undefined) ?? null;
       }
-      this.identity = (map.get("identity") as DoIdentity | undefined) ?? null;
       this.lastReadMs = (map.get("last_read") as number | undefined) ?? 0;
       this.lastPersistedReadMs = this.lastReadMs;
     });
@@ -280,10 +283,14 @@ export class FeedDO extends DurableObject<Env> {
       if (!upstream.ok) {
         if (config.rtNeedsKey && !this.lastFetchKeyed && (upstream.status === 401 || upstream.status === 403)) {
           // Distinguishable from a transient failure: the documented key
-          // requirement has probably started being enforced.
-          console.warn(
-            `${this.tag()} keyless poll rejected (${upstream.status}) — upstream key enforcement may have begun; install RT_FEED_KEYS`,
-          );
+          // requirement has probably started being enforced. Once per DO
+          // lifetime (mirrors keylessWarned) — not once per 20 s cycle.
+          if (!this.enforcementWarned) {
+            this.enforcementWarned = true;
+            console.warn(
+              `${this.tag()} keyless poll rejected (${upstream.status}) — upstream key enforcement may have begun; install RT_FEED_KEYS`,
+            );
+          }
         } else {
           console.warn(`${this.tag()} upstream ${upstream.status}; keeping old snapshot`);
         }
