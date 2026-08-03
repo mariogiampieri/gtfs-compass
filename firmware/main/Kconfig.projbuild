@@ -1,0 +1,36 @@
+menu "gtfs-compass"
+
+    config GC_API_BASE_URL
+        string "API base URL"
+        default "https://gtfs-compass-api.mariogiampieri.workers.dev"
+        help
+            The companion Worker. The device calls POST /v1/nearby (or GET
+            with the dev fixed location below).
+
+    config GC_WIFI_SSID
+        string "Dev WiFi SSID seed (optional)"
+        default ""
+        help
+            Development convenience only: on boot, if NVS holds no
+            credentials and this is non-empty, it is written into NVS once.
+            Put real values in the gitignored sdkconfig.local, never here.
+            The runtime ONLY reads NVS — provisioning replaces the seeder,
+            not the connect path.
+
+    config GC_WIFI_PASSWORD
+        string "Dev WiFi password seed (optional)"
+        default ""
+
+    config GC_DEV_FIXED_LAT
+        string "Dev fixed latitude (optional)"
+        default ""
+        help
+            When set (with GC_DEV_FIXED_LON), the device calls GET
+            /v1/nearby?lat=&lon= and skips WiFi scanning — for testing a
+            specific station's board from anywhere (e.g. 40.692338).
+
+    config GC_DEV_FIXED_LON
+        string "Dev fixed longitude (optional)"
+        default ""
+
+endmenu

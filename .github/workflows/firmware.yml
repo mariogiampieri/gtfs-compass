@@ -1,0 +1,49 @@
+name: firmware
+
+on:
+  push:
+    paths: ["firmware/**", ".github/workflows/firmware.yml"]
+  pull_request:
+    paths: ["firmware/**", ".github/workflows/firmware.yml"]
+
+jobs:
+  host-tests:
+    # Seconds: plain cc + Unity + ASAN over the platform-free model component.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run model tests
+        run: |
+          cd firmware/test/host
+          cmake -B build -G "Unix Makefiles" .
+          cmake --build build
+          ./build/test_model
+
+  device-build:
+    # Minutes: full ESP-IDF compile in the pinned container (no hardware).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false # device build uses managed components, not the sim submodule
+      - name: ESP-IDF build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: esp32s3
+          path: firmware
+
+  sim-build:
+    # Compile-only: proves ui/ + model/ stay platform-free.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install SDL2
+        run: brew install sdl2
+      - name: Build simulator
+        run: |
+          cd firmware/sim
+          cmake -B build -G "Unix Makefiles" .
+          cmake --build build

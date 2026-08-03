@@ -7,13 +7,20 @@ any task. It is the source of truth; this file is the operating manual.
 
 ## Current scope
 
-**Implement Phases 1–3 only** (ingest + data model, feed Durable Object, read API).
+**Phases 1–3 plus the alert layer are shipped and live** (ingest + data model, feed/GBFS/alert
+Durable Objects, the `/v1/nearby` read API). **Phase 4 (firmware) is active** — plan:
+`docs/plans/2026-08-03-002-feat-phase-4-firmware-bringup-plan.md`; the design handoff
+(`docs/design/transit-watch-handoff.md`) is the product source of truth for screens, the
+guiding spec for device fundamentals (core/hal split, staleness honesty, burn-in, power model).
 
-- **Phase 4 (firmware) is out of scope for now** — Mario is still designing the device
-  interface. Do not scaffold firmware code, HAL stubs, or display work unless explicitly asked.
-- Phases 5+ (accounts, config UI) come later. Don't build ahead, but don't paint them out
-  either: the schema already includes users/devices/favorites — keep those tables and the API
-  shapes compatible with the spec so later phases slot in.
+- **Machine split:** the opti box takes API/ingest tasks (long-running background); Mario's Mac
+  takes firmware/UI work and flashing (the device connects there).
+- Phase 4 milestone 1 = read-only board against the production API. Touch/gestures/detail
+  views (M2) and the IMU wake/deep-sleep power model (M3) are explicitly deferred — don't
+  build ahead of the milestone without a plan.
+- Phases 5+ (accounts, config UI, pairing, retention purge) come later. Don't build ahead, but
+  don't paint them out either: the schema already includes users/devices/favorites — keep those
+  tables and the API shapes compatible with the spec so later phases slot in.
 
 ## Workflow — non-negotiable
 
