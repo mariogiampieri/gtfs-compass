@@ -48,16 +48,20 @@ declare global {
      */
     EMAIL_ROUTING?: SendEmailBinding;
     /**
-     * Registration allowlist (R4b), comma- or whitespace-separated. Empty means
-     * open registration; an unlisted address gets the same silent 200. Also the
-     * unconditional second condition for AUTH_EMAIL_PROVIDER=console.
+     * Registration allowlist (R4b), comma- or whitespace-separated. **Unset or
+     * empty means open sign-up — anyone on the internet can register**, which
+     * is the shipped default; an unlisted address gets the same silent 200.
+     * Also the unconditional second condition for AUTH_EMAIL_PROVIDER=console.
      */
     AUTH_ALLOWED_EMAILS?: string;
-    /** Per-address sign-in sends per UTC day (default 5). */
+    /**
+     * Per-address sign-in sends per UTC day (default 5). `0` stops sends
+     * outright — it is the kill switch, not a fall back to the default.
+     */
     AUTH_SEND_BUDGET_ADDRESS?: string;
-    /** Daily global send slice reserved for addresses with accounts (default 80). */
+    /** Daily global send slice reserved for addresses with accounts (default 80; 0 stops sends). */
     AUTH_SEND_BUDGET_KNOWN?: string;
-    /** Daily global send slice for unknown addresses (default 20). */
+    /** Daily global send slice for unknown addresses (default 20; 0 stops sends). */
     AUTH_SEND_BUDGET_UNKNOWN?: string;
     /**
      * Origin the emailed sign-in link points at, e.g. `https://compass.example`.

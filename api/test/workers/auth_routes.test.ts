@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   CSRF_HEADER,
@@ -10,7 +10,12 @@ import {
   nonceCookie,
 } from "../../src/auth";
 import { SEND_ADDRESS_SCOPE, budgetDay, readBudget } from "../../src/email";
-import { CALLBACK_PATH, MAGIC_TOKEN_TTL_S, routeAuth } from "../../src/routes/auth";
+import {
+  CALLBACK_PATH,
+  MAGIC_TOKEN_TTL_S,
+  MAX_LIVE_TOKENS_PER_ADDRESS,
+  routeAuth,
+} from "../../src/routes/auth";
 
 /**
  * /v1/auth/* — the sign-in surface (U4; R1, R2, R4, R4b, R19; AE1, AE2, AE3).
@@ -343,14 +348,23 @@ describe("POST /v1/auth/request guards", () => {
     expect(spent.token).toBeNull();
   });
 
-  it("charges the address budget once per request, repeats included", async () => {
+  it("charges the address budget once per mailed link", async () => {
     const key = await hashToken(KNOWN);
     await requestLink(KNOWN);
     expect(await readBudget(env, SEND_ADDRESS_SCOPE, key, budgetDay())).toBe(1);
     await requestLink(KNOWN);
-    // The token row is reused, but the mail is not free: the address cap is
-    // what bounds a resend loop.
+    // Each repeat inside the cap mails a real link, so it is not free: the
+    // address cap is what bounds a resend loop.
     expect(await readBudget(env, SEND_ADDRESS_SCOPE, key, budgetDay())).toBe(2);
+  });
+
+  it("addresses the allowlist refuses do not spend the global registration slice", async () => {
+    // Twenty throwaway addresses is the default unknown slice. If a refusal
+    // charges it, the next real sign-up — including the operator's own first
+    // one on a fresh deployment — is blocked until 00:00 UTC.
+    for (let i = 0; i < 20; i++) await requestLink(`throwaway${i}@example.net`);
+    const { token } = await requestLink(UNKNOWN);
+    expect(token).toBeTruthy();
   });
 
   it("mints nothing when the provider is misconfigured (U3's ordering KTD)", async () => {
@@ -418,19 +432,34 @@ describe("the magic token (R1, R4)", () => {
     expect(logs).toContain(`https://compass.example${CALLBACK_PATH}#`);
   });
 
-  it("a repeat inside the window keeps one row and does not slide the expiry", async () => {
+  it("a repeat does not invalidate the link already sitting in the inbox", async () => {
     const first = await requestLink(KNOWN);
-    const rowsBefore = await tokenRows();
     const second = await requestLink(KNOWN);
-    const rowsAfter = await tokenRows();
-
-    expect(rowsAfter).toHaveLength(1);
-    expect(rowsAfter[0].id).toBe(rowsBefore[0].id);
-    expect(rowsAfter[0].expires_at).toBe(rowsBefore[0].expires_at);
-    // The mailed secret is fresh (the old one is unrecoverable by design), and
-    // the old link is dead — one live link per address.
     expect(second.token).not.toBe(first.token);
-    expect(rowsAfter[0].token_hash).toBe(await hashToken(second.token!));
+    // Two rows, each with its own unslid expiry: an unauthenticated POST must
+    // not be able to destroy a link somebody else is holding.
+    const rows = await tokenRows();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.expires_at)).toEqual(rows.map((r) => (r.created_at as number) + MAGIC_TOKEN_TTL_S));
+
+    const { res } = await call(redeem(first.token, { cookies: { [NONCE_COOKIE]: first.nonce } }));
+    expect(res.status).toBe(200);
+  });
+
+  it("caps concurrently-live links per address, and a capped repeat spends no budget", async () => {
+    const key = await hashToken(KNOWN);
+    const cap = MAX_LIVE_TOKENS_PER_ADDRESS;
+    for (let i = 0; i < cap; i++) expect((await requestLink(KNOWN)).token).toBeTruthy();
+    expect(await tokenRows()).toHaveLength(cap);
+    expect(await readBudget(env, SEND_ADDRESS_SCOPE, key, budgetDay())).toBe(cap);
+
+    const capped = await requestLink(KNOWN);
+    expect(capped.res.status).toBe(200); // R2: still the one answer
+    expect(capped.token).toBeNull();
+    expect(await tokenRows()).toHaveLength(cap);
+    // The whole point: a third party cannot burn a named user's daily
+    // allowance by hammering the route.
+    expect(await readBudget(env, SEND_ADDRESS_SCOPE, key, budgetDay())).toBe(cap);
   });
 
   it("keeps separate rows for separate addresses", async () => {
@@ -574,6 +603,81 @@ describe("POST /v1/auth/redeem", () => {
       .bind(await hashToken(old.token))
       .first();
     expect(survivor).toBeNull();
+  });
+
+  it("rotates the same account's session, carrying the 180-day anchor forward", async () => {
+    const old = await mintSession(e(), "usr_known");
+    const anchor = nowSec() - 100 * 86_400;
+    await env.DB.prepare("UPDATE sessions SET created_at = ?1 WHERE id = ?2")
+      .bind(anchor, old.sessionId)
+      .run();
+
+    const { token, nonce } = await requestLink(KNOWN);
+    const { res } = await call(
+      redeem(token, { cookies: { [NONCE_COOKIE]: nonce, [SESSION_COOKIE]: old.token } }),
+    );
+    expect(res.status).toBe(200);
+
+    const rows = await env.DB.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>();
+    expect(rows!.n).toBe(1); // one batch, one survivor
+    const session = res.headers.getSetCookie().find((c) => c.startsWith(`${SESSION_COOKIE}=`))!;
+    const fresh = session.split(";")[0].split("=")[1];
+    const row = await env.DB.prepare("SELECT created_at FROM sessions WHERE token_hash = ?1")
+      .bind(await hashToken(fresh))
+      .first<{ created_at: number }>();
+    // Re-authenticating must not reset the absolute cap of a session that is
+    // continuing in the same browser.
+    expect(row!.created_at).toBe(anchor);
+  });
+
+  it("a session belonging to a different account is destroyed, not rotated", async () => {
+    await env.DB.prepare("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+      .bind("usr_other", "other@example.com", nowSec())
+      .run();
+    const other = await mintSession(e(), "usr_other");
+    const anchor = nowSec() - 100 * 86_400;
+    await env.DB.prepare("UPDATE sessions SET created_at = ?1 WHERE id = ?2")
+      .bind(anchor, other.sessionId)
+      .run();
+
+    const { token, nonce } = await requestLink(KNOWN);
+    const { res } = await call(
+      redeem(token, { cookies: { [NONCE_COOKIE]: nonce, [SESSION_COOKIE]: other.token } }),
+    );
+    expect(res.status).toBe(200);
+    expect(
+      await env.DB.prepare("SELECT id FROM sessions WHERE token_hash = ?1")
+        .bind(await hashToken(other.token))
+        .first(),
+    ).toBeNull();
+    const session = res.headers.getSetCookie().find((c) => c.startsWith(`${SESSION_COOKIE}=`))!;
+    const row = await env.DB.prepare(
+      "SELECT user_id, created_at FROM sessions WHERE token_hash = ?1",
+    )
+      .bind(await hashToken(session.split(";")[0].split("=")[1]))
+      .first<{ user_id: string; created_at: number }>();
+    expect(row!.user_id).toBe("usr_known");
+    expect(row!.created_at).toBeGreaterThan(anchor); // a new account, a new anchor
+  });
+
+  it("warns on account creation when the allowlist is empty (open sign-up)", async () => {
+    const { token, nonce } = await requestLink(UNKNOWN);
+    const warnings: string[] = [];
+    const spy = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    });
+    try {
+      const { res } = await call(
+        redeem(token, { cookies: { [NONCE_COOKIE]: nonce } }),
+        e({ AUTH_ALLOWED_EMAILS: "" }),
+      );
+      expect(res.status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+    // Open registration is the specified behavior, not a bug — but it must not
+    // be silent, because it is also what an accidentally-cleared var looks like.
+    expect(warnings.join("\n")).toContain("AUTH_ALLOWED_EMAILS");
   });
 
   it("rejects a cross-site POST of an attacker's token on the missing header (AE3)", async () => {

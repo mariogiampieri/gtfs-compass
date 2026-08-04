@@ -28,6 +28,15 @@ export const DIST_DIR = path.join(here, "dist");
 const REQUIRED = ["index.html", "app.js", "styles.css", "_headers", "manifest.webmanifest"];
 
 /**
+ * Extensions the R19 audit reads. Not just `.html`: everything in `src/` is
+ * copied verbatim to `dist/` and served statically, so any of these is a
+ * document a browser can navigate to directly — `icon.svg` at `/icon.svg`
+ * today, and whatever `.htm`/`.xhtml` a later unit adds without anyone
+ * revisiting this list.
+ */
+const AUDITED_EXTENSIONS = [".html", ".htm", ".xhtml", ".svg"];
+
+/**
  * Static-asset delivery cannot carry a per-request nonce, so `script-src
  * 'self'` / `style-src 'self'` is the whole policy — anything inline is simply
  * dead on arrival in the browser, silently. Failing the build is the only way
@@ -73,7 +82,7 @@ export async function build() {
 
   const violations = [];
   for (const rel of emitted) {
-    if (!rel.endsWith(".html")) continue;
+    if (!AUDITED_EXTENSIONS.some((ext) => rel.endsWith(ext))) continue;
     for (const problem of auditHtml(await readFile(path.join(DIST_DIR, rel), "utf8"))) {
       violations.push(`${rel}: ${problem}`);
     }

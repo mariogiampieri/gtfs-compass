@@ -10,16 +10,20 @@
  * `LOCATE_LOG_RETENTION_DAYS` the row goes. The same run sweeps the tables
  * nothing else bounds: expired `magic_tokens` and `pairing_codes` (`pair/start`
  * is unauthenticated, so an attacker chooses that table's growth rate),
- * yesterday's `auth_budgets` shards, and `device_fixes` older than the precise
- * window — a metre-accurate GPS fix is the most precise location this system
- * stores and must not be the one location table with no expiry at all.
+ * expired `sessions` (closing a browser tab is not a sign-out; nothing but
+ * this sweep bounds a table every sign-in mints a row into), yesterday's
+ * `auth_budgets` shards — except `scope = 'send:failure'`, retained past its
+ * day because it is the only durable signal that a Resend outage happened —
+ * and `device_fixes` older than the precise window — a metre-accurate GPS fix
+ * is the most precise location this system stores and must not be the one
+ * location table with no expiry at all.
  *
  * A Cron Trigger rather than a DO alarm: there is no polling loop and no
  * per-object state here, and the alarm-loop discipline in `do_shared.ts` exists
  * for a different shape.
  */
 
-import { budgetDay } from "./email";
+import { SEND_FAILURE_SCOPE, budgetDay } from "./email";
 import { intVar } from "./locate";
 
 /** The single `maintenance_runs.job` key this module owns. */
@@ -42,6 +46,7 @@ export interface PurgeCounts {
   device_fixes_deleted: number;
   magic_tokens_deleted: number;
   pairing_codes_deleted: number;
+  sessions_deleted: number;
   auth_budgets_deleted: number;
 }
 
@@ -199,15 +204,31 @@ export async function runRetentionPurge(env: Env, nowMs: number = Date.now()): P
     [nowS],
   );
 
+  // Sessions: `revokeSession` fires only on explicit sign-out, so a user who
+  // just closes the browser leaves a row forever without this phase. `NULL`
+  // reads as expired for the same reason the locate_log predicates treat an
+  // untimestamped row as out-of-window — it is also where NULLs already sort
+  // in idx_sessions_expires_at, so the seek stays cheap.
+  const sessionsDeleted = await phase(
+    `DELETE FROM sessions
+      WHERE id IN (SELECT id FROM sessions
+                    WHERE expires_at IS NULL OR expires_at < ?1
+                    ORDER BY expires_at LIMIT ?2)`,
+    [nowS],
+  );
+
   // Budget shards are keyed by UTC day; anything before today is dead weight.
   // Strictly `<` today, computed exactly as email.ts computes the day it
   // writes, so a purge running at 00:00 UTC cannot delete a live counter.
+  // `send:failure` is excluded: it is the only durable record that a Resend
+  // outage happened, and this same purge deleting it at 03:47 UTC the morning
+  // after would erase the signal before an operator ever saw it.
   const budgetsDeleted = await phase(
     `DELETE FROM auth_budgets
       WHERE rowid IN (SELECT rowid FROM auth_budgets
-                       WHERE day < ?1
-                       ORDER BY day LIMIT ?2)`,
-    [budgetDay(nowMs)],
+                       WHERE day < ?1 AND scope != ?2
+                       ORDER BY day LIMIT ?3)`,
+    [budgetDay(nowMs), SEND_FAILURE_SCOPE],
   );
 
   const counts: PurgeCounts = {
@@ -216,6 +237,7 @@ export async function runRetentionPurge(env: Env, nowMs: number = Date.now()): P
     device_fixes_deleted: fixesDeleted,
     magic_tokens_deleted: magicDeleted,
     pairing_codes_deleted: pairingDeleted,
+    sessions_deleted: sessionsDeleted,
     auth_budgets_deleted: budgetsDeleted,
   };
   const result: PurgeResult = {

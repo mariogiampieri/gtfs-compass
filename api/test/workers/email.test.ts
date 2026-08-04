@@ -6,13 +6,13 @@ import {
   BUDGET_SHARDS,
   EmailConfigError,
   EmailSendError,
+  REFUSED_SCOPE_SUFFIX,
   SEND_ADDRESS_SCOPE,
   SEND_FAILURE_SCOPE,
   SEND_GLOBAL_KNOWN_SCOPE,
   SEND_GLOBAL_UNKNOWN_SCOPE,
   budgetDay,
   buildMime,
-  chargeBudget,
   chargeSendBudget,
   deliver,
   incrementBudget,
@@ -397,14 +397,15 @@ describe("sharded budgets", () => {
     expect(await readBudget(env as unknown as Env, "t:scope", "k")).toBe(0);
   });
 
-  it("chargeBudget admits up to the limit, then refuses and writes nothing", async () => {
+  it("charging admits up to the limit, then refuses and writes nothing", async () => {
+    const target = e({ AUTH_SEND_BUDGET_ADDRESS: "3", AUTH_SEND_BUDGET_KNOWN: "100" });
     for (let i = 0; i < 3; i++) {
-      expect(await chargeBudget(env as unknown as Env, "t:scope", "k", 3)).toBe(true);
+      expect((await chargeSendBudget(target, KNOWN, { known: true })).allowed).toBe(true);
     }
-    expect(await chargeBudget(env as unknown as Env, "t:scope", "k", 3)).toBe(false);
-    expect(await readBudget(env as unknown as Env, "t:scope", "k")).toBe(3);
-    // A zero or negative limit refuses rather than dividing by the shard count.
-    expect(await chargeBudget(env as unknown as Env, "t:other", "k", 0)).toBe(false);
+    expect((await chargeSendBudget(target, KNOWN, { known: true })).allowed).toBe(false);
+    expect(await readBudget(target, SEND_ADDRESS_SCOPE, await hashToken("mario@example.com"))).toBe(
+      3,
+    );
   });
 });
 
@@ -504,6 +505,87 @@ describe("the send budget (R4)", () => {
     // Byte-identical SQL, same count, same order: the slice travels as a *bound
     // value*, never as a different query or an extra one. That is the single
     // difference R4 requires and R2 permits.
+    expect(seen[1]).toEqual(seen[0]);
+  });
+
+  it("a spent global slice refuses before the per-address counter writes a row", async () => {
+    // The address key is attacker-chosen and unbounded, so charging it ahead of
+    // the global slice would let an unauthenticated caller mint one persisted
+    // D1 row per unique address forever — long after the daily cap on *emails*
+    // was spent. The global read has to come first or the cap bounds nothing.
+    const target = budgetEnv({ AUTH_SEND_BUDGET_ADDRESS: "5", AUTH_SEND_BUDGET_UNKNOWN: "1" });
+    expect((await chargeSendBudget(target, "first@example.net", { known: false })).allowed).toBe(
+      true,
+    );
+    const before = await env.DB.prepare("SELECT COUNT(*) AS n FROM auth_budgets").first<{
+      n: number;
+    }>();
+
+    for (let i = 0; i < 40; i++) {
+      const decision = await chargeSendBudget(target, `spray${i}@example.net`, { known: false });
+      expect(decision).toEqual({ allowed: false, slice: "unknown", refusedBy: "global" });
+    }
+    const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM auth_budgets").first<{
+      n: number;
+    }>();
+    expect(after!.n).toBe(before!.n);
+  });
+
+  it("a limit of 0 is an operator kill switch, not a fall back to the default", async () => {
+    const stopped = budgetEnv({ AUTH_SEND_BUDGET_UNKNOWN: "0" });
+    expect(await chargeSendBudget(stopped, UNKNOWN, { known: false })).toEqual({
+      allowed: false,
+      slice: "unknown",
+      refusedBy: "global",
+    });
+    expect(await chargeSendBudget(budgetEnv({ AUTH_SEND_BUDGET_ADDRESS: "0" }), KNOWN, {
+      known: true,
+    })).toEqual({ allowed: false, slice: "known", refusedBy: "address" });
+    const rows = await env.DB.prepare("SELECT COUNT(*) AS n FROM auth_budgets").first<{ n: number }>();
+    expect(rows!.n).toBe(0);
+
+    // Malformed config is the case the default exists for; 0 is not malformed.
+    for (const raw of ["-1", "abc", "1.5", ""]) {
+      expect(
+        (await chargeSendBudget(budgetEnv({ AUTH_SEND_BUDGET_UNKNOWN: raw }), `n${raw}@x.example`, {
+          known: false,
+        })).allowed,
+      ).toBe(true);
+    }
+  });
+
+  it("a charge that will never be mailed spends a parallel counter, not the live slice", async () => {
+    const target = budgetEnv();
+    const decision = await chargeSendBudget(target, UNKNOWN, { known: false, deliverable: false });
+    expect(decision.allowed).toBe(true); // the caller still gets a decision, not an error
+    // Neither live counter moved, so a refused address cannot spend the slice
+    // that bounds real registrations.
+    expect(await readBudget(target, SEND_GLOBAL_UNKNOWN_SCOPE, "")).toBe(0);
+    expect(await readBudget(target, SEND_ADDRESS_SCOPE, await hashToken(UNKNOWN))).toBe(0);
+    // It is charged on the parallel counters, so the statement shape and the
+    // D1 write count are the same as a deliverable request's.
+    expect(
+      await readBudget(target, SEND_GLOBAL_UNKNOWN_SCOPE + REFUSED_SCOPE_SUFFIX, ""),
+    ).toBe(1);
+    expect(
+      await readBudget(target, SEND_ADDRESS_SCOPE + REFUSED_SCOPE_SUFFIX, await hashToken(UNKNOWN)),
+    ).toBe(1);
+  });
+
+  it("issues the same queries whether or not the charge is deliverable", async () => {
+    const seen: string[][] = [];
+    const recorder = {
+      prepare: (query: string) => {
+        seen[seen.length - 1].push(query);
+        return env.DB.prepare(query);
+      },
+    };
+    const target = budgetEnv({ DB: recorder });
+
+    seen.push([]);
+    await chargeSendBudget(target, "listed@example.com", { known: false, deliverable: true });
+    seen.push([]);
+    await chargeSendBudget(target, "unlisted@example.net", { known: false, deliverable: false });
     expect(seen[1]).toEqual(seen[0]);
   });
 

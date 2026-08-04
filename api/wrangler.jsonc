@@ -27,7 +27,12 @@
     // which fails on both counts if this line is removed. The workerd test
     // pool cannot see any of this: SELF.fetch() there bypasses the asset
     // router entirely.
-    "run_worker_first": ["/v1/*", "/internal/*"]
+    //
+    // The bare namespace roots are listed separately from their `/*` globs
+    // (F11, verified empirically): `/v1/*` does not match `/v1` with no
+    // trailing segment, so without these two entries a bare `GET /v1` or
+    // `GET /internal` fell through to the SPA shell's HTML 200.
+    "run_worker_first": ["/v1/*", "/v1", "/internal/*", "/internal"]
   },
   // Retention purge (R20), api/src/retention.ts. Daily is the right cadence:
   // the windows are 14 and 90 days, so an hourly sweep would buy nothing but

@@ -1,8 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { DIST_DIR, auditHtml, build } from "../build.mjs";
+import { DIST_DIR, SRC_DIR, auditHtml, build } from "../build.mjs";
 
 /** @type {{files: string[]}} */
 let output;
@@ -66,4 +66,31 @@ describe("config-ui build output", () => {
       expect(url).not.toMatch(/https?:\/\//);
     }
   });
+});
+
+describe("R19 gate covers every navigable output type, not just .html (F10)", () => {
+  // icon.svg is served at /icon.svg and is a document a browser can navigate
+  // to directly, same as index.html — the audit that gated only .html would
+  // never see a violation planted here, or in a future .htm/.xhtml file.
+  const PROBE_BASENAME = "_r19_probe";
+  const EXTENSIONS = [".html", ".htm", ".xhtml", ".svg"];
+
+  afterEach(async () => {
+    for (const ext of EXTENSIONS) {
+      await rm(path.join(SRC_DIR, `${PROBE_BASENAME}${ext}`), { force: true });
+    }
+    // Restore dist to the clean state the earlier tests in this file assumed,
+    // in case a later suite (or a re-run) reads it after this one.
+    await build();
+  });
+
+  for (const ext of EXTENSIONS) {
+    it(`fails the build on an inline <script> planted in a ${ext} file`, async () => {
+      await writeFile(
+        path.join(SRC_DIR, `${PROBE_BASENAME}${ext}`),
+        "<script>alert(1)</script>\n",
+      );
+      await expect(build()).rejects.toThrow(/R19/);
+    });
+  }
 });

@@ -471,15 +471,24 @@ Requesting a link requires a configured mail provider — set
 prints tokens. For local work, `AUTH_EMAIL_PROVIDER=console` prints the link
 to the Worker log and refuses to start without an `AUTH_ALLOWED_EMAILS` list.
 
-**Registration is allowlist-gated by default.** Only addresses in
-`AUTH_ALLOWED_EMAILS` can receive a link; clearing the variable is the
-deliberate opt-in to open sign-up. An address that is not on the list gets
-the same `200 {"ok":true}` as one that is — the response never reveals
-whether an address has an account, is on the allowlist, or has exhausted its
-daily send budget.
+**Out of the box, sign-up is open to the internet.** `AUTH_ALLOWED_EMAILS`
+ships unset, and an empty allowlist means anyone who can reach the Worker can
+register — a deliberate opt-in, and almost certainly not what you want on a
+personal deployment. Set it to your own address before you deploy. Every
+account created under an empty allowlist logs a warning, so `wrangler tail`
+will tell you if you got there by accident. Once it is set, only listed
+addresses can receive a link; an address that is not on the list gets the
+same `200 {"ok":true}` as one that is — the response never reveals whether an
+address has an account, is on the allowlist, or has exhausted its daily send
+budget.
 
-Three details are load-bearing and easy to undo by accident:
+Four details are load-bearing and easy to undo by accident:
 
+- **Asking again never kills the link you already have.** An address may hold
+  up to three un-redeemed links at once, each with its own untouched
+  ten-minute expiry; past that a repeat mails nothing and costs nothing.
+  Re-issuing the secret on the live row instead would let any anonymous `POST`
+  invalidate the link sitting in somebody else's inbox.
 - **The token rides in the URL fragment**, so it is never in a request line,
   a query string, a `Referer`, or a server log. The interstitial reads
   `location.hash`, strips it from the address bar, and `POST`s it.
@@ -526,6 +535,13 @@ The split is deliberate: the question these diagnostic rows exist to answer —
 the metrics, not by the position, so the movement history ages out roughly six
 times faster than the residual measurements. The same run sweeps expired
 sign-in tokens, expired pairing codes, and yesterday's rate-limit counters.
+
+The sweep also covers expired `sessions` — closing a browser tab is not a
+sign-out, so nothing else bounds that table — and it deliberately **excludes**
+`auth_budgets` rows scoped `send:failure` from the daily counter cleanup: that
+scope is the only durable record that a mail-provider outage happened, and
+letting the next purge tick erase it would destroy the signal before an
+operator ever saw it.
 
 Every run is recorded, including one that finds nothing to do — otherwise
 "no rows deleted lately" is indistinguishable from a dead cron:

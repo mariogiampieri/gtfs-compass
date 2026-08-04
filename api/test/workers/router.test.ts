@@ -127,6 +127,38 @@ describe("router", () => {
   });
 });
 
+describe("the /v1/auth/* bucket", () => {
+  // Deliberately identity-and-isolation assertions, not refill timing: this
+  // repo has been broken twice by tests racing a token-bucket refill window.
+  // At 0.2 tokens/sec a whole suite could run inside one refill tick, so
+  // nothing here depends on how long the loop below takes.
+  const authGet = (ip: string) =>
+    SELF.fetch("https://api.example/v1/auth/mode", { headers: { "CF-Connecting-IP": ip } });
+
+  it("routes /v1/auth/* through the Worker at all", async () => {
+    const res = await authGet("198.51.100.201");
+    expect(res.status).toBe(200);
+    expect(await res.json<any>()).toHaveProperty("auth_mode");
+  });
+
+  it("429s past the burst, on its own bucket, per IP", async () => {
+    const ip = "198.51.100.202";
+    const statuses: number[] = [];
+    for (let i = 0; i < 20; i++) statuses.push((await authGet(ip)).status);
+    // Capacity is 10; refill can only ever *add* tokens, so "the first ten are
+    // served" and "something in twenty is refused" both hold however slow the
+    // machine is.
+    expect(statuses.slice(0, 10).every((s) => s === 200)).toBe(true);
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
+
+    // Same IP, different prefix: separate bucket map, so the auth burst has
+    // not spent the general limiter (and vice versa).
+    expect((await get("/internal/mta-subway/zzz/stop/X", ip)).status).toBe(404);
+    // A different IP is untouched — the bucket is keyed, not global.
+    expect((await authGet("198.51.100.203")).status).toBe(200);
+  });
+});
+
 describe("rateLimited refill math", () => {
   it("refills tokens over time at the configured rate", async () => {
     const { rateLimited } = await import("../../src/index");

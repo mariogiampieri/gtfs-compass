@@ -252,6 +252,50 @@ describe("sliding renewal", () => {
     expect(after.created_at).toBe(seeded.created_at); // absolute anchor untouched
   });
 
+  it("hands the response path a refreshed cookie, so the window slides for the browser too", async () => {
+    const minted = await mintSession(env, USER);
+    const before = (await sessionRow(minted.token))!;
+    await backdate(minted.token, {
+      createdAt: before.created_at - 16 * DAY_S,
+      expiresAt: before.expires_at - 16 * DAY_S,
+      lastUsedAt: before.last_used_at! - 16 * DAY_S,
+    });
+    // The D1 row sliding is invisible to the browser: its Max-Age was fixed at
+    // mint, so without a re-issued cookie a user active every day is still
+    // hard-logged-out on day 30 and the 180-day cap is unreachable.
+    const result = (await authorize(req("/v1/config", { cookies: jar(minted.token) }), env)) as {
+      refresh: string | null;
+    };
+    expect(result.refresh).toBeTruthy();
+    expect(result.refresh).toContain(`${SESSION_COOKIE}=${minted.token}`);
+    const maxAge = Number(result.refresh!.match(/Max-Age=(\d+)/)![1]);
+    expect(maxAge).toBeGreaterThan(29 * DAY_S);
+    expect(maxAge).toBeLessThanOrEqual(30 * DAY_S);
+  });
+
+  it("offers no refresh before the half-life — nothing was renewed", async () => {
+    const minted = await mintSession(env, USER);
+    const result = (await authorize(req("/v1/config", { cookies: jar(minted.token) }), env)) as {
+      refresh: string | null;
+    };
+    expect(result.refresh).toBeNull();
+  });
+
+  it("writes nothing when the renewed expiry equals the stored one (at the cap)", async () => {
+    const minted = await mintSession(env, USER);
+    // Pinned to the absolute cap: `Math.min` cannot move expires_at any more,
+    // but the half-life condition stays permanently true, so an unconditional
+    // UPDATE rewrites an identical row on every single request.
+    const createdAt = nowSec() - 179 * DAY_S;
+    await backdate(minted.token, { createdAt, expiresAt: createdAt + 180 * DAY_S, lastUsedAt: 1 });
+    const seeded = (await sessionRow(minted.token))!;
+    const cred = await validateSession(env, minted.token);
+    expect(cred).toMatchObject({ userId: USER });
+    const after = (await sessionRow(minted.token))!;
+    expect(after.expires_at).toBe(seeded.expires_at);
+    expect(after.last_used_at).toBe(seeded.last_used_at); // the row was not touched
+  });
+
   it("renewal never pushes expires_at past the absolute cap", async () => {
     const minted = await mintSession(env, USER);
     const createdAt = nowSec() - 175 * DAY_S;
@@ -285,6 +329,16 @@ describe("rotation and revocation", () => {
     const row = (await sessionRow(rotated!.token))!;
     expect(row.created_at).toBe(createdAt);
     expect(row.expires_at).toBeLessThanOrEqual(createdAt + 180 * DAY_S);
+  });
+
+  it("refuses to rotate a session belonging to a different user", async () => {
+    // Redemption is the caller: the cookie already in the browser may belong to
+    // somebody else entirely, and carrying *their* created_at anchor onto the
+    // new account's session would be a rotation of the wrong thing.
+    const other = await mintSession(env, "usr_other");
+    expect(await rotateSession(env, other.token, { userId: USER })).toBeNull();
+    expect(await validateSession(env, other.token)).toMatchObject({ userId: "usr_other" });
+    expect(await rotateSession(env, other.token, { userId: "usr_other" })).not.toBeNull();
   });
 
   it("rotating an unknown or expired token returns null and mints nothing", async () => {
@@ -403,6 +457,17 @@ describe("the redeem nonce cookie", () => {
     expect(clearedNonceCookie()).toMatch(/Max-Age=0/);
     expect(readNonceCookie(req("/", { cookies: { [NONCE_COOKIE]: "abc123" } }))).toBe("abc123");
     expect(readNonceCookie(req("/"))).toBeNull();
+  });
+
+  it("keeps scanning past an empty duplicate of the same cookie name", async () => {
+    // A cleared cookie from a wider path and a live one can both be in the
+    // header; abandoning the scan on the first empty value throws the live one
+    // away and logs the user out.
+    const minted = await mintSession(env, USER);
+    const request = new Request(`${ORIGIN}/v1/config`, {
+      headers: { Cookie: `${SESSION_COOKIE}=; ${SESSION_COOKIE}=${minted.token}` },
+    });
+    expect(await resolveCredential(request, env)).toMatchObject({ userId: USER });
   });
 });
 

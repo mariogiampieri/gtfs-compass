@@ -125,6 +125,23 @@ describe("static assets in front of the API", () => {
     expect(await res.json()).toEqual({ error: "not found" });
   });
 
+  // F11: the bare namespace root, with no trailing segment at all — distinct
+  // from `/v1/does-not-exist` above, which the `/v1/*` glob is unambiguously
+  // written to cover. Settled empirically rather than assumed, because a glob
+  // that requires a trailing segment would let exactly this path fall through
+  // to the SPA shell's HTML 200, the failure this whole suite exists to catch.
+  it("answers the bare /v1 root with JSON, never the SPA shell", async () => {
+    const res = await fetch(`${BASE}/v1`);
+    expect(res.headers.get("content-type")).toMatch(/application\/json/);
+    expect(res.status).not.toBe(200);
+  });
+
+  it("answers the bare /internal root with JSON, never the SPA shell", async () => {
+    const res = await fetch(`${BASE}/internal`);
+    expect(res.headers.get("content-type")).toMatch(/application\/json/);
+    expect(res.status).not.toBe(200);
+  });
+
   it("serves the auth interstitial from the Worker, with a per-request CSP nonce", async () => {
     // R19's reason for putting the callback under /v1/: `run_worker_first`
     // already covers it, so the asset router cannot answer it with the SPA

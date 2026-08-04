@@ -16,11 +16,24 @@
  *     issues the same statements in the same order for a known address, an
  *     unknown one, and one the allowlist refuses; the response is a fixed byte
  *     string with a fixed header set. The only per-request variation is the
- *     random nonce cookie value, which is random for everybody. The one thing
- *     that does vary is whether a `magic_tokens` row is written — R4b requires
- *     exactly that ("no row created") — so the residual signal is the timing of
- *     one D1 insert, and it discloses allowlist membership rather than account
- *     existence. Accepted deliberately; see the KTD note on `handleRequest`.
+ *     random nonce cookie value, which is random for everybody. What varies is
+ *     whether writes happen at all, and that leaks two things, both accepted
+ *     deliberately (see the KTD note on `handleRequest`):
+ *
+ *       - **Allowlist membership.** R4b requires "no row created" for a refused
+ *         address, so a refusal skips the `magic_tokens` insert. The residual
+ *         signal is the timing of one D1 write.
+ *       - **Account existence, but only once a global slice is exhausted.**
+ *         R4's reserved-slice split is what makes this unavoidable: the whole
+ *         point is that known and unknown addresses are refused *at different
+ *         thresholds*, so an attacker who spends the unknown slice can then
+ *         distinguish the two classes by whether the request still writes.
+ *         R2 and R4 are in genuine tension here and R4 wins — a spraying
+ *         attacker locking every existing user out of sign-in is a worse
+ *         outcome than a timing oracle that costs the attacker the whole
+ *         unknown slice to open and closes again at 00:00 UTC. Collapsing the
+ *         slices into one counter would close the oracle and reopen the
+ *         lockout.
  *
  *  2. **The emailed secret is never in a URL path, query string, referrer, or
  *     server log.** It rides in the fragment (R1), which no HTTP request
@@ -51,6 +64,7 @@ import {
   readNonceCookie,
   readSessionCookie,
   revokeSession,
+  rotateSession,
 } from "../auth";
 import {
   EmailConfigError,
@@ -59,12 +73,27 @@ import {
   isAllowedRecipient,
   magicLinkMessage,
   normalizeEmail,
+  parseAllowlist,
   selectSender,
   type EmailDeps,
 } from "../email";
 
 /** ASVS 6.5.5: a sign-in link is good for ten minutes and no longer. */
 export const MAGIC_TOKEN_TTL_S = 600;
+
+/**
+ * How many un-redeemed links one address may hold at once.
+ *
+ * The number exists because the obvious alternative — rewriting the live row's
+ * `token_hash` on a repeat — hands any unauthenticated caller a way to destroy
+ * the link already sitting in a named user's inbox, and to do it as often as
+ * they like. Minting alongside instead means a repeat is *additive*: the
+ * mailed link a user is holding always stays redeemable. Three is enough for
+ * "it did not arrive, send another" across two devices and small enough that
+ * the row is not a mail-bomb amplifier; past it a repeat is free and mints
+ * nothing, so a third party cannot spend a victim's daily send budget either.
+ */
+export const MAX_LIVE_TOKENS_PER_ADDRESS = 3;
 
 /**
  * The interstitial's path. Under `/v1/` on purpose: `wrangler.jsonc` already
@@ -169,44 +198,48 @@ function acknowledged(nonce: string): Response {
   });
 }
 
+/** How many un-redeemed, unexpired links this address is holding right now. */
+async function countLiveTokens(env: Env, email: string, now: number): Promise<number> {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM magic_tokens WHERE email = ?1 AND used_at IS NULL AND expires_at > ?2",
+  )
+    .bind(email, now)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
 /**
- * Mint the link secret and park its hash.
+ * Mint the link secret and park its hash on a row of its own.
  *
  * R4 asks that a repeat inside the window "resend the existing token". R1's
  * hash-at-rest makes the literal reading impossible — we destroyed the
  * plaintext on purpose and cannot mail back a secret we no longer hold — so
- * what is preserved is the property the requirement is protecting: **one live
- * link per address, on one row, whose expiry does not slide.** A repeat
- * rewrites the live row's `token_hash` and `nonce_hash` in place, keeping
- * `created_at`/`expires_at`, so the previously mailed link stops working and no
- * amount of clicking "resend" walks a link past ten minutes. Fresh minting
- * still costs a send-budget unit — the budget counts emails, and the address
- * cap is what bounds a mail-bomb.
- *
- * The subquery pins the UPDATE to exactly one row: writing the same
- * `token_hash` to two rows would collide on `idx_magic_tokens_token_hash`.
+ * what is preserved is the property the requirement is protecting: **a bounded
+ * number of live links per address, none of whose expiries slide.** Every row
+ * carries its own `created_at`/`expires_at` and is never rewritten, so no
+ * amount of clicking "resend" walks a link past ten minutes and no request can
+ * invalidate a link somebody else is holding. `MAX_LIVE_TOKENS_PER_ADDRESS` is
+ * the bound; the caller checks it before spending any budget.
  */
-async function issueMagicToken(env: Env, email: string, nonce: string): Promise<string> {
+async function issueMagicToken(
+  env: Env,
+  email: string,
+  nonce: string,
+  now: number,
+): Promise<string> {
   const token = randomToken(); // 16 bytes = the >=128 bits R1 requires
-  const tokenHash = await hashToken(token);
-  const nonceHash = await hashToken(nonce);
-  const now = nowS();
-
-  const refreshed = await env.DB.prepare(
-    `UPDATE magic_tokens SET token_hash = ?1, nonce_hash = ?2
-     WHERE id = (SELECT id FROM magic_tokens
-                 WHERE email = ?3 AND used_at IS NULL AND expires_at > ?4
-                 ORDER BY expires_at DESC LIMIT 1)`,
-  )
-    .bind(tokenHash, nonceHash, email, now)
-    .run();
-  if ((refreshed.meta?.changes ?? 0) > 0) return token;
-
   await env.DB.prepare(
     `INSERT INTO magic_tokens (id, token_hash, email, nonce_hash, created_at, expires_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
   )
-    .bind(`mgt_${randomToken(12)}`, tokenHash, email, nonceHash, now, now + MAGIC_TOKEN_TTL_S)
+    .bind(
+      `mgt_${randomToken(12)}`,
+      await hashToken(token),
+      email,
+      await hashToken(nonce),
+      now,
+      now + MAGIC_TOKEN_TTL_S,
+    )
     .run();
   return token;
 }
@@ -221,14 +254,20 @@ async function issueMagicToken(env: Env, email: string, nonce: string): Promise<
  *   2. Syntax. 400 here is not an oracle (see `looksLikeAddress`).
  *   3. `selectSender` — inline, **before** anything is minted, so a
  *      misconfigured provider leaves no orphan `magic_tokens` row (U3's KTD).
- *   4. Account lookup, then `chargeSendBudget` — both inline, both issuing the
- *      same statements in the same order whatever the lookup found (R2/R4).
- *   5. The allowlist decision (R4b), consumed only *after* the response shape
- *      is already committed.
- *   6. The send, in `waitUntil`, after the response has gone out.
+ *   4. Account lookup and the live-link count — both inline, both issuing the
+ *      same statements in the same order whatever they find (R2/R4).
+ *   5. The two decisions that say whether mail is going out at all: the
+ *      allowlist (R4b) and the live-link cap. They are made *before* the
+ *      budget, because a request that was never going to be mailed must not
+ *      spend a slice that gates real sign-ins — twenty throwaway addresses
+ *      would otherwise block every new registration until 00:00 UTC. A refused
+ *      request charges the parallel `:refused` counters instead, so the
+ *      statement shape is unchanged.
+ *   6. `chargeSendBudget` — inline, before the response (R4).
+ *   7. The send, in `waitUntil`, after the response has gone out.
  *
- * KTD — the one residual signal. Steps 1-4 are identical for every well-formed
- * address; step 5 skips a D1 insert for an address the allowlist refuses,
+ * KTD — the one residual signal. Steps 1-6 are identical for every well-formed
+ * address; step 7 skips a D1 insert for an address the allowlist refuses,
  * because R4b requires that no row be created for it. That leaves a timing
  * difference of one insert which discloses *allowlist membership*, not account
  * existence, and only to an attacker who can measure a few milliseconds across
@@ -269,22 +308,30 @@ async function handleRequest(
   }
 
   const nonce = randomToken();
+  const now = nowS();
   const account = await env.DB.prepare("SELECT id FROM users WHERE email = ?1")
     .bind(email)
     .first<{ id: string }>();
-  const budget = await chargeSendBudget(env, email, { known: account !== null });
-  const allowed = isAllowedRecipient(env, email);
+  const live = await countLiveTokens(env, email, now);
+  // Settled before the charge, so the budget only ever pays for a link that is
+  // actually going out. Both inputs are address-independent in *shape*: the
+  // allowlist test touches no storage and the count is the same query for
+  // everybody.
+  const deliverable = isAllowedRecipient(env, email) && live < MAX_LIVE_TOKENS_PER_ADDRESS;
+  const budget = await chargeSendBudget(env, email, { known: account !== null, deliverable });
 
-  if (allowed && budget.allowed) {
-    const token = await issueMagicToken(env, email, nonce);
+  if (deliverable && budget.allowed) {
+    const token = await issueMagicToken(env, email, nonce, now);
     const url = `${publicOrigin(request, env)}${CALLBACK_PATH}#${token}`;
     // After the response, never before it: a provider that hangs for ten
     // seconds must not hold the caller, and a caller who times the response
     // must not learn whether mail went out.
     ctx.waitUntil(deliver(sender, env, magicLinkMessage(email, url), deps));
-  } else if (!budget.allowed) {
+  } else if (deliverable) {
     // The address itself never reaches a log line; the slice and the control
-    // that refused are what an operator needs to see a cap being hit.
+    // that refused are what an operator needs to see a cap being hit. Only a
+    // charge against a live slice is worth a line — the `:refused` counters
+    // filling up is the design working, not a cap being hit.
     console.warn(`[auth] send budget refused slice=${budget.slice} by=${budget.refusedBy}`);
   }
 
@@ -454,6 +501,16 @@ async function resolveAccount(env: Env, email: string): Promise<string | null> {
   if (existing) return existing.id;
   if (!isAllowedRecipient(env, email)) return null;
 
+  if (parseAllowlist(env).length === 0) {
+    // R4b's open-registration mode is a deliberate opt-in, but it is also what
+    // an accidentally-cleared variable looks like, and the two are
+    // indistinguishable from the outside. Say so on every account it creates.
+    console.warn(
+      "[auth] AUTH_ALLOWED_EMAILS is empty — registration is OPEN and this request created an " +
+        "account for an address nobody vouched for",
+    );
+  }
+
   const id = `usr_${randomToken(12)}`;
   await env.DB.prepare(
     `INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)
@@ -540,9 +597,21 @@ async function handleRedeem(request: Request, env: Env): Promise<Response> {
   // R3: authentication rotates. Any session already sitting in this browser is
   // destroyed rather than left live alongside the new one, so a token planted
   // before sign-in is worthless afterwards.
+  //
+  // Which of the two shapes applies depends on *whose* session is present, and
+  // that is the whole distinction: a live session for this same account is a
+  // continuing session, so `rotateSession` replaces it in one batch (the old
+  // token cannot survive a half-failed write) and carries `created_at`
+  // forward, which is what stops repeated sign-ins from walking a session past
+  // the 180-day cap. Anything else — a stranger's session, an expired one,
+  // garbage — is not a rotation: it is revoked and the new account gets its own
+  // anchor rather than inheriting somebody else's.
   const presented = readSessionCookie(request);
-  if (presented) await revokeSession(env, presented);
-  const minted = await mintSession(env, userId);
+  let minted = presented ? await rotateSession(env, presented, { userId }) : null;
+  if (!minted) {
+    if (presented) await revokeSession(env, presented);
+    minted = await mintSession(env, userId);
+  }
 
   const headers = new Headers({ "Content-Type": "application/json", "Cache-Control": "no-store" });
   headers.append("Set-Cookie", minted.cookie);

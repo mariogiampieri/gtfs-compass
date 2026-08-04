@@ -1,7 +1,7 @@
 import { createExecutionContext, createScheduledController, env } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { budgetDay } from "../../src/email";
+import { SEND_FAILURE_SCOPE, budgetDay } from "../../src/email";
 import worker from "../../src/index";
 import {
   DEFAULT_PRECISE_DAYS,
@@ -90,15 +90,16 @@ async function countOf(table: string): Promise<number> {
 }
 
 beforeEach(async () => {
-  // Schema per migrations 0000 + 0003 + 0004 (these suites build their own
-  // tables). The two purge indexes are created here as well: the partial one
-  // is load-bearing for tier one's self-latching, so the tests run against the
-  // shape production has.
+  // Schema per migrations 0000 + 0003 + 0004 + 0005 (these suites build their
+  // own tables). The purge indexes are created here as well: the partial ones
+  // are load-bearing for the self-latching phases, so the tests run against
+  // the shape production has.
   for (const table of [
     "maintenance_runs",
     "auth_budgets",
     "pairing_codes",
     "magic_tokens",
+    "sessions",
     "device_fixes",
     "locate_log",
     "devices",
@@ -134,6 +135,20 @@ beforeEach(async () => {
   await env.DB.prepare(
     "CREATE INDEX idx_locate_log_precise_ts ON locate_log (ts) WHERE est_lat IS NOT NULL",
   ).run();
+  await env.DB.prepare(
+    "CREATE INDEX idx_locate_log_ref_only_ts ON locate_log (ts) WHERE est_lat IS NULL AND ref_lat IS NOT NULL",
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE sessions (
+       id           TEXT PRIMARY KEY NOT NULL,
+       user_id      TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+       expires_at   INTEGER,
+       created_at   INTEGER,
+       token_hash   TEXT,
+       last_used_at INTEGER
+     )`,
+  ).run();
+  await env.DB.prepare("CREATE INDEX idx_sessions_expires_at ON sessions (expires_at)").run();
   await env.DB.prepare(
     `CREATE TABLE devices (
        id         TEXT PRIMARY KEY NOT NULL,
@@ -364,6 +379,37 @@ describe("device_fixes — the most precise location in the system expires too",
   });
 });
 
+describe("sessions — bounded by nothing else (F9)", () => {
+  async function insertSession(id: string, expiresAt: number | null) {
+    await env.DB.prepare(
+      `INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at, last_used_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?4)`,
+    )
+      .bind(id, USER, `hash_${id}`, nowSec(), expiresAt)
+      .run();
+  }
+
+  it("deletes an expired session and keeps a live one — closing the tab is not a sign-out", async () => {
+    await insertSession("sess_dead", nowSec() - 60);
+    await insertSession("sess_live", nowSec() + 3600);
+
+    const result = await runRetentionPurge(e());
+
+    expect(result.counts.sessions_deleted).toBe(1);
+    const rows = await env.DB.prepare("SELECT id FROM sessions").all<{ id: string }>();
+    expect(rows.results.map((r) => r.id)).toEqual(["sess_live"]);
+  });
+
+  it("treats a NULL expires_at as expired, same as the locate_log predicates do", async () => {
+    await insertSession("sess_null", null);
+
+    const result = await runRetentionPurge(e());
+
+    expect(result.counts.sessions_deleted).toBe(1);
+    expect(await countOf("sessions")).toBe(0);
+  });
+});
+
 describe("credential and counter sweeps — the tables nothing else bounds", () => {
   it("deletes expired magic tokens and pairing codes, keeping live ones", async () => {
     const now = nowSec();
@@ -408,6 +454,25 @@ describe("credential and counter sweeps — the tables nothing else bounds", () 
     expect(result.counts.auth_budgets_deleted).toBe(1);
     const rows = await env.DB.prepare("SELECT day FROM auth_budgets").all<{ day: number }>();
     expect(rows.results.map((r) => r.day)).toEqual([today]);
+  });
+
+  it("retains a send:failure counter across a purge that deletes an ordinary counter from the same day (F8)", async () => {
+    const today = budgetDay();
+    await env.DB.prepare(
+      `INSERT INTO auth_budgets (scope, key, day, shard, count)
+       VALUES (?1, 'k', ?2, 0, 1),
+              ('send:address', 'k', ?2, 0, 3)`,
+    )
+      .bind(SEND_FAILURE_SCOPE, today - 1)
+      .run();
+
+    const result = await runRetentionPurge(e());
+
+    // Only the ordinary counter is counted as deleted; send:failure survives
+    // uncounted, invisibly, exactly as it must.
+    expect(result.counts.auth_budgets_deleted).toBe(1);
+    const rows = await env.DB.prepare("SELECT scope FROM auth_budgets").all<{ scope: string }>();
+    expect(rows.results.map((r) => r.scope)).toEqual([SEND_FAILURE_SCOPE]);
   });
 });
 

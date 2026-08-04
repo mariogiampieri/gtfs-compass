@@ -33,12 +33,11 @@
  *
  * R2 constrains this module's shape: `chargeSendBudget()` must be callable
  * inline, before the response, and must not branch observably on account
- * existence beyond *which slice it charges*. Both branches issue the same
+ * existence beyond *which slice it charges*. Every branch issues the same
  * queries in the same order; only the `scope` string and the limit differ.
  */
 
 import { hashToken, randomToken } from "./auth";
-import { intVar } from "./locate";
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                       */
@@ -419,6 +418,16 @@ export const SEND_GLOBAL_KNOWN_SCOPE = "send:global:known";
 export const SEND_GLOBAL_UNKNOWN_SCOPE = "send:global:unknown";
 export const SEND_FAILURE_SCOPE = "send:failure";
 
+/**
+ * Suffix that turns each send scope into its dead twin. A request that was
+ * never going to be mailed — an address the allowlist refuses, a repeat that
+ * already holds its cap of live links — charges these instead of the live
+ * slices, so the statement shape and the D1 write count are unchanged while
+ * the counters that gate real sign-ins are not consumed. Without it, twenty
+ * throwaway addresses block every new registration until 00:00 UTC.
+ */
+export const REFUSED_SCOPE_SUFFIX = ":refused";
+
 const DEFAULT_ADDRESS_BUDGET = 5;
 /**
  * Defaults sum to 100/day — Resend's free tier — with four fifths reserved for
@@ -465,26 +474,6 @@ export async function incrementBudget(
     .run();
 }
 
-/**
- * Read-then-increment. Deliberately not serializable: two concurrent charges at
- * the boundary can both pass, so a limit of N admits N+1 in the worst case.
- * That is the correct trade for a rate limit — the alternative is a
- * transaction on the hot row the sharding exists to avoid, and being one send
- * over on a daily cap costs nothing while a serialized auth path costs
- * everything. Returns false when the budget is spent (and writes nothing).
- */
-export async function chargeBudget(
-  env: Env,
-  scope: string,
-  key: string,
-  limit: number,
-): Promise<boolean> {
-  if (limit <= 0) return false;
-  if ((await readBudget(env, scope, key)) >= limit) return false;
-  await incrementBudget(env, scope, key);
-  return true;
-}
-
 /** Which global slice a charge landed in. Operator-facing only — never a response. */
 export type BudgetSlice = "known" | "unknown";
 
@@ -495,47 +484,76 @@ export interface SendBudgetDecision {
   refusedBy?: "address" | "global";
 }
 
+/**
+ * Budget limits parse differently from `intVar`'s positive-only timeouts: **0
+ * is meaningful here.** It is the operator's kill switch — "stop sending mail
+ * right now" — so it has to survive parsing rather than being rounded up to
+ * the default. Anything that is not a whole non-negative number is malformed
+ * config, which is what the default exists for.
+ */
+function budgetVar(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === "") return fallback;
+  const n = Number(trimmed);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+
 function addressLimit(env: Env): number {
-  return intVar(env.AUTH_SEND_BUDGET_ADDRESS, DEFAULT_ADDRESS_BUDGET);
+  return budgetVar(env.AUTH_SEND_BUDGET_ADDRESS, DEFAULT_ADDRESS_BUDGET);
 }
 
 function globalLimit(env: Env, slice: BudgetSlice): number {
   return slice === "known"
-    ? intVar(env.AUTH_SEND_BUDGET_KNOWN, DEFAULT_GLOBAL_KNOWN_BUDGET)
-    : intVar(env.AUTH_SEND_BUDGET_UNKNOWN, DEFAULT_GLOBAL_UNKNOWN_BUDGET);
+    ? budgetVar(env.AUTH_SEND_BUDGET_KNOWN, DEFAULT_GLOBAL_KNOWN_BUDGET)
+    : budgetVar(env.AUTH_SEND_BUDGET_UNKNOWN, DEFAULT_GLOBAL_UNKNOWN_BUDGET);
 }
 
 /**
  * The one call `/v1/auth/request` makes **inline, before responding** (R2, R4).
  *
- * `known` says whether the address already has an account; the caller
- * establishes that. It selects the slice and nothing else: both values run the
- * same two charges in the same order against differently-named counters, so
- * the inline path has no branch an observer can time or count. The address
- * budget is charged first because it is the per-victim control; the global
- * slice second because it is the per-provider one.
+ * `known` says whether the address already has an account and `deliverable`
+ * whether a mail is actually going out; the caller establishes both. They
+ * select *which* counters are charged and nothing else: every combination runs
+ * the same reads and the same writes in the same order against differently
+ * named scopes, so the inline path has no branch an observer can time or count.
+ *
+ * **Both counters are read before either is written.** The address key is
+ * attacker-chosen with unbounded cardinality, so charging it ahead of the
+ * global slice would insert one persisted `auth_budgets` row per unique
+ * address for as long as anyone cares to POST — the global cap would bound
+ * emails and nothing about D1. Reading the global slice first means a spent
+ * cap writes nothing at all.
  *
  * The address key is a SHA-256 of the normalized address, so `auth_budgets` is
  * not a plaintext list of everyone who ever tried to sign in.
+ *
+ * Deliberately not serializable: two concurrent charges at the boundary can
+ * both pass, so a limit of N admits N+1 in the worst case. That is the correct
+ * trade for a rate limit — the alternative is a transaction on the hot row the
+ * sharding exists to avoid.
  */
 export async function chargeSendBudget(
   env: Env,
   email: string,
-  opts: { known: boolean },
+  opts: { known: boolean; deliverable?: boolean },
 ): Promise<SendBudgetDecision> {
   const slice: BudgetSlice = opts.known ? "known" : "unknown";
-  const scope = opts.known ? SEND_GLOBAL_KNOWN_SCOPE : SEND_GLOBAL_UNKNOWN_SCOPE;
+  const suffix = opts.deliverable === false ? REFUSED_SCOPE_SUFFIX : "";
+  const addressScope = SEND_ADDRESS_SCOPE + suffix;
+  const globalScope = (opts.known ? SEND_GLOBAL_KNOWN_SCOPE : SEND_GLOBAL_UNKNOWN_SCOPE) + suffix;
   const key = await hashToken(normalizeEmail(email));
 
-  if (!(await chargeBudget(env, SEND_ADDRESS_SCOPE, key, addressLimit(env)))) {
-    return { allowed: false, slice, refusedBy: "address" };
-  }
-  // A global refusal after an address charge leaves that charge spent. Accepted:
-  // reversing it would need the transaction the sharding exists to avoid, and
-  // over-charging a spraying address is the harmless direction to be wrong in.
-  if (!(await chargeBudget(env, scope, "", globalLimit(env, slice)))) {
-    return { allowed: false, slice, refusedBy: "global" };
-  }
+  const addressUsed = await readBudget(env, addressScope, key);
+  const globalUsed = await readBudget(env, globalScope, "");
+  if (globalUsed >= globalLimit(env, slice)) return { allowed: false, slice, refusedBy: "global" };
+  if (addressUsed >= addressLimit(env)) return { allowed: false, slice, refusedBy: "address" };
+
+  // A failure between the two increments leaves the address charged and the
+  // slice not. Accepted: over-charging one address is the harmless direction to
+  // be wrong in, and the alternative is the transaction sharding exists to avoid.
+  await incrementBudget(env, addressScope, key);
+  await incrementBudget(env, globalScope, "");
   return { allowed: true, slice };
 }
 

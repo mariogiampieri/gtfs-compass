@@ -71,7 +71,19 @@ const KNOWN_SCOPES: readonly Scope[] = ["read:departures", "read:config", "read:
  * `device` is a scoped Bearer credential that can never reach account surfaces.
  */
 export type Credential =
-  | { kind: "session"; userId: string; sessionId: string | null; single?: true }
+  | {
+      kind: "session";
+      userId: string;
+      sessionId: string | null;
+      single?: true;
+      /**
+       * Set only when this request slid the window. `expires_at` moving in D1
+       * is invisible to the browser — its `Max-Age` was fixed at mint — so the
+       * response has to re-issue the cookie or the sliding window has no
+       * user-visible effect at all. See `Authorized.refresh`.
+       */
+      renewedExpiresAtS?: number;
+    }
   | { kind: "device"; deviceId: string; userId: string; scopes: readonly Scope[] };
 
 /** A bindable `WHERE` fragment scoping rows to the credential's owner. */
@@ -87,6 +99,14 @@ export interface Authorized {
   credential: Credential;
   /** Default `user_id = ?1`; call `ownerPredicate` directly for other shapes. */
   owner: OwnerPredicate;
+  /**
+   * A ready `Set-Cookie` when this request renewed the session, else null.
+   * **Any route that answers 2xx and leaves the session in place must append
+   * it**, or the window slides in D1 only and the browser still hard-expires
+   * the cookie at the original `Max-Age`. Sign-out is the deliberate exception:
+   * it clears the cookie instead.
+   */
+  refresh: string | null;
 }
 
 export interface MintedSession {
@@ -167,7 +187,10 @@ function readCookie(request: Request, name: string): string | null {
     if (eq === -1) continue;
     if (part.slice(0, eq).trim() !== name) continue;
     const value = part.slice(eq + 1).trim();
-    return value === "" ? null : value;
+    // Keep scanning past an empty one rather than returning on the first name
+    // match: a cleared cookie from a wider path can sit in the same header
+    // ahead of the live one, and stopping there logs the user out.
+    if (value !== "") return value;
   }
   return null;
 }
@@ -234,8 +257,16 @@ async function prepareSession(
 
 /**
  * Validate a session token, sliding its window when — and only when — it is
- * past the half-life. That condition is what keeps a read a read (R3): an
- * unconditional `last_used_at` stamp would put a D1 write on every page load.
+ * past the half-life **and the renewed value actually moves**. The half-life
+ * condition is what keeps a read a read (R3): an unconditional `last_used_at`
+ * stamp would put a D1 write on every page load. The second condition covers
+ * the far end of the same problem: once `expires_at` is pinned to the absolute
+ * cap, `Math.min` stops moving it while the half-life test stays permanently
+ * true, so an unguarded UPDATE rewrites an identical row on every request.
+ *
+ * A renewal is reported back on the credential (`renewedExpiresAtS`) because
+ * the browser cannot see a D1 column — `authorize()` turns it into the
+ * `Set-Cookie` the response must carry.
  */
 export async function validateSession(env: Env, token: string): Promise<Credential | null> {
   if (!token) return null;
@@ -252,24 +283,38 @@ export async function validateSession(env: Env, token: string): Promise<Credenti
   // extended past the absolute cap is still dead at 180 days.
   if (row.expires_at <= now || absoluteEndS <= now) return null;
 
+  const credential: Credential = { kind: "session", userId: row.user_id, sessionId: row.id };
   const ttlS = sessionTtlS(env);
   if (now >= row.expires_at - Math.floor(ttlS / 2)) {
     const renewedS = Math.min(now + ttlS, absoluteEndS);
-    await env.DB.prepare(
-      "UPDATE sessions SET expires_at = ?1, last_used_at = ?2 WHERE id = ?3",
-    )
-      .bind(renewedS, now, row.id)
-      .run();
+    if (renewedS > row.expires_at) {
+      await env.DB.prepare(
+        "UPDATE sessions SET expires_at = ?1, last_used_at = ?2 WHERE id = ?3",
+      )
+        .bind(renewedS, now, row.id)
+        .run();
+      credential.renewedExpiresAtS = renewedS;
+    }
   }
-  return { kind: "session", userId: row.user_id, sessionId: row.id };
+  return credential;
 }
 
 /**
  * Rotate on authentication (R3): issue a new token and destroy the old row in
  * one batch. `created_at` is carried forward, so rotation cannot be used to
  * walk a session past its 180-day absolute cap.
+ *
+ * `opts.userId` is what makes this safe on the redeem path, where the cookie
+ * already in the browser may belong to somebody else entirely: a rotation is
+ * only a rotation when the continuing session is the *same account's*. A
+ * mismatch returns null and the caller revokes and mints instead, so a
+ * stranger's absolute-cap anchor can never be inherited by a new sign-in.
  */
-export async function rotateSession(env: Env, oldToken: string): Promise<MintedSession | null> {
+export async function rotateSession(
+  env: Env,
+  oldToken: string,
+  opts: { userId?: string } = {},
+): Promise<MintedSession | null> {
   if (!oldToken) return null;
   const oldHash = await hashToken(oldToken);
   const row = await env.DB.prepare(
@@ -278,6 +323,7 @@ export async function rotateSession(env: Env, oldToken: string): Promise<MintedS
     .bind(oldHash)
     .first<{ id: string; user_id: string; created_at: number; expires_at: number }>();
   if (!row) return null;
+  if (opts.userId !== undefined && row.user_id !== opts.userId) return null;
   const now = nowS();
   if (row.expires_at <= now || row.created_at + sessionAbsoluteTtlS(env) <= now) return null;
 
@@ -471,5 +517,21 @@ export async function authorize(
     return Response.json({ error: `forbidden: missing scope ${opts.scope}` }, { status: 403 });
   }
 
-  return { credential, owner: ownerPredicate(credential) };
+  return {
+    credential,
+    owner: ownerPredicate(credential),
+    refresh: refreshCookie(request, credential),
+  };
+}
+
+/**
+ * The `Set-Cookie` a renewed session needs, or null. Rebuilt from the token the
+ * request presented — the plaintext exists only in that header, never in D1 —
+ * so this is the only point at which a slid window can reach the browser.
+ */
+function refreshCookie(request: Request, credential: Credential): string | null {
+  if (credential.kind !== "session" || credential.renewedExpiresAtS === undefined) return null;
+  const token = readSessionCookie(request);
+  if (!token) return null;
+  return sessionCookie(token, Math.max(0, credential.renewedExpiresAtS - nowS()));
 }
