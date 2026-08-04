@@ -13,8 +13,8 @@ and Citi Bike GBFS) are built, with all three NYC systems live — subway,
 **MTA Bus** (six static GTFS sources + the citywide Bus Time realtime feed),
 and Citi Bike. Phase 4 (firmware) and Phase 5 (accounts, pairing, and the
 config UI) are in progress — the config UI currently ships its shell, its
-sign-in form, and a local location check; the accounts behind them are
-landing alongside. Everything is specified in
+sign-in form, device pairing and the device list, and a local location check.
+Everything is specified in
 [`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md).
 
 ## Architecture at a glance
@@ -154,13 +154,15 @@ older than 90 s as stale. A feed whose upstream freezes (HTTP 200 but a
 non-advancing header timestamp) goes visibly stale rather than being
 re-stamped fresh.
 
-**The transit routes are still unauthenticated.** `/internal/*` and the
-transit `/v1/*` routes stay public until the device-token model lands; they
-are limited to the curated feed allowlist (`vars.CURATED_FEEDS` in
-`api/wrangler.jsonc`) and per-IP rate limiting, and expose only
-already-public transit data. The locate diagnostics surfaces are gated by a
+**The transit routes are unauthenticated, and stay that way.** `/internal/*`
+and the transit `/v1/*` routes serve already-public transit data and answer
+identically whether or not a credential is presented — a paired device changes
+nothing about them. They are limited to the curated feed allowlist
+(`vars.CURATED_FEEDS` in `api/wrangler.jsonc`) and per-IP rate
+limiting. The locate diagnostics surfaces are gated by a
 `DIAG_TOKEN` Worker secret (see `.env.example`). Accounts exist on
-`/v1/auth/*` — see [Signing in](#signing-in) — and everything user-owned
+`/v1/auth/*` — see [Signing in](#signing-in) — devices get their own scoped
+credentials through [pairing](#pairing-a-device), and everything user-owned
 that arrives in later milestones goes behind them.
 
 ## The read API (Phase 3)
@@ -440,9 +442,32 @@ to configure, and the session cookie is first-party.
 
 Today it holds the shell, the sign-in form (which posts an address to
 `POST /v1/auth/request` and never says whether that address has an account —
-the emailed link is redeemed by a separate Worker-served page), and the
-location check below. Device pairing and favorites editing land in later
-milestones.
+the emailed link is redeemed by a separate Worker-served page), the **pairing
+screens** and the **device list** described below, and the location check.
+Favorites and walk-time editing land in a later milestone.
+
+**Pairing a board from the browser.** The device shows an eight-letter code and
+sends you to `/pair`, which is this same shell with the cursor in the code box.
+Typing a code shows a **confirm screen** first: it names the board — as text
+the device reported and nothing has verified — and says plainly that a code
+must come off a screen you are holding, because the attack this step exists to
+stop (RFC 8628 §5.4) is a code read to you over the phone. Nothing is bound
+until you confirm.
+
+**The device list** shows every board on the account with its name, firmware
+version, when it was paired, when it last called home, a checkbox per
+permission, and an unpair button. The `read:fix` checkbox is the one that
+matters and it says so: turning it on means *this device will receive your
+phone's live position* until you turn it off, and turning it off both stops
+that and deletes the position already sent to that board.
+
+The other two checkboxes are labelled **recorded, but not enforced yet**, and
+the label is deliberate. `/v1/departures` and `/v1/nearby` are anonymous by
+design and name no scope, and a board's own config read does not exist yet, so
+unchecking "Arrival times" today stores your choice without stopping the board
+from displaying arrivals. Same rule the API applies to stale data: say so
+rather than show a control that quietly does nothing. The label goes when
+those routes start checking the grant.
 
 Prerequisites: Node.js 18+ — nothing else. There is no framework and no
 bundler; the UI is hand-written HTML, CSS, and native ES modules, and the
@@ -541,6 +566,146 @@ Four details are load-bearing and easy to undo by accident:
 Emailed links point at the origin of the request that asked for one. On a
 deployment answering to more than one hostname, set `AUTH_PUBLIC_ORIGIN` to
 pin them to the real front door.
+
+### Pairing a device
+
+The board has no keyboard and must never hold your password, so pairing
+follows **RFC 8628** (the OAuth device authorization grant): the device asks
+for a pairing request, shows you an eight-character code, and polls until you
+have claimed that code in a browser you are already signed in to.
+
+| Route | Caller | What it does |
+| --- | --- | --- |
+| `POST /v1/device/pair/start` | the device, unauthenticated | Mints a 256-bit `device_code` (stored hashed) and an 8-character `user_code`; answers `device_code`, `user_code`, `verification_uri`, `expires_in`, `interval` |
+| `POST /v1/device/pair/poll` | the device, `Authorization: Bearer <device_code>` | `authorization_pending` until claimed, then the device token **exactly once** |
+| `POST /v1/pair/claim` | the browser, session cookie + `X-GC-CSRF` | Names the pending request by its `user_code`; the first call previews the device, a second call with `"confirm": true` binds it |
+
+```bash
+# what the firmware does, by hand
+curl -X POST "https://<worker-host>/v1/device/pair/start" \
+  -H 'content-type: application/json' \
+  -d '{"device_name":"Kitchen board","fw_version":"1.4.0"}'
+# -> {"device_code":"…","user_code":"BCDF-GHJK","verification_uri":"https://…/pair", …}
+
+curl -X POST "https://<worker-host>/v1/device/pair/poll" \
+  -H "Authorization: Bearer <device_code>"
+# -> 400 {"error":"authorization_pending"} until you claim it, then the token
+```
+
+Five properties are load-bearing:
+
+- **The short code authenticates nothing.** It is ~34.5 bits and gets read off
+  a screen; all it does is *name* a pending request. The credential is the
+  256-bit `device_code`, which never leaves the device, is stored hashed, and
+  is sent as a `Bearer` header — a copy in the query string is refused
+  outright rather than accepted, because a query string reaches every access
+  log along the way.
+- **The claiming browser never sees the device token.** Claiming writes
+  ownership and nothing else; the token is minted on the device's next poll
+  and returned only to whoever holds the device code. It is issued exactly
+  once — a replay gets `expired_token`.
+- **Claiming takes a confirm step.** That screen is a security control, not a
+  nicety: RFC 8628 §5.4's attack is talking someone into typing a code from a
+  device they are not holding. The preview names the device — as **untrusted,
+  escaped, length-capped** text, because the name is whatever the device said
+  it was — before anything is bound.
+- **Guessing is budgeted in D1, not in memory.** Attempts are counted per
+  signed-in claimer *and* per client network, **including attempts against
+  codes that do not exist**, since a per-code counter is no defense against
+  spraying the live-code space. A specific code is separately destroyed after
+  five attempts against it, and a pairing request expires in five minutes. Tune
+  the caps with the `PAIR_*_BUDGET_*` variables in `.env.example`; each takes
+  `0` as a kill switch.
+- **No cap here is an off switch a stranger can flip.** The per-caller budgets
+  are keyed to the /24 or /64, not to the address — a per-address cap is not a
+  cap when the smallest IPv6 allocation holds 2^64 of them — and the
+  deployment-wide caps are *split*, exactly like the send budgets: a network's
+  (or an account's) first few requests of the day draw on a `FRESH` slice that
+  repeat traffic cannot touch. Without that, ~25 addresses could spend one
+  shared counter in minutes and every honest board would get `429` until
+  midnight UTC. If a slice does run out, the refusal is recorded rather than
+  merely logged — that is a real outage of a feature nobody would otherwise see:
+
+  ```bash
+  cd api
+  npx wrangler d1 execute gtfs-compass --remote \
+    --command "SELECT scope, key, SUM(count) FROM auth_budgets
+                WHERE scope LIKE 'pair:%:refused' GROUP BY scope, key"
+  ```
+
+  Any row here means honest callers in that class were turned away today; the
+  fix is to raise the matching `PAIR_*_BUDGET_FRESH`/`_REPEAT` var. (The daily
+  retention sweep clears yesterday's counters, so read it the same day.)
+- **A freshly paired device cannot see your location.** Pairing grants
+  `read:departures` and `read:config` only. `read:fix` — the scope that lets a
+  board receive your phone's live position — is never implied by pairing and
+  is granted separately, per device.
+
+#### What the device token can do
+
+The board sends its token as `Authorization: Bearer gtfsc_dev_…` — never a
+query parameter, which the API refuses. The token is stored as a SHA-256 hash
+under a unique index and resolves in one indexed lookup.
+
+- **It is not a login.** A device token can never come back as a session: the
+  Bearer branch and the cookie branch are separate by construction, so a token
+  extracted from a board cannot be exchanged for account access even in a
+  browser that is already signed in.
+- **It reaches only what its scopes name.** A route that does not declare a
+  scope refuses device tokens outright, so the account email, the device list,
+  configuration writes and `POST /v1/pair/claim` answer `403` to a board — one
+  rule in the resolver rather than a guard each route has to remember. A
+  request for a scope the device was not granted is also a `403`; a device
+  token holding `read:config` may read *its own* device's configuration and no
+  other board's, including boards on the same account. **No route names
+  `read:departures` or `read:config` yet**, so those two grants are stored,
+  listed, and not currently checked against anything — which the device list
+  says on the toggle rather than leaving an unchecked box to imply a board was
+  cut off.
+- **Revocation is immediate, on both sides.** Unpairing sets `revoked_at` and
+  the very next request is a `401` — the same `401`, byte for byte, that a
+  token which never existed gets, so a token found in flash tells its holder
+  nothing. It also **deletes the phone position already delivered to that
+  board**, and so does turning the `read:fix` permission off on its own:
+  revocation that only stopped the *next* fix would leave the last one
+  readable indefinitely.
+- **Theft is visible.** Every device request refreshes `last_used_at` (at most
+  once every five minutes, so a board polling every 20 s does not put a
+  database write on each poll). The device list shows it: a board you are
+  holding that is still calling home is a board whose token somebody else has.
+
+**Token rotation is specified and not implemented.** Any response to a
+device-token request *may* one day carry `X-GC-Device-Token: <new token>`,
+meaning "persist this and use it from now on". Nothing emits it today, and a
+device that ignores it keeps working — firmware that handles it now is what
+makes switching rotation on later a non-breaking change instead of a
+fleet-wide reflash.
+
+#### Managing paired devices
+
+Three routes behind the device list, all of them **session-only** — a board's
+own token is refused outright, so a stolen credential cannot enumerate the
+account's other boards, widen its own permissions, or unpair anything.
+
+| Route | What it does |
+| --- | --- |
+| `GET /v1/config/devices` | This account's boards: `id`, `paired_at`, `last_seen`, `scopes`, and the device's own `name`/`fw_version` tagged `untrusted` |
+| `PATCH /v1/config/devices/<device_id>` | `{"scope": "read:fix", "granted": true}` — one permission per request, so a stale browser tab cannot restore a grant you just revoked |
+| `DELETE /v1/config/devices/<device_id>` | Unpair: revoke the credential and delete the stored position |
+
+```bash
+curl "https://<worker-host>/v1/config/devices" -b cookies.txt
+
+curl -X PATCH "https://<worker-host>/v1/config/devices/dev_abc123" \
+  -b cookies.txt -H 'content-type: application/json' -H 'X-GC-CSRF: 1' \
+  -H "Origin: https://<worker-host>" \
+  -d '{"scope":"read:fix","granted":true}'
+```
+
+A device id that belongs to somebody else answers `404`, the same as one that
+does not exist, and the write it named does not happen — the ownership
+predicate is in the `WHERE` clause of every statement, not in a check a route
+had to remember.
 
 ### The location check
 

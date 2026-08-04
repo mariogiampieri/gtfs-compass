@@ -85,6 +85,12 @@ The bindable `WHERE user_id = ?` fragment `authorize()` hands back to every rout
 ### Device Scope
 A separately grantable, separately revocable permission on a paired device's Bearer token (`read:departures`, `read:config`, `read:fix`). `read:fix` is never implied by pairing alone — a freshly paired board holds no location grant until a user extends one, so a stolen or second-hand board is not a tracking device by default.
 
+### Unpair
+Revoking a paired board from the device list: `devices.revoked_at` is stamped, its scope list is emptied, and its stored fix is cleared. The row itself survives, so the board's token keeps resolving to the same `401` a token that never existed gets, and the account's diagnostic attribution is not orphaned. Turning the `read:fix` scope off on its own performs the second and third of those steps — revocation is a property of the grant, not of the unpair button.
+
+### Relay Seam
+The three functions that are allowed to touch `device_fixes` (`api/src/relay.ts`): `putFixForUser` writes the account's latest phone position to every device holding `read:fix`, `getFix` reads one device's row for the locate chain, and `clearFix` deletes it. No SQL against that table exists anywhere else — that is what keeps moving the relay off D1 a three-function change rather than a data migration. Only `clearFix` exists today; the other two arrive with the relay itself.
+
 ### Send Budget
 The sharded daily counter set (`auth_budgets`) gating magic-link delivery: a per-address cap charged first, then a global cap split into a `known` slice (addresses with an existing account) and a smaller `unknown` slice. The split exists so spraying unknown addresses cannot exhaust the shared daily cap and lock out real users — it costs only the attacker's own slice. A separate `send:failure` scope counts delivery failures rather than requests and is retained past the daily sweep that clears the others, because it is the only durable signal that a mail-provider outage happened.
 

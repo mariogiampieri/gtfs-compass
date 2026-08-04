@@ -490,8 +490,11 @@ export interface SendBudgetDecision {
  * right now" — so it has to survive parsing rather than being rounded up to
  * the default. Anything that is not a whole non-negative number is malformed
  * config, which is what the default exists for.
+ *
+ * Exported alongside the counter primitives because every budget in the system
+ * has to agree on what `0` means; `routes/pair.ts` parses its caps with this.
  */
-function budgetVar(raw: string | undefined, fallback: number): number {
+export function budgetVar(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
   const trimmed = raw.trim();
   if (trimmed === "") return fallback;

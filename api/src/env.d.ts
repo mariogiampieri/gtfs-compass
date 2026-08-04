@@ -71,6 +71,48 @@ declare global {
      */
     AUTH_PUBLIC_ORIGIN?: string;
     /**
+     * Pairing starts one client **network** may request per UTC day (R7,
+     * default 20). The key is the /24 (IPv4) or /64 (IPv6), not the address, so
+     * a subscriber cannot buy more budget by changing addresses. Bounds an
+     * unauthenticated INSERT, so `0` disables device pairing outright — it is a
+     * kill switch, not a fall back to the default.
+     */
+    PAIR_START_BUDGET_IP?: string;
+    /**
+     * Deployment-wide starts per UTC day from networks still within their first
+     * few of the day (default 400) — where an honest board pairing for the
+     * first time lands. Reserved from PAIR_START_BUDGET_REPEAT so that a caller
+     * hammering one network cannot switch pairing off for everybody else. `0`
+     * refuses every such start.
+     */
+    PAIR_START_BUDGET_FRESH?: string;
+    /**
+     * Deployment-wide starts per UTC day from a network that has already spent
+     * its fresh allowance (default 100) — retry storms and abuse. `0` allows a
+     * network its first few starts per day and nothing more.
+     */
+    PAIR_START_BUDGET_REPEAT?: string;
+    /**
+     * Claim attempts one signed-in account may make per UTC day (R7, default
+     * 10), counting attempts against codes that do not exist. This is the
+     * anti-spray control; `0` disables claiming.
+     */
+    PAIR_CLAIM_BUDGET_CLAIMER?: string;
+    /**
+     * Claim attempts one client network (/24 or /64) may make per UTC day
+     * (default 20; 0 disables claiming).
+     */
+    PAIR_CLAIM_BUDGET_IP?: string;
+    /**
+     * Deployment-wide claim attempts per UTC day from accounts still within
+     * their first few of the day (default 400), and from accounts past them
+     * (default 100). Split for the same reason as the start slices: one abuser
+     * exhausting a shared counter would lock every other account out of pairing
+     * until 00:00 UTC. `0` on either refuses that class.
+     */
+    PAIR_CLAIM_BUDGET_FRESH?: string;
+    PAIR_CLAIM_BUDGET_REPEAT?: string;
+    /**
      * Retention tier one (R20): days after which `locate_log` raw coordinates
      * are nulled and `device_fixes` rows are deleted (default 14). The derived
      * metrics survive to LOCATE_LOG_RETENTION_DAYS.

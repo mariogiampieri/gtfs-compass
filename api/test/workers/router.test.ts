@@ -159,6 +159,81 @@ describe("the /v1/auth/* bucket", () => {
   });
 });
 
+describe("the pairing bucket (U5)", () => {
+  // A poll with no bearer credential is refused before any storage is touched,
+  // which makes it the cheapest possible probe for "did this path reach the
+  // pairing route at all" — a 404 here would mean the prefix fell through to
+  // the internal-route matcher.
+  const poll = (ip: string) =>
+    SELF.fetch("https://api.example/v1/device/pair/poll", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": ip },
+    });
+
+  it("routes both pairing prefixes through the Worker", async () => {
+    const res = await poll("198.51.100.211");
+    expect(res.status).toBe(400);
+    expect((await res.json<any>()).error).toBe("invalid_request");
+
+    // The browser half is a different prefix and must land on the same route.
+    const claim = await SELF.fetch("https://api.example/v1/pair/claim", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "198.51.100.211" },
+    });
+    expect(claim.status).toBe(401); // reached the route, refused for want of a session
+  });
+
+  it("has its own bucket, sized for a 5-second poll loop", async () => {
+    const ip = "198.51.100.212";
+    const statuses: number[] = [];
+    for (let i = 0; i < 15; i++) statuses.push((await poll(ip)).status);
+    // Capacity is 15 — the whole point of not sharing the auth bucket, whose
+    // 10-token burst at 0.2/sec would strangle a device polling as instructed.
+    expect(statuses.every((s) => s === 400)).toBe(true);
+
+    // Spent here, untouched elsewhere: the auth bucket is a separate map.
+    expect(
+      (await SELF.fetch("https://api.example/v1/auth/mode", { headers: { "CF-Connecting-IP": ip } }))
+        .status,
+    ).toBe(200);
+  });
+});
+
+describe("the config surface (U10)", () => {
+  // A list read with no cookie is refused before any storage is touched, which
+  // makes it the cheapest probe for "did this path reach routeConfig at all".
+  // A 404 with `{"error":"not found"}` here would mean the prefix fell through
+  // to the internal-route matcher; an HTML 200 would mean the asset router
+  // answered it with the SPA shell.
+  const devices = (ip: string) =>
+    SELF.fetch("https://api.example/v1/config/devices", { headers: { "CF-Connecting-IP": ip } });
+
+  it("routes /v1/config/* through the Worker", async () => {
+    const res = await devices("198.51.100.221");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(await res.json<any>()).toEqual({ error: "unauthorized" });
+  });
+
+  it("answers an unknown config path with the route's JSON 404", async () => {
+    const res = await SELF.fetch("https://api.example/v1/config", {
+      headers: { "CF-Connecting-IP": "198.51.100.222" },
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json<any>()).toEqual({ error: "not found" });
+  });
+
+  it("shares the standard bucket rather than the auth one", async () => {
+    const ip = "198.51.100.223";
+    const statuses: number[] = [];
+    for (let i = 0; i < 20; i++) statuses.push((await devices(ip)).status);
+    // Capacity is 20: a session-only, low-frequency surface has no reason to
+    // sit in the sign-in bucket, where a burst of 10 is the whole allowance.
+    expect(statuses.every((s) => s === 401)).toBe(true);
+    expect((await devices(ip)).status).toBe(429);
+  });
+});
+
 describe("rateLimited refill math", () => {
   it("refills tokens over time at the configured rate", async () => {
     const { rateLimited } = await import("../../src/index");

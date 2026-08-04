@@ -1,8 +1,10 @@
 import { adapterGroups } from "./adapters";
 import { routeAuth } from "./routes/auth";
+import { routeConfig } from "./routes/config";
 import { routeDepartures } from "./routes/departures";
 import { routeLocate } from "./routes/locate";
 import { routeNearby } from "./routes/nearby";
+import { routePair } from "./routes/pair";
 import { runRetentionPurge } from "./retention";
 
 export { FeedDO } from "./feed_do";
@@ -44,6 +46,26 @@ const LOCATE_RATE_REFILL_PER_SEC = 1;
 const AUTH_RATE_CAPACITY = 10; // burst
 const AUTH_RATE_REFILL_PER_SEC = 0.2;
 
+// Pairing is also a credential-issuing surface, but it deliberately does NOT
+// share the auth bucket: /v1/device/pair/poll is a polling loop (RFC 8628
+// advertises a 5-second `interval`), and the auth bucket's 12/minute would
+// strangle a device that is doing exactly what it was told to do. Sized for
+// that loop instead — 30/minute sustained, 15 burst.
+//
+// The looser bucket is safe for different reasons on the two halves of the
+// surface, and neither of them is this bucket — which is per-isolate,
+// best-effort, and cleared wholesale at 10,000 entries, so it bounds nothing an
+// IP-rotating caller cares about. What bounds /v1/device/pair/start and
+// /v1/pair/claim is the per-network, per-claimer and sliced global budgets in
+// D1 (R7), which survive isolate recycle and count across the deployment.
+// /v1/device/pair/poll — the highest-rate route here — deliberately has no such
+// budget: it is a probe of a unique index that reads zero rows for any caller
+// who does not already hold a device code, so a D1 counter would cost more than
+// the read it bounded. The reasoning, and the test that keeps the index
+// assumption honest, are on `handlePoll` in routes/pair.ts.
+const PAIR_RATE_CAPACITY = 15; // burst
+const PAIR_RATE_REFILL_PER_SEC = 0.5;
+
 type RateBuckets = Map<string, { tokens: number; lastMs: number }>;
 
 // In-isolate caches: best-effort (reset on isolate recycle), which is the
@@ -52,6 +74,7 @@ const adapterCache = new Map<string, string | null>();
 const rateBuckets: RateBuckets = new Map();
 const locateRateBuckets: RateBuckets = new Map();
 const authRateBuckets: RateBuckets = new Map();
+const pairRateBuckets: RateBuckets = new Map();
 
 export function rateLimited(
   ip: string,
@@ -147,6 +170,32 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return Response.json({ error: "rate limited" }, { status: 429 });
       }
       return routeAuth(request, env, url, ctx);
+    }
+
+    // RFC 8628 pairing (U5). Two prefixes, one surface: the device half lives
+    // under /v1/device/pair/ and the browser's claim under /v1/pair/, because
+    // the claim is not something a device may ever call.
+    if (url.pathname.startsWith("/v1/device/pair/") || url.pathname.startsWith("/v1/pair/")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (
+        rateLimited(ip, Date.now(), pairRateBuckets, PAIR_RATE_CAPACITY, PAIR_RATE_REFILL_PER_SEC)
+      ) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routePair(request, env, url);
+    }
+
+    // The account's own configuration (U10: the device list, scope grants,
+    // unpair). Standard bucket rather than the auth one: it is session-only and
+    // low-frequency, and the auth bucket's 12/minute is sized for a sign-in —
+    // strangling a *revocation* because the same browser also loaded a list is
+    // the wrong failure for the surface that turns a board off.
+    if (url.pathname === "/v1/config" || url.pathname.startsWith("/v1/config/")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (rateLimited(ip, Date.now())) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routeConfig(request, env, url);
     }
 
     if (

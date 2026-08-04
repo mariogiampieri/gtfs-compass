@@ -51,6 +51,61 @@
         <p id="sign-in-status" class="status" role="status" hidden></p>
       </section>
 
+      <!--
+        Pairing entry (R8). The device shows an eight-letter code and sends the
+        human to /pair, which the SPA fallback answers with this same shell —
+        app.js focuses the field below when that is the path. The confirm block
+        stays hidden until the server has previewed the device: it is a security
+        control against RFC 8628 §5.4 code-phishing, so its copy and the
+        device's self-reported metadata are both written by devices-view.js
+        with textContent, never by markup here.
+      -->
+      <section class="card" aria-labelledby="pair-heading">
+        <h2 id="pair-heading">Pair a device</h2>
+        <p class="muted">
+          Your board shows an eight-letter code. Type it here while the code is
+          still on screen — it expires after five minutes.
+        </p>
+        <form id="pair-form" novalidate>
+          <label for="pair-code">Pairing code</label>
+          <input
+            id="pair-code"
+            name="code"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            autocapitalize="characters"
+            autocorrect="off"
+            placeholder="BCDF-GHJK"
+            maxlength="20"
+            required
+          />
+          <button id="pair-submit" type="submit">Look up this code</button>
+        </form>
+        <div id="pair-confirm" class="confirm" hidden>
+          <h3>Is this the device in front of you?</h3>
+          <p id="pair-confirm-warning" class="banner"></p>
+          <div id="pair-confirm-device"></div>
+          <button id="pair-confirm-yes" type="button">Yes — pair this device</button>
+          <button id="pair-confirm-no" type="button" class="secondary">Cancel</button>
+        </div>
+        <p id="pair-status" class="status" role="status" hidden></p>
+      </section>
+
+      <section class="card" aria-labelledby="devices-heading">
+        <h2 id="devices-heading">Your devices</h2>
+        <p class="muted">
+          Every board paired to this account. Permissions are per device and take
+          effect on that board's next request; unpairing revokes its credential
+          immediately.
+        </p>
+        <p id="devices-empty" class="muted" hidden>
+          No devices paired yet. Pair one with the code it shows.
+        </p>
+        <ul id="devices-list" class="devices"></ul>
+        <p id="devices-status" class="status" role="status" hidden></p>
+      </section>
+
       <section class="card" aria-labelledby="capture-heading">
         <h2 id="capture-heading">Location check</h2>
         <p class="muted">
