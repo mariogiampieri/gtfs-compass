@@ -59,6 +59,13 @@ declare global {
     AUTH_SEND_BUDGET_KNOWN?: string;
     /** Daily global send slice for unknown addresses (default 20). */
     AUTH_SEND_BUDGET_UNKNOWN?: string;
+    /**
+     * Origin the emailed sign-in link points at, e.g. `https://compass.example`.
+     * Optional: defaults to the origin of the request that asked for the link,
+     * which is derived from the `Host` header — set this to pin links to the
+     * real front door on a deployment reachable under more than one hostname.
+     */
+    AUTH_PUBLIC_ORIGIN?: string;
   }
   // `cloudflare:test`'s env (and workers-types' import { env }) are typed as
   // Cloudflare.Env; bridge the project Env into it.

@@ -125,6 +125,24 @@ describe("static assets in front of the API", () => {
     expect(await res.json()).toEqual({ error: "not found" });
   });
 
+  it("serves the auth interstitial from the Worker, with a per-request CSP nonce", async () => {
+    // R19's reason for putting the callback under /v1/: `run_worker_first`
+    // already covers it, so the asset router cannot answer it with the SPA
+    // shell — which would deliver the most security-critical page in the app
+    // under the static `script-src 'self'` policy, with its inline script
+    // silently blocked and no nonce anywhere.
+    const res = await fetch(`${BASE}/v1/auth/callback`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toMatch(/script-src 'nonce-[A-Za-z0-9_-]+'/);
+    expect(csp).not.toContain("unsafe-inline");
+    expect(await res.text()).toContain("Signing in");
+    // A nonce reused across responses is a nonce an injected script can quote.
+    const again = await fetch(`${BASE}/v1/auth/callback`);
+    expect(again.headers.get("content-security-policy")).not.toBe(csp);
+  });
+
   it("leaves /internal/* alone", async () => {
     const res = await fetch(`${BASE}/internal/mta-subway/ace`);
     expect(res.status).toBe(404);

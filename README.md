@@ -154,12 +154,14 @@ older than 90 s as stale. A feed whose upstream freezes (HTTP 200 but a
 non-advancing header timestamp) goes visibly stale rather than being
 re-stamped fresh.
 
-**No authentication yet.** The `/internal/*` and `/v1/*` routes are public
-until the device-token model lands (Phase 5); they are limited to the
-curated feed allowlist (`vars.CURATED_FEEDS` in `api/wrangler.jsonc`) and
-per-IP rate limiting, and expose only already-public transit data. The
-locate diagnostics surfaces are additionally gated by a `DIAG_TOKEN` Worker
-secret (see `.env.example`).
+**The transit routes are still unauthenticated.** `/internal/*` and the
+transit `/v1/*` routes stay public until the device-token model lands; they
+are limited to the curated feed allowlist (`vars.CURATED_FEEDS` in
+`api/wrangler.jsonc`) and per-IP rate limiting, and expose only
+already-public transit data. The locate diagnostics surfaces are gated by a
+`DIAG_TOKEN` Worker secret (see `.env.example`). Accounts exist on
+`/v1/auth/*` — see [Signing in](#signing-in) — and everything user-owned
+that arrives in later milestones goes behind them.
 
 ## The read API (Phase 3)
 
@@ -448,6 +450,50 @@ Security headers for the static side come from `config-ui/src/_headers`
 (CSP, `nosniff`, `Referrer-Policy: no-referrer`, `frame-ancestors 'none'`).
 The Worker-served sign-in callback is a separate route with its own
 nonce-based CSP.
+
+### Signing in
+
+There are no passwords. You type an address, the Worker mails a single-use
+link, and opening it signs the browser in.
+
+| Route | What it does |
+| --- | --- |
+| `POST /v1/auth/request` | Ask for a link. **Always** answers `200 {"ok":true}` |
+| `GET /v1/auth/callback` | The Worker-served interstitial the emailed link opens |
+| `POST /v1/auth/redeem` | The only thing that consumes a token |
+| `POST /v1/auth/signout` | Revokes the session server-side and clears the cookie |
+| `GET /v1/auth/mode` | `{"auth_mode":"single"\|"multi"}` — drives the single-user banner |
+
+Requesting a link requires a configured mail provider — set
+`AUTH_EMAIL_PROVIDER` (and its provider's variables) as described in
+`.env.example`. With none set, sign-in is disabled outright and
+`/v1/auth/request` answers `503`; there is deliberately no fallback that
+prints tokens. For local work, `AUTH_EMAIL_PROVIDER=console` prints the link
+to the Worker log and refuses to start without an `AUTH_ALLOWED_EMAILS` list.
+
+**Registration is allowlist-gated by default.** Only addresses in
+`AUTH_ALLOWED_EMAILS` can receive a link; clearing the variable is the
+deliberate opt-in to open sign-up. An address that is not on the list gets
+the same `200 {"ok":true}` as one that is — the response never reveals
+whether an address has an account, is on the allowlist, or has exhausted its
+daily send budget.
+
+Three details are load-bearing and easy to undo by accident:
+
+- **The token rides in the URL fragment**, so it is never in a request line,
+  a query string, a `Referer`, or a server log. The interstitial reads
+  `location.hash`, strips it from the address bar, and `POST`s it.
+- **Only a POST consumes a token.** Mail gateways prefetch links with GETs;
+  a scanner's GET must not burn a sign-in link before its owner clicks it.
+- **A `__Host-` nonce cookie set at request time is matched at redemption.**
+  `SameSite=Lax` means it is simply absent when the link is opened on another
+  device or inside a mail app's webview, so a mismatch is not an error: the
+  interstitial names the address being signed in and asks for a confirmation,
+  and the token stays valid until you give it.
+
+Emailed links point at the origin of the request that asked for one. On a
+deployment answering to more than one hostname, set `AUTH_PUBLIC_ORIGIN` to
+pin them to the real front door.
 
 ### The location check
 

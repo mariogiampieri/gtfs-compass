@@ -1,4 +1,5 @@
 import { adapterGroups } from "./adapters";
+import { routeAuth } from "./routes/auth";
 import { routeDepartures } from "./routes/departures";
 import { routeLocate } from "./routes/locate";
 import { routeNearby } from "./routes/nearby";
@@ -31,6 +32,17 @@ const RATE_REFILL_PER_SEC = 5;
 const LOCATE_RATE_CAPACITY = 10; // burst
 const LOCATE_RATE_REFILL_PER_SEC = 1;
 
+// /v1/auth* gets its own bucket rather than borrowing the general one because
+// it is the only credential-issuing surface here: a burst that is unremarkable
+// for a departures read is, on this path, either a mail-bomb aimed at one
+// address or a run of guesses at a live sign-in token. The per-address and
+// global send budgets (R4) bound the mail; this bounds everything else —
+// including redemption attempts, which the budgets do not see at all.
+// 12/minute sustained, 10 burst: a human signing in spends 3 (mode, request,
+// redeem) and a page reload spends 1.
+const AUTH_RATE_CAPACITY = 10; // burst
+const AUTH_RATE_REFILL_PER_SEC = 0.2;
+
 type RateBuckets = Map<string, { tokens: number; lastMs: number }>;
 
 // In-isolate caches: best-effort (reset on isolate recycle), which is the
@@ -38,6 +50,7 @@ type RateBuckets = Map<string, { tokens: number; lastMs: number }>;
 const adapterCache = new Map<string, string | null>();
 const rateBuckets: RateBuckets = new Map();
 const locateRateBuckets: RateBuckets = new Map();
+const authRateBuckets: RateBuckets = new Map();
 
 export function rateLimited(
   ip: string,
@@ -87,9 +100,12 @@ const STATION_ROUTE = /^\/internal\/([^/]+)\/all\/station\/([^/]+)$/;
 const ALERTS_ROUTE = /^\/internal\/([^/]+)\/alerts\/route\/([^/]+)$/;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  // `ctx` is threaded through because /v1/auth/request sends its mail in
+  // `waitUntil` (R2: the send happens after the response, so response timing
+  // cannot say whether mail went out).
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      return await route(request, env);
+      return await route(request, env, ctx);
     } catch (error) {
       // D1 hiccups and other unexpected failures keep the JSON error contract.
       console.error("route failed:", error);
@@ -98,8 +114,18 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function route(request: Request, env: Env): Promise<Response> {
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/v1/auth/")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (
+        rateLimited(ip, Date.now(), authRateBuckets, AUTH_RATE_CAPACITY, AUTH_RATE_REFILL_PER_SEC)
+      ) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routeAuth(request, env, url, ctx);
+    }
 
     if (
       url.pathname === "/v1/nearby" ||
