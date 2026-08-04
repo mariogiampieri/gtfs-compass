@@ -32,12 +32,37 @@ export const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ";
 export const USER_CODE_LENGTH = 8;
 
 /**
+ * What a toggle says when the grant is stored but nothing checks it yet.
+ *
+ * `read:departures` and `read:config` gate nothing today: `/v1/departures` and
+ * `/v1/nearby` are anonymous by design and name no scope, and the board's own
+ * config read does not exist yet — so a user who unchecks "Arrival times"
+ * would watch the board carry on displaying them. That is the exact failure the
+ * device list exists to prevent, and the repo already has the rule for a value
+ * it cannot stand behind: label it, the way stale data is labelled rather than
+ * quietly shown.
+ *
+ * **Removed by U13** (`/v1/departures` authenticated mode) **and U15**
+ * (`GET /v1/config/:device_id`) — the units that make each scope actually
+ * checked. Delete the flag from that scope's entry and this note stops
+ * rendering for it.
+ */
+export const UNENFORCED_NOTE =
+  "Recorded, but not enforced yet. Nothing checks the board against this permission today, so switching it off does not stop it. Your choice is stored now and starts being applied the moment the check ships — at which point a board without the permission is refused.";
+
+/**
  * The scopes, in the order they are shown, with what each one actually means
  * for the person deciding.
  *
- * `read:fix` carries a `warning` the other two do not, and the difference is
- * the point: departures and configuration are what the board is *for*, and the
- * location grant is a separate decision with a separate consequence.
+ * Two fields carry the honesty of the screen and are worth reading as a pair:
+ *
+ *  - `warning` is on `read:fix` alone, and the difference is the point:
+ *    departures and configuration are what the board is *for*, and the location
+ *    grant is a separate decision with a separate consequence.
+ *
+ *  - `enforced` is opt-*in*, so a scope added later is labelled unenforced
+ *    until someone states otherwise. The wrong way round would have a new
+ *    toggle silently claim an authority nothing implements.
  */
 export const SCOPES = Object.freeze([
   Object.freeze({
@@ -57,6 +82,9 @@ export const SCOPES = Object.freeze([
       "Off unless you turn it on. Pairing never grants it: a board on a shelf has no reason to know where you are.",
     warning:
       "Turning this on means this device will receive your phone's live position, every time your phone sends one, until you turn it back off. Turning it off stops that and deletes the position already sent to this device.",
+    // Off by default, stored when granted, and revoking it really does delete
+    // the position already delivered — the one toggle whose "off" is a fact.
+    enforced: true,
   }),
 ]);
 
@@ -93,6 +121,21 @@ export const PAIRED_MESSAGE =
 export const DEVICES_UNAVAILABLE_MESSAGE = "Could not load your devices. Try again in a moment.";
 export const UNPAIRED_MESSAGE =
   "Unpaired. That board's credential stops working immediately, and any position it was sent has been deleted.";
+/**
+ * A failed unpair is not a failed read, and must not borrow the read's words:
+ * this is the last thing on screen after the user tried to cut off a board they
+ * may believe is stolen, and it has to say that the board still works.
+ */
+export const UNPAIR_FAILED_MESSAGE =
+  "Could not unpair that device. It is still paired and its credential still works — try again.";
+/**
+ * The confirm step came back as anything other than "paired". No server path
+ * produces it today (`/v1/pair/claim` answers a confirmed claim 200 or an
+ * error), so this is the fallback for a shape that should not exist — which is
+ * exactly when announcing "Paired." would be the expensive mistake.
+ */
+export const PAIR_NOT_COMPLETED_MESSAGE =
+  "That pairing did not complete. Nothing was attached to your account — ask the device for a fresh code and try again.";
 export const SCOPE_CONFLICT_MESSAGE =
   "This device changed somewhere else. Reloading the list to show what it actually holds.";
 export const SCOPE_FAILED_MESSAGE = "Could not change that permission. Nothing was changed.";
@@ -288,7 +331,7 @@ export async function unpairDevice(deviceId, fetchImpl) {
     return { state: "error", message: OFFLINE_MESSAGE };
   }
   if (res.status === 401) return { state: "signed-out", message: SIGNED_OUT_MESSAGE };
-  if (!res.ok) return { state: "error", message: DEVICES_UNAVAILABLE_MESSAGE };
+  if (!res.ok) return { state: "error", message: UNPAIR_FAILED_MESSAGE };
   return { state: "ok", message: UNPAIRED_MESSAGE };
 }
 

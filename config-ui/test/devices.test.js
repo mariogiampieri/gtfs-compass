@@ -8,11 +8,14 @@ import {
   CODE_UNKNOWN_MESSAGE,
   CONFIRM_WARNING,
   DEVICES_PATH,
+  DEVICES_UNAVAILABLE_MESSAGE,
   OFFLINE_MESSAGE,
   SCOPES,
   SCOPE_CONFLICT_MESSAGE,
   SIGNED_OUT_MESSAGE,
+  UNENFORCED_NOTE,
   UNPAIRED_MESSAGE,
+  UNPAIR_FAILED_MESSAGE,
   cap,
   claimCode,
   fetchDevices,
@@ -198,6 +201,29 @@ describe("scope toggles", () => {
   it("lists read:fix as off-by-default in its own copy", () => {
     expect(SCOPES.find((s) => s.id === "read:fix").summary).toMatch(/off unless you turn it on/i);
   });
+
+  it("does not claim a permission is enforced when nothing checks it (F5)", () => {
+    // `/v1/departures` and `/v1/nearby` name no scope — they are anonymous by
+    // design (R10) — and the board's own config read is U15. So unchecking
+    // either of these two changes nothing the user can observe, and a toggle
+    // that stays silent about that is the failure this list exists to prevent.
+    // Enforcement arrives with U13 and U15; the label goes then, not before.
+    for (const id of ["read:departures", "read:config"]) {
+      expect(SCOPES.find((s) => s.id === id).enforced).not.toBe(true);
+    }
+    // read:fix is genuinely off by default, genuinely stored, and revoking it
+    // genuinely deletes the delivered position. It is not labelled.
+    expect(SCOPES.find((s) => s.id === "read:fix").enforced).toBe(true);
+  });
+
+  it("says what is true today and what changes when the check ships (F5)", () => {
+    expect(UNENFORCED_NOTE).toMatch(/not enforced yet/i);
+    // Today: recorded, and switching it off does not stop the board.
+    expect(UNENFORCED_NOTE).toMatch(/recorded|stored/i);
+    expect(UNENFORCED_NOTE).toMatch(/does not stop it/i);
+    // Later: the grant starts being applied, and a board without it is refused.
+    expect(UNENFORCED_NOTE).toMatch(/refused/i);
+  });
 });
 
 describe("unpairing", () => {
@@ -214,6 +240,16 @@ describe("unpairing", () => {
   it("tells the user that revocation already happened, not that it will", () => {
     expect(UNPAIRED_MESSAGE).toMatch(/immediately/i);
     expect(UNPAIRED_MESSAGE).toMatch(/deleted/i);
+  });
+
+  it("says a revocation failed, not that a list failed to load (F9)", async () => {
+    // The read's copy would leave the user believing the credential may already
+    // be gone while the board keeps working — on the screen reached after a
+    // theft. Same split as setScope's SCOPE_FAILED / DEVICES_UNAVAILABLE.
+    const result = await unpairDevice("dev_1", async () => json({ error: "x" }, 500));
+    expect(result).toEqual({ state: "error", message: UNPAIR_FAILED_MESSAGE });
+    expect(UNPAIR_FAILED_MESSAGE).not.toBe(DEVICES_UNAVAILABLE_MESSAGE);
+    expect(UNPAIR_FAILED_MESSAGE).toMatch(/still paired|still works/i);
   });
 });
 

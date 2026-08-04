@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SEND_FAILURE_SCOPE, budgetDay } from "../../src/email";
 import worker from "../../src/index";
+import { PAIR_CLAIM_REFUSED_SCOPE, PAIR_START_REFUSED_SCOPE } from "../../src/routes/pair";
 import {
   DEFAULT_PRECISE_DAYS,
   DEFAULT_RETENTION_DAYS,
@@ -344,6 +345,33 @@ describe("credential and counter sweeps — the tables nothing else bounds", () 
     expect(result.counts.auth_budgets_deleted).toBe(1);
     const rows = await env.DB.prepare("SELECT scope FROM auth_budgets").all<{ scope: string }>();
     expect(rows.results.map((r) => r.scope)).toEqual([SEND_FAILURE_SCOPE]);
+  });
+
+  it("retains the pairing global-refusal counters, which record a lockout an operator looks for the next day", async () => {
+    const today = budgetDay();
+    await env.DB.prepare(
+      `INSERT INTO auth_budgets (scope, key, day, shard, count)
+       VALUES (?1, 'fresh', ?3, 0, 4),
+              (?2, 'fresh', ?3, 0, 7),
+              ('pair:start:ip', 'k', ?3, 0, 9)`,
+    )
+      .bind(PAIR_START_REFUSED_SCOPE, PAIR_CLAIM_REFUSED_SCOPE, today - 1)
+      .run();
+
+    const result = await runRetentionPurge(e());
+
+    // A global budget is exhausted by an attacker and the deployment cannot
+    // pair; the operator looks the next morning. If the sweep took these with
+    // the ordinary counters, the only durable evidence would already be gone.
+    expect(result.counts.auth_budgets_deleted).toBe(1);
+    const rows = await env.DB.prepare("SELECT scope, count FROM auth_budgets ORDER BY scope").all<{
+      scope: string;
+      count: number;
+    }>();
+    expect(rows.results).toEqual([
+      { scope: PAIR_CLAIM_REFUSED_SCOPE, count: 7 },
+      { scope: PAIR_START_REFUSED_SCOPE, count: 4 },
+    ]);
   });
 });
 

@@ -175,6 +175,26 @@ async function readDevice(
     .first<DeviceRow>();
 }
 
+/**
+ * Whether this device id is this account's **at all**, revoked or not.
+ *
+ * Deliberately blind to `revoked_at`, which is the whole difference from
+ * `readDevice`: once a row is revoked it is invisible to the list, to the scope
+ * toggle, and to `ON DELETE CASCADE`, so anything left hanging off it has no
+ * reaper but retention's sweep. `handleUnpair` is the one place that needs to
+ * see through the revocation, and it still answers 404 either way.
+ */
+async function ownsDevice(env: Env, auth: Authorized, deviceId: string): Promise<boolean> {
+  const { owner } = auth;
+  const idIndex = owner.binds.length + 1;
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok FROM devices WHERE ${owner.sql} AND id = ?${idIndex}`,
+  )
+    .bind(...owner.binds, deviceId)
+    .first<{ ok: number }>();
+  return row !== null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* GET /v1/config/devices (R18)                                                */
 /* -------------------------------------------------------------------------- */
@@ -222,12 +242,15 @@ async function handleScope(request: Request, env: Env, deviceId: string): Promis
   const body = await readJsonBody(request);
   if (!body) return withSession(auth, noStoreJson({ error: "invalid JSON body" }, 400));
 
-  const requested = typeof body.scope === "string" ? parseScopes(body.scope) : [];
-  const scope = requested[0];
-  // parseScopes drops anything unrecognized, so an unknown scope arrives here
-  // as an empty list — which is a 400, never a silent no-op that answers 200
-  // and leaves the UI believing a grant it asked for exists.
-  if (requested.length !== 1 || !scope) {
+  // Matched against the scope set directly, never through `parseScopes` —
+  // that one is a *column* parser, and a column is a list: it splits on commas
+  // and drops what it does not recognize, so `"bogus,read:fix"` would reach
+  // this handler as a well-formed single-scope request. An unknown or
+  // ambiguous scope is a 400, never a silent no-op that answers 200 and leaves
+  // the UI believing the grant it worded was the grant that happened.
+  const requested = typeof body.scope === "string" ? body.scope.trim() : "";
+  const scope = KNOWN_SCOPES.find((known) => known === requested);
+  if (!scope) {
     return withSession(
       auth,
       noStoreJson({ error: `scope must be one of ${KNOWN_SCOPES.join(", ")}` }, 400),
@@ -248,6 +271,10 @@ async function handleScope(request: Request, env: Env, deviceId: string): Promis
   // the order the toggles happened to be flipped in — the CAS below compares
   // strings.
   const next = formatScopes(KNOWN_SCOPES.filter((s) => current.has(s)));
+
+  // What the response reports. Reassigned only by the lost-CAS path, which
+  // answers from the row it re-read rather than from the row it started with.
+  let effective: DeviceRow = { ...row, scopes: next };
 
   if (next !== (row.scopes ?? "")) {
     const { owner } = auth;
@@ -270,7 +297,11 @@ async function handleScope(request: Request, env: Env, deviceId: string): Promis
           noStoreJson({ error: "device scopes changed concurrently; reload and retry" }, 409),
         );
       }
-      return withSession(auth, noStoreJson(deviceView(fresh)));
+      // Same state, another writer: this request succeeded, so it falls
+      // through to the clear below rather than returning here. Returning would
+      // make "revoking read:fix deletes the fix" a property of whichever
+      // request won the race instead of a property of this handler.
+      effective = fresh;
     }
   }
 
@@ -283,7 +314,7 @@ async function handleScope(request: Request, env: Env, deviceId: string): Promis
     await clearFix(env, deviceId);
   }
 
-  return withSession(auth, noStoreJson(deviceView({ ...row, scopes: next })));
+  return withSession(auth, noStoreJson(deviceView(effective)));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -316,7 +347,19 @@ async function handleUnpair(request: Request, env: Env, deviceId: string): Promi
   // Zero rows is "not yours, not there, or already unpaired" — one answer, and
   // the tenancy half of it is the predicate above, not a check anyone had to
   // remember to write.
-  if ((revoked.meta?.changes ?? 0) !== 1) return withSession(auth, noSuchDevice());
+  if ((revoked.meta?.changes ?? 0) !== 1) {
+    // ...but an already-unpaired device of this account still gets the clear.
+    // The two writes here are deliberately unbatched (see `../relay`), so
+    // "revoked, not cleared" is a reachable state, and it is a terminal one:
+    // the row is out of `readDevice`, out of the list, and out of the
+    // cascade's reach, which leaves retention's 14-day sweep as the only other
+    // reaper of a position the user was already told had been deleted. A
+    // repeat unpair is the reachable path, and it answers the same 404 —
+    // nothing here distinguishes a device this account owns from one it does
+    // not, only what gets cleaned up behind that answer.
+    if (await ownsDevice(env, auth, deviceId)) await clearFix(env, deviceId);
+    return withSession(auth, noSuchDevice());
+  }
 
   await clearFix(env, deviceId);
 

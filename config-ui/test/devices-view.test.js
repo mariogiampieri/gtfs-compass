@@ -5,6 +5,7 @@ import {
   MAX_DISPLAY_FW,
   MAX_DISPLAY_NAME,
   SCOPES,
+  UNENFORCED_NOTE,
   UNKNOWN_FW,
   UNNAMED_DEVICE,
   UNTRUSTED_NOTE,
@@ -144,6 +145,21 @@ describe("the device list itself (R18)", () => {
     const fix = list.querySelector('input[data-scope="read:fix"]');
     expect(fix.checked).toBe(false);
     expect(list.querySelector(".scope-warning").textContent).toMatch(/live position/i);
+  });
+
+  it("marks the toggles that gate nothing yet, on the row itself (F5)", () => {
+    const list = document.createElement("ul");
+    renderDevices(list, [entry()], handlers);
+
+    // Row-level, not a footnote: the claim being corrected is made by the
+    // checkbox, so the correction has to sit with the checkbox.
+    for (const id of ["read:departures", "read:config"]) {
+      const row = list.querySelector(`input[data-scope="${id}"]`).closest(".scope");
+      expect(row.textContent).toContain(UNENFORCED_NOTE);
+    }
+    const fixRow = list.querySelector('input[data-scope="read:fix"]').closest(".scope");
+    expect(fixRow.textContent).not.toContain(UNENFORCED_NOTE);
+    expect(list.querySelectorAll(".scope-unenforced")).toHaveLength(2);
   });
 
   it("reports a toggle with the device, the scope and the new state", () => {

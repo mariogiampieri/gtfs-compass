@@ -461,6 +461,14 @@ matters and it says so: turning it on means *this device will receive your
 phone's live position* until you turn it off, and turning it off both stops
 that and deletes the position already sent to that board.
 
+The other two checkboxes are labelled **recorded, but not enforced yet**, and
+the label is deliberate. `/v1/departures` and `/v1/nearby` are anonymous by
+design and name no scope, and a board's own config read does not exist yet, so
+unchecking "Arrival times" today stores your choice without stopping the board
+from displaying arrivals. Same rule the API applies to stale data: say so
+rather than show a control that quietly does nothing. The label goes when
+those routes start checking the grant.
+
 Prerequisites: Node.js 18+ — nothing else. There is no framework and no
 bundler; the UI is hand-written HTML, CSS, and native ES modules, and the
 "build" copies `config-ui/src/` to `config-ui/dist/` and fails if any emitted
@@ -602,12 +610,32 @@ Five properties are load-bearing:
   escaped, length-capped** text, because the name is whatever the device said
   it was — before anything is bound.
 - **Guessing is budgeted in D1, not in memory.** Attempts are counted per
-  signed-in claimer *and* per IP, **including attempts against codes that do
-  not exist**, since a per-code counter is no defense against spraying the
-  live-code space. A specific code is separately destroyed after five attempts
-  against it, and a pairing request expires in five minutes. Tune the caps
-  with the `PAIR_*_BUDGET_*` variables in `.env.example`; each takes `0` as a
-  kill switch.
+  signed-in claimer *and* per client network, **including attempts against
+  codes that do not exist**, since a per-code counter is no defense against
+  spraying the live-code space. A specific code is separately destroyed after
+  five attempts against it, and a pairing request expires in five minutes. Tune
+  the caps with the `PAIR_*_BUDGET_*` variables in `.env.example`; each takes
+  `0` as a kill switch.
+- **No cap here is an off switch a stranger can flip.** The per-caller budgets
+  are keyed to the /24 or /64, not to the address — a per-address cap is not a
+  cap when the smallest IPv6 allocation holds 2^64 of them — and the
+  deployment-wide caps are *split*, exactly like the send budgets: a network's
+  (or an account's) first few requests of the day draw on a `FRESH` slice that
+  repeat traffic cannot touch. Without that, ~25 addresses could spend one
+  shared counter in minutes and every honest board would get `429` until
+  midnight UTC. If a slice does run out, the refusal is recorded rather than
+  merely logged — that is a real outage of a feature nobody would otherwise see:
+
+  ```bash
+  cd api
+  npx wrangler d1 execute gtfs-compass --remote \
+    --command "SELECT scope, key, SUM(count) FROM auth_budgets
+                WHERE scope LIKE 'pair:%:refused' GROUP BY scope, key"
+  ```
+
+  Any row here means honest callers in that class were turned away today; the
+  fix is to raise the matching `PAIR_*_BUDGET_FRESH`/`_REPEAT` var. (The daily
+  retention sweep clears yesterday's counters, so read it the same day.)
 - **A freshly paired device cannot see your location.** Pairing grants
   `read:departures` and `read:config` only. `read:fix` — the scope that lets a
   board receive your phone's live position — is never implied by pairing and
@@ -629,7 +657,11 @@ under a unique index and resolves in one indexed lookup.
   rule in the resolver rather than a guard each route has to remember. A
   request for a scope the device was not granted is also a `403`; a device
   token holding `read:config` may read *its own* device's configuration and no
-  other board's, including boards on the same account.
+  other board's, including boards on the same account. **No route names
+  `read:departures` or `read:config` yet**, so those two grants are stored,
+  listed, and not currently checked against anything — which the device list
+  says on the toggle rather than leaving an unchecked box to imply a board was
+  cut off.
 - **Revocation is immediate, on both sides.** Unpairing sets `revoked_at` and
   the very next request is a `401` — the same `401`, byte for byte, that a
   token which never existed gets, so a token found in flash tells its holder

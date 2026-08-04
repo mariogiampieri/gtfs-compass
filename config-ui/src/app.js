@@ -15,6 +15,7 @@ import { requestMagicLink } from "./auth.js";
 import {
   CONFIRM_WARNING,
   PAIRED_MESSAGE,
+  PAIR_NOT_COMPLETED_MESSAGE,
   claimCode,
   fetchDevices,
   setScope,
@@ -226,11 +227,17 @@ function mountPairing() {
     const result = await claimCode(pending, { confirm: true });
     confirmYes.disabled = false;
     closeConfirm();
-    show(status, result.message ?? PAIRED_MESSAGE);
-    if (result.state === "paired") {
-      form.reset();
-      await refreshDevices();
+    // The success copy is gated on the state, never on the message being
+    // absent. `claimCode` maps every 409 to a `confirm` result carrying no
+    // message, so defaulting to PAIRED_MESSAGE would announce a pairing on the
+    // one screen whose entire job is saying what got attached to this account.
+    if (result.state !== "paired") {
+      show(status, result.message ?? PAIR_NOT_COMPLETED_MESSAGE);
+      return;
     }
+    show(status, result.message ?? PAIRED_MESSAGE);
+    form.reset();
+    await refreshDevices();
   });
 
   // The device sends the human to /pair; the SPA fallback answers it with this

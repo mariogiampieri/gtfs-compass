@@ -43,6 +43,12 @@
  * an error — a device that was never granted `read:fix`, or was granted it and
  * never had a phone post one, has nothing to clear.
  *
+ * Idempotence is also what makes a *retry* a repair, and callers rely on that.
+ * Because the revoke and the clear are two unbatched writes (see above), the
+ * second can fail on its own; `routes/config.ts` therefore re-runs this against
+ * devices that are already revoked, and against grants that are already off,
+ * rather than treating "nothing to change" as "nothing to do".
+ *
  * Callers revoke the grant *first* and clear *second*, never the other way
  * round. The order is what closes the window against a concurrent
  * `putFixForUser`, whose fan-out predicate is "this user's devices holding

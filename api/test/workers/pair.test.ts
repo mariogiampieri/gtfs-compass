@@ -9,13 +9,18 @@ import {
   MAX_DEVICE_NAME_LENGTH,
   PAIRING_CODE_TTL_S,
   PAIR_CLAIMER_SCOPE,
-  PAIR_CLAIM_GLOBAL_SCOPE,
+  PAIR_CLAIM_FRESH_SCOPE,
   PAIR_CLAIM_IP_SCOPE,
-  PAIR_START_GLOBAL_SCOPE,
+  PAIR_CLAIM_REFUSED_SCOPE,
+  PAIR_CLAIM_REPEAT_SCOPE,
+  PAIR_START_FRESH_SCOPE,
   PAIR_START_IP_SCOPE,
+  PAIR_START_REFUSED_SCOPE,
+  PAIR_START_REPEAT_SCOPE,
   USER_CODE_ALPHABET,
   USER_CODE_LENGTH,
   mintUserCode,
+  networkKey,
   normalizeUserCode,
   routePair,
 } from "../../src/routes/pair";
@@ -144,6 +149,33 @@ function bytes(value: number): number[] {
   return new Array<number>(USER_CODE_LENGTH).fill(value);
 }
 
+/**
+ * An `Env` whose D1 binding records every statement the route prepares, with
+ * the values it bound. Lets a test re-run the route's *own* SQL through
+ * `.all()`, which reports `meta.rows_read` — `.first()`, which the routes use,
+ * does not.
+ */
+function recordingEnv(sink: { sql: string; args: unknown[] }[]): Env {
+  const db = {
+    prepare(sql: string) {
+      const entry = { sql, args: [] as unknown[] };
+      sink.push(entry);
+      const real = env.DB.prepare(sql);
+      return {
+        bind: (...args: unknown[]) => {
+          entry.args = args;
+          return real.bind(...args);
+        },
+        first: real.first.bind(real),
+        all: real.all.bind(real),
+        run: real.run.bind(real),
+      };
+    },
+    batch: env.DB.batch.bind(env.DB),
+  };
+  return e({ DB: db });
+}
+
 async function codeRows(): Promise<Record<string, unknown>[]> {
   const { results } = await env.DB.prepare("SELECT * FROM pairing_codes").all();
   return results as Record<string, unknown>[];
@@ -270,7 +302,11 @@ describe("POST /v1/device/pair/start", () => {
   it("caps and strips device-supplied metadata at rest (R8)", async () => {
     await start({
       device_name: `${"n".repeat(200)}`,
-      fw_version: "1.0 ‮0.1",
+      // Escapes, never raw bytes: one literal NUL in this file makes `file`
+      // report the whole thing as `data`, which takes it out of every repo-wide
+      // grep and log scraper that skips binaries. U+0000 is the C0 control,
+      // U+202E is RIGHT-TO-LEFT OVERRIDE.
+      fw_version: "1.0\u0000\u202E0.1",
     });
     const row = (await codeRows())[0];
     expect((row.device_name as string).length).toBe(MAX_DEVICE_NAME_LENGTH);
@@ -340,40 +376,52 @@ describe("pair/start is bounded before it writes (R7)", () => {
 
     // D1-backed, not in-isolate: the count is readable straight out of the
     // sharded counter table, and a brand-new Env object sees the same refusal.
-    expect(await readBudget(env, PAIR_START_IP_SCOPE, await hashToken(IP))).toBe(3);
+    expect(await readBudget(env, PAIR_START_IP_SCOPE, await hashToken(networkKey(IP)))).toBe(3);
     expect((await call(req("/v1/device/pair/start"), e({ PAIR_START_BUDGET_IP: "3" }))).status).toBe(
       429,
     );
   });
 
-  it("keys the budget per IP, and never stores the address in the clear", async () => {
+  it("keys the budget to the network, not the address, and stores neither in the clear", async () => {
     const env1 = e({ PAIR_START_BUDGET_IP: "1" });
     expect((await call(req("/v1/device/pair/start", { ip: "198.51.100.1" }), env1)).status).toBe(200);
-    expect((await call(req("/v1/device/pair/start", { ip: "198.51.100.1" }), env1)).status).toBe(429);
-    // A different address is a different budget.
-    expect((await call(req("/v1/device/pair/start", { ip: "198.51.100.2" }), env1)).status).toBe(200);
+    // A per-address key is not a bound: changing the last octet — or, in IPv6,
+    // any of the 2^64 host bits a subscriber is handed — would otherwise buy a
+    // whole fresh budget for free.
+    expect((await call(req("/v1/device/pair/start", { ip: "198.51.100.2" }), env1)).status).toBe(429);
+    expect((await call(req("/v1/device/pair/start", { ip: "2001:db8::1" }), env1)).status).toBe(200);
+    expect((await call(req("/v1/device/pair/start", { ip: "2001:db8::dead:beef" }), env1)).status).toBe(
+      429,
+    );
+    // A different network is a different budget.
+    expect((await call(req("/v1/device/pair/start", { ip: "198.51.101.1" }), env1)).status).toBe(200);
+    expect((await call(req("/v1/device/pair/start", { ip: "2001:db8:0:1::1" }), env1)).status).toBe(200);
 
     const { results } = await env.DB.prepare("SELECT key FROM auth_budgets WHERE scope = ?1")
       .bind(PAIR_START_IP_SCOPE)
       .all<{ key: string }>();
     expect(results.length).toBeGreaterThan(0);
-    for (const row of results) expect(row.key).not.toContain("198.51.100");
+    for (const row of results) {
+      expect(row.key).not.toContain("198.51.100");
+      expect(row.key).not.toContain("2001");
+    }
   });
 
-  it("an exhausted global slice writes NO per-IP counter row (the ordering that matters)", async () => {
-    // The P1 shape from M1's review: the per-IP key is attacker-chosen, so if
-    // it were charged before the global bound were checked, a caller rotating
-    // addresses would grow `auth_budgets` for as long as they cared to POST.
+  it("an exhausted global slice writes NO per-network counter row (the ordering that matters)", async () => {
+    // The P1 shape from M1's review: the per-network key is attacker-chosen, so
+    // if it were charged before the global bound were checked, a caller
+    // rotating networks would grow `auth_budgets` for as long as they cared to
+    // POST.
     await env.DB.prepare(
       "INSERT INTO auth_budgets (scope, key, day, shard, count) VALUES (?1, '', ?2, 0, 99)",
     )
-      .bind(PAIR_START_GLOBAL_SCOPE, budgetDay())
+      .bind(PAIR_START_FRESH_SCOPE, budgetDay())
       .run();
 
-    const environment = e({ PAIR_START_BUDGET_GLOBAL: "99" });
-    for (const ip of ["192.0.2.1", "192.0.2.2", "192.0.2.3"]) {
+    const environment = e({ PAIR_START_BUDGET_FRESH: "99" });
+    for (const ip of ["192.0.2.1", "198.51.100.1", "203.0.113.9"]) {
       expect((await call(req("/v1/device/pair/start", { ip }), environment)).status).toBe(429);
-      expect(await readBudget(env, PAIR_START_IP_SCOPE, await hashToken(ip))).toBe(0);
+      expect(await readBudget(env, PAIR_START_IP_SCOPE, await hashToken(networkKey(ip)))).toBe(0);
     }
     expect(await codeRows()).toHaveLength(0);
     const { results } = await env.DB.prepare(
@@ -385,10 +433,109 @@ describe("pair/start is bounded before it writes (R7)", () => {
   });
 
   it("treats 0 as a kill switch, not as an unset value", async () => {
-    expect((await call(req("/v1/device/pair/start"), e({ PAIR_START_BUDGET_IP: "0" }))).status).toBe(
-      429,
-    );
+    for (const kill of [
+      { PAIR_START_BUDGET_IP: "0" },
+      { PAIR_START_BUDGET_FRESH: "0" },
+    ]) {
+      expect((await call(req("/v1/device/pair/start"), e(kill))).status).toBe(429);
+    }
     expect(await codeRows()).toHaveLength(0);
+  });
+
+  it("spends the repeat slice on a network that keeps starting, never the fresh one", async () => {
+    // The split, in one caller: the first few starts from a network draw on
+    // `fresh`, and everything past them on `repeat`. Sized so the repeat slice
+    // runs out while the fresh one is barely touched.
+    const environment = e({ PAIR_START_BUDGET_FRESH: "50", PAIR_START_BUDGET_REPEAT: "3" });
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      statuses.push((await call(req("/v1/device/pair/start", { ip: "192.0.2.5" }), environment)).status);
+    }
+    // Four fresh charges, three repeat charges, then this network is done for
+    // the day even though 46 of the 50 fresh starts are still unspent.
+    expect(statuses.filter((s) => s === 200)).toHaveLength(7);
+    expect(statuses.slice(7)).toEqual([429, 429, 429]);
+    expect(await readBudget(env, PAIR_START_FRESH_SCOPE, "")).toBe(4);
+    expect(await readBudget(env, PAIR_START_REPEAT_SCOPE, "")).toBe(3);
+  });
+
+  it("a flood that spends the global budget does NOT lock out an honest board (F1)", async () => {
+    // The attack the reviewers named, at the SHIPPED defaults — no env
+    // overrides, because the point is what a stock deployment does. Under a
+    // single 500/day global counter, 25 addresses at the per-caller cap of 20
+    // spend the entire deployment's day and every honest device 429s until
+    // 00:00 UTC. Twenty-five addresses is one afternoon of a proxy pool, or
+    // twenty-five of the 2^64 addresses in one IPv6 /64.
+    let accepted = 0;
+    for (let net = 0; net < 25; net++) {
+      for (let i = 0; i < 20; i++) {
+        const ip = `2001:db8:${net.toString(16)}::${i.toString(16)}`;
+        if ((await call(req("/v1/device/pair/start", { ip }))).status === 200) accepted++;
+      }
+    }
+    // The flood got somewhere — this is a real spend, not a no-op setup — and
+    // was cut off well short of the 500 a shared counter would have handed it.
+    expect(accepted).toBeGreaterThan(0);
+    expect(accepted).toBeLessThan(500);
+    expect(await readBudget(env, PAIR_START_REPEAT_SCOPE, "")).toBe(100);
+
+    // The property that matters, and the one the old tests never asked: a third
+    // party who has done nothing wrong can still pair a board.
+    const honest = await call(req("/v1/device/pair/start", { ip: "192.0.2.200" }));
+    expect(honest.status).toBe(200);
+  }, 30_000);
+
+  it("records a globally-refused start where an operator can see it, not just in the log", async () => {
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const environment = e({ PAIR_START_BUDGET_FRESH: "0" });
+      expect((await call(req("/v1/device/pair/start"), environment)).status).toBe(429);
+      expect((await call(req("/v1/device/pair/start"), environment)).status).toBe(429);
+    } finally {
+      spy.mockRestore();
+    }
+    // A durable counter, keyed by slice: "pairing has been off for eleven
+    // hours" must not be indistinguishable from "nobody paired a board today".
+    expect(await readBudget(env, PAIR_START_REFUSED_SCOPE, "fresh")).toBe(2);
+    expect(errors.join("\n")).toContain("fresh");
+    // A refusal still writes nothing keyed to the caller.
+    expect(await readBudget(env, PAIR_START_IP_SCOPE, await hashToken(networkKey(IP)))).toBe(0);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The budget key (F1) — a network, never an address                           */
+/* -------------------------------------------------------------------------- */
+
+describe("networkKey", () => {
+  it("truncates IPv4 to the /24 and IPv6 to the /64", () => {
+    expect(networkKey("203.0.113.7")).toBe("203.0.113.0/24");
+    expect(networkKey("203.0.113.250")).toBe(networkKey("203.0.113.7"));
+    expect(networkKey("203.0.114.7")).not.toBe(networkKey("203.0.113.7"));
+
+    // Every host bit inside one /64 is one key, however the address is written:
+    // compressed, expanded, upper case, leading zeros, or with a zone index.
+    const prefix = networkKey("2001:db8:1:2::1");
+    for (const form of [
+      "2001:db8:1:2:0:0:0:9999",
+      "2001:0db8:0001:0002::abcd",
+      "2001:DB8:1:2::1",
+      "2001:db8:1:2::1%eth0",
+    ]) {
+      expect(networkKey(form), form).toBe(prefix);
+    }
+    expect(networkKey("2001:db8:1:3::1")).not.toBe(prefix);
+  });
+
+  it("gives anything unparseable one shared key rather than one key each", () => {
+    // Fails safe: `unknown` (no CF-Connecting-IP) and any form the edge does
+    // not emit share a single tight budget instead of minting budgets.
+    expect(networkKey("unknown")).toBe("unknown");
+    expect(networkKey("999.1.2.3")).toBe("999.1.2.3");
+    expect(networkKey("1:2:3")).toBe("1:2:3");
   });
 });
 
@@ -650,23 +797,70 @@ describe("attempt budgets (R7; AE5)", () => {
     expect(
       (await call(claimReq(mintUserCode(), otherCookie, { confirm: true }), environment)).status,
     ).toBe(429);
-    expect(await readBudget(env, PAIR_CLAIM_IP_SCOPE, await hashToken(IP))).toBe(3);
+    expect(await readBudget(env, PAIR_CLAIM_IP_SCOPE, await hashToken(networkKey(IP)))).toBe(3);
   });
 
-  it("an exhausted global slice writes no per-claimer or per-IP counter row", async () => {
+  it("an exhausted global slice writes no per-claimer or per-network counter row", async () => {
     await env.DB.prepare(
       "INSERT INTO auth_budgets (scope, key, day, shard, count) VALUES (?1, '', ?2, 0, 7)",
     )
-      .bind(PAIR_CLAIM_GLOBAL_SCOPE, budgetDay())
+      .bind(PAIR_CLAIM_FRESH_SCOPE, budgetDay())
       .run();
     const cookie = await session(OWNER);
     const res = await call(
       claimReq(mintUserCode(), cookie, { confirm: true }),
-      e({ PAIR_CLAIM_BUDGET_GLOBAL: "7" }),
+      e({ PAIR_CLAIM_BUDGET_FRESH: "7" }),
     );
     expect(res.status).toBe(429);
     expect(await readBudget(env, PAIR_CLAIMER_SCOPE, await hashToken(OWNER))).toBe(0);
-    expect(await readBudget(env, PAIR_CLAIM_IP_SCOPE, await hashToken(IP))).toBe(0);
+    expect(await readBudget(env, PAIR_CLAIM_IP_SCOPE, await hashToken(networkKey(IP)))).toBe(0);
+    // And the refusal is on the operator's counter, not only in the log tail.
+    expect(await readBudget(env, PAIR_CLAIM_REFUSED_SCOPE, "fresh")).toBe(1);
+  });
+
+  it("an account spending its whole claim budget does NOT lock out another account (F2)", async () => {
+    // A claim costs a session, which raises the price of this attack without
+    // removing it: registration is open whenever AUTH_ALLOWED_EMAILS is empty,
+    // and accounts accumulate across days while the counter resets daily. The
+    // per-claimer cap of 10/day already bounds this account; what the global
+    // counter must not do is let that spend reach anybody else.
+    const attacker = await session(OTHER);
+    const environment = e({
+      PAIR_CLAIM_BUDGET_CLAIMER: "10",
+      PAIR_CLAIM_BUDGET_IP: "50",
+      // The whole repeat slice is what one account past its first few attempts
+      // can reach; the loop below spends it exactly. The fresh slice is only
+      // large enough that a single shared counter of the same total (8 + 6)
+      // would have run out inside the loop — which is the point.
+      PAIR_CLAIM_BUDGET_FRESH: "8",
+      PAIR_CLAIM_BUDGET_REPEAT: "6",
+    });
+    for (let i = 0; i < 10; i++) {
+      const res = await call(claimReq(mintUserCode(), attacker, { confirm: true }), environment);
+      expect(res.status, `spray ${i}`).toBe(404); // charged, and every guess misses
+    }
+    expect(await readBudget(env, PAIR_CLAIM_REPEAT_SCOPE, "")).toBe(6);
+
+    // The property the old tests never asked: an unrelated account can still
+    // pair a board. Its first attempts of the day land in the fresh slice,
+    // which the sprayer above could not touch.
+    const started = await start();
+    const owner = await session(OWNER);
+    const preview = await call(claimReq(started.user_code, owner), environment);
+    expect(preview.status).toBe(409);
+    const confirmed = await call(claimReq(started.user_code, owner, { confirm: true }), environment);
+    expect(confirmed.status).toBe(200);
+    expect((await codeRows())[0].claimed_by).toBe(OWNER);
+  });
+
+  it("treats 0 on either claim slice as a kill switch", async () => {
+    const cookie = await session(OWNER);
+    const res = await call(
+      claimReq(mintUserCode(), cookie, { confirm: true }),
+      e({ PAIR_CLAIM_BUDGET_FRESH: "0" }),
+    );
+    expect(res.status).toBe(429);
+    expect(await readBudget(env, PAIR_CLAIMER_SCOPE, await hashToken(OWNER))).toBe(0);
   });
 
   it("charges a successful claim too — a hit is still an attempt", async () => {
@@ -810,6 +1004,47 @@ describe("POST /v1/device/pair/poll", () => {
     const res = await call(req("/v1/device/pair/poll"));
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "invalid_request" });
+  });
+
+  it("costs O(1) rows read whatever the table holds — the reason it needs no budget (F3)", async () => {
+    // This route is unbudgeted and it is the highest-rate one here (RFC 8628
+    // advertises a 5-second interval), so what stands in for a D1 budget is
+    // the unique index on `device_code_hash`: a caller who does not hold a
+    // device code reads *zero* rows, and one who does reads one. Charging a
+    // counter instead would swap that for two SELECTs and an UPSERT — a write,
+    // on an unauthenticated path. The moment the lookup stops being
+    // index-covered that trade is wrong, which is what this pins.
+    const now = nowSec();
+    for (let i = 0; i < 300; i++) {
+      await env.DB.prepare(
+        `INSERT INTO pairing_codes (id, device_code_hash, user_code, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)`,
+      )
+        .bind(`pcd_bulk_${i}`, `hash_bulk_${i}`, mintUserCode(), now, now + PAIRING_CODE_TTL_S)
+        .run();
+    }
+
+    // Replay the statement the route itself ran, so this cannot drift away
+    // from the real predicate: `.first()` hides `meta`, `.all()` reports it.
+    const started = await start();
+    const seen: { sql: string; args: unknown[] }[] = [];
+    const polled = await call(pollReq(started.device_code), recordingEnv(seen));
+    expect(polled.status).toBe(400); // authorization_pending: unclaimed
+
+    // Whatever the predicate becomes, it is this route's only read of the
+    // table — so a change that stops being index-covered lands here.
+    const lookup = seen.filter((s) => /^\s*SELECT[\s\S]*FROM pairing_codes/.test(s.sql));
+    expect(lookup).toHaveLength(1);
+    const hit = await env.DB.prepare(lookup[0].sql)
+      .bind(...lookup[0].args)
+      .all();
+    expect(hit.results).toHaveLength(1);
+    expect(hit.meta.rows_read).toBeLessThanOrEqual(1);
+
+    // And the case an abuser actually generates: a code nobody holds.
+    const miss = await env.DB.prepare(lookup[0].sql).bind(await hashToken("no-such-code")).all();
+    expect(miss.results).toHaveLength(0);
+    expect(miss.meta.rows_read).toBe(0);
   });
 });
 

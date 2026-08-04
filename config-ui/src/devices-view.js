@@ -34,6 +34,7 @@ import {
   MAX_DISPLAY_FW,
   MAX_DISPLAY_NAME,
   SCOPES,
+  UNENFORCED_NOTE,
   UNKNOWN_FW,
   UNNAMED_DEVICE,
   UNTRUSTED_NOTE,
@@ -123,6 +124,10 @@ function renderDevice(entry, handlers) {
     });
     label.append(input, el("span", undefined, ` ${scope.label}`));
     row.append(label, el("p", "muted", scope.summary));
+    // A control that does nothing yet says so, on the row, every render — the
+    // same discipline the API applies to stale data. `SCOPES` opts *in* to
+    // "enforced", so forgetting the flag over-labels rather than over-claims.
+    if (!scope.enforced) row.append(el("p", "scope-unenforced", UNENFORCED_NOTE));
     if (scope.warning) row.append(el("p", "scope-warning", scope.warning));
     item.append(row);
   }

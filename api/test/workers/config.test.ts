@@ -189,6 +189,7 @@ async function grant(
   scope: string,
   granted: boolean,
   opts: ReqOpts = {},
+  environment: Env = e(),
 ): Promise<Response> {
   return call(
     req(`/v1/config/devices/${deviceId}`, {
@@ -197,8 +198,91 @@ async function grant(
       body: { scope, granted },
       ...opts,
     }),
+    environment,
   );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Envs that make a partial failure and a lost race deterministic              */
+/* -------------------------------------------------------------------------- */
+
+/** Bind a host object's own method to it, so a Proxy can hand it back intact. */
+function passThrough(target: object, prop: string | symbol): unknown {
+  const value = Reflect.get(target, prop) as unknown;
+  return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+}
+
+/**
+ * An `Env` whose first `DELETE FROM device_fixes` throws.
+ *
+ * Unpair is two writes that are deliberately *not* batched (see `relay.ts`),
+ * so "the second one failed" is a state the system can genuinely be in — and
+ * the only honest way to test what it leaves behind is to put it there.
+ */
+function failingFixDelete(): Env {
+  const db = env.DB;
+  let armed = true;
+  return e({
+    DB: new Proxy(db, {
+      get(target, prop) {
+        if (prop !== "prepare") return passThrough(target, prop);
+        return (sql: string) => {
+          if (armed && sql.includes("DELETE FROM device_fixes")) {
+            armed = false;
+            throw new Error("D1: write failed");
+          }
+          return target.prepare(sql);
+        };
+      },
+    }),
+  });
+}
+
+/**
+ * An `Env` that runs `competitor` immediately before the first statement whose
+ * SQL contains `marker` — i.e. exactly in the window between this request's
+ * read and its write.
+ *
+ * Deterministic on purpose. A `Promise.all` of two requests exercises whatever
+ * interleaving the runtime happens to pick, which is worth asserting on but is
+ * not evidence that a specific compare-and-set branch ran.
+ */
+function raceBefore(marker: string, competitor: () => Promise<void>): Env {
+  const db = env.DB;
+  let armed = true;
+  const wrap = (stmt: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(stmt, {
+      get(target, prop) {
+        if (prop === "bind") {
+          return (...args: unknown[]) => wrap(target.bind(...args));
+        }
+        if (prop === "run") {
+          return async () => {
+            if (armed) {
+              armed = false;
+              await competitor();
+            }
+            return target.run();
+          };
+        }
+        return passThrough(target, prop);
+      },
+    });
+  return e({
+    DB: new Proxy(db, {
+      get(target, prop) {
+        if (prop !== "prepare") return passThrough(target, prop);
+        return (sql: string) => {
+          const stmt = target.prepare(sql);
+          return armed && sql.includes(marker) ? wrap(stmt) : stmt;
+        };
+      },
+    }),
+  });
+}
+
+/** The scope compare-and-set in `handleScope`, named for `raceBefore`. */
+const SCOPE_CAS = "UPDATE devices SET scopes";
 
 beforeEach(async () => {
   await resetSchema();
@@ -467,6 +551,20 @@ describe("granting and revoking a scope", () => {
     expect(await storedScopes(deviceId)).toEqual([...DEFAULT_DEVICE_SCOPES]);
   });
 
+  it("refuses a comma-joined scope rather than acting on the one it recognizes", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId } = await pairDevice(cookie);
+    // Each of these names more than one thing, or names one thing twice. The
+    // move the server would have made is unambiguous — nothing widens — but
+    // the *request* is not, and answering it 200 tells a client its exact
+    // wording was understood.
+    for (const scope of ["bogus,read:fix", "read:fix,read:fix", "read:fix,read:config", ""]) {
+      const res = await grant(cookie, deviceId, scope, true);
+      expect(res.status).toBe(400);
+    }
+    expect(await storedScopes(deviceId)).toEqual([...DEFAULT_DEVICE_SCOPES]);
+  });
+
   it("refuses a request that does not say whether it is granting or revoking", async () => {
     const cookie = await session(OWNER);
     const { deviceId } = await pairDevice(cookie);
@@ -563,6 +661,69 @@ describe("revoking read:fix clears the position already delivered", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* Two tabs at once — the compare-and-set branches                             */
+/* -------------------------------------------------------------------------- */
+
+describe("a scope change that loses the compare-and-set", () => {
+  it("still clears the fix when the winner asked for the same revocation", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    const environment = raceBefore(SCOPE_CAS, async () => {
+      await grant(cookie, deviceId, "read:fix", false);
+      // Re-seeded after the winner's own clear, so what this asserts is that
+      // *this* request cleared — not that somebody did. Leaning on the
+      // winner's second write is precisely the coupling being tested for.
+      await seedFix(deviceId);
+    });
+
+    const res = await grant(cookie, deviceId, "read:fix", false, {}, environment);
+
+    expect(res.status).toBe(200);
+    expect((await res.json<DeviceEntry>()).scopes).not.toContain("read:fix");
+    expect(await fixCount(deviceId)).toBe(0);
+  });
+
+  it("answers 409 and applies nothing when the concurrent change was a different one", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    const environment = raceBefore(SCOPE_CAS, async () => {
+      await grant(cookie, deviceId, "read:departures", false);
+    });
+
+    const res = await grant(cookie, deviceId, "read:fix", false, {}, environment);
+
+    expect(res.status).toBe(409);
+    // The revocation did not happen, so the fix it would have taken with it is
+    // still there — a 409 that had half-applied would be the worse answer.
+    expect(await storedScopes(deviceId)).toEqual(["read:config", "read:fix"]);
+    expect(await fixCount(deviceId)).toBe(1);
+  });
+
+  it("ends in one state when two tabs revoke the same scope at once", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    const [first, second] = await Promise.all([
+      grant(cookie, deviceId, "read:fix", false),
+      grant(cookie, deviceId, "read:fix", false),
+    ]);
+
+    // Both asked for what the row now holds, so neither is a conflict.
+    expect([first.status, second.status]).toEqual([200, 200]);
+    expect(await storedScopes(deviceId)).not.toContain("read:fix");
+    expect(await fixCount(deviceId)).toBe(0);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Unpair (R18)                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -614,6 +775,35 @@ describe("unpairing a device", () => {
     const { deviceId } = await pairDevice(cookie);
     await call(req(`/v1/config/devices/${deviceId}`, { method: "DELETE", cookie }));
     expect(await listDevices(cookie)).toEqual([]);
+  });
+
+  it("reaps a fix stranded by an unpair whose clear failed", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    // The revoke lands and the clear throws — the grant is gone, the position
+    // is not, and the user has already been told it was deleted.
+    await expect(
+      call(
+        req(`/v1/config/devices/${deviceId}`, { method: "DELETE", cookie }),
+        failingFixDelete(),
+      ),
+    ).rejects.toThrow();
+    expect(await fixCount(deviceId)).toBe(1);
+
+    // Every other path to that row is now closed: it is out of the list, and a
+    // scope toggle 404s on `revoked_at IS NULL` before it reaches the clear.
+    expect(await listDevices(cookie)).toEqual([]);
+    expect((await grant(cookie, deviceId, "read:fix", false)).status).toBe(404);
+    expect(await fixCount(deviceId)).toBe(1);
+
+    // So the repeat unpair has to be the reaper — behind the same 404, which
+    // says nothing new about a device the caller already owns.
+    const repeat = await call(req(`/v1/config/devices/${deviceId}`, { method: "DELETE", cookie }));
+    expect(repeat.status).toBe(404);
+    expect(await fixCount(deviceId)).toBe(0);
   });
 
   it("answers the same 404 on a repeat, an unknown id, and a malformed one", async () => {

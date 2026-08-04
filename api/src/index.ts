@@ -52,11 +52,17 @@ const AUTH_RATE_REFILL_PER_SEC = 0.2;
 // strangle a device that is doing exactly what it was told to do. Sized for
 // that loop instead — 30/minute sustained, 15 burst.
 //
-// The looser bucket is safe because it is not the control that bounds abuse
-// here: /v1/device/pair/start and /v1/pair/claim are bounded by per-IP,
-// per-claimer and global budgets in D1 (R7), which survive isolate recycle and
-// count across the whole deployment. This bucket only keeps one caller from
-// making the Worker do arithmetic all day.
+// The looser bucket is safe for different reasons on the two halves of the
+// surface, and neither of them is this bucket — which is per-isolate,
+// best-effort, and cleared wholesale at 10,000 entries, so it bounds nothing an
+// IP-rotating caller cares about. What bounds /v1/device/pair/start and
+// /v1/pair/claim is the per-network, per-claimer and sliced global budgets in
+// D1 (R7), which survive isolate recycle and count across the deployment.
+// /v1/device/pair/poll — the highest-rate route here — deliberately has no such
+// budget: it is a probe of a unique index that reads zero rows for any caller
+// who does not already hold a device code, so a D1 counter would cost more than
+// the read it bounded. The reasoning, and the test that keeps the index
+// assumption honest, are on `handlePoll` in routes/pair.ts.
 const PAIR_RATE_CAPACITY = 15; // burst
 const PAIR_RATE_REFILL_PER_SEC = 0.5;
 

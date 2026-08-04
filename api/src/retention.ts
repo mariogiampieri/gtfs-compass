@@ -12,9 +12,10 @@
  * is unauthenticated, so an attacker chooses that table's growth rate),
  * expired `sessions` (closing a browser tab is not a sign-out; nothing but
  * this sweep bounds a table every sign-in mints a row into), yesterday's
- * `auth_budgets` shards — except `scope = 'send:failure'`, retained past its
- * day because it is the only durable signal that a Resend outage happened —
- * and `device_fixes` older than the precise window — a metre-accurate GPS fix
+ * `auth_budgets` shards — except the scopes in `RETAINED_BUDGET_SCOPES`, kept
+ * past their day because they are the only durable signal that a mail outage
+ * or a pairing lockout happened — and `device_fixes` older than the precise
+ * window — a metre-accurate GPS fix
  * is the most precise location this system stores and must not be the one
  * location table with no expiry at all.
  *
@@ -25,6 +26,20 @@
 
 import { SEND_FAILURE_SCOPE, budgetDay } from "./email";
 import { intVar } from "./locate";
+import { PAIR_CLAIM_REFUSED_SCOPE, PAIR_START_REFUSED_SCOPE } from "./routes/pair";
+
+/**
+ * Budget scopes the daily sweep must leave alone. They are not counters that
+ * bound anything — they are the only durable record that a delivery outage or
+ * a global-budget lockout happened, and both are things an operator looks for
+ * *after* the night they occurred. Sweeping them with the ordinary day
+ * counters would erase the evidence before anyone read it.
+ */
+const RETAINED_BUDGET_SCOPES = [
+  SEND_FAILURE_SCOPE,
+  PAIR_START_REFUSED_SCOPE,
+  PAIR_CLAIM_REFUSED_SCOPE,
+] as const;
 
 /** The single `maintenance_runs.job` key this module owns. */
 export const RETENTION_JOB = "retention-purge";
@@ -226,9 +241,10 @@ export async function runRetentionPurge(env: Env, nowMs: number = Date.now()): P
   const budgetsDeleted = await phase(
     `DELETE FROM auth_budgets
       WHERE rowid IN (SELECT rowid FROM auth_budgets
-                       WHERE day < ?1 AND scope != ?2
-                       ORDER BY day LIMIT ?3)`,
-    [budgetDay(nowMs), SEND_FAILURE_SCOPE],
+                       WHERE day < ?1
+                         AND scope NOT IN (${RETAINED_BUDGET_SCOPES.map((_, i) => `?${i + 2}`).join(", ")})
+                       ORDER BY day LIMIT ?${RETAINED_BUDGET_SCOPES.length + 2})`,
+    [budgetDay(nowMs), ...RETAINED_BUDGET_SCOPES],
   );
 
   const counts: PurgeCounts = {

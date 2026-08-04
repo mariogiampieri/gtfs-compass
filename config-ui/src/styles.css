@@ -173,6 +173,20 @@ button:disabled {
   font-size: 0.85rem;
 }
 
+/*
+ * The label on a permission the server stores but does not check yet. Same box
+ * as .scope-warning so it cannot be skimmed past, dashed and unfilled so it
+ * reads as "not in force" rather than as a second hazard.
+ */
+.scope-unenforced {
+  color: var(--muted);
+  border: 1px dashed var(--edge);
+  border-radius: 0.5rem;
+  padding: 0.6rem;
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+
 .confirm {
   margin-top: 1rem;
   padding-top: 0.9rem;
