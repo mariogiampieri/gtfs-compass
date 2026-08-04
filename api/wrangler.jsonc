@@ -9,6 +9,41 @@
     // explicit allowlist. A second agency is a config change, not code.
     "CURATED_FEEDS": ["mta-subway", "mta-bus", "citibike"]
   },
+  // The config-UI PWA ships from this same Worker so it is same-origin with
+  // /v1/* — no CORS, and the session cookie is first-party (R16). Built by
+  // `npm run build:ui` (config-ui/build.mjs); the directory is build output and
+  // is not committed, so `pretest` and `deploy` both build before anything
+  // reads it.
+  "assets": {
+    "directory": "../config-ui/dist",
+    // Paths that are not asset-first fall back to the shell, so a client-side
+    // route survives a reload.
+    "not_found_handling": "single-page-application",
+    // ...but never for these: API and operator paths reach the Worker first
+    // whatever exists in the assets tree, so a file that happens to be named
+    // `v1/nearby` cannot shadow the API and hand a device HTML where it
+    // expects JSON — the worst possible way for a device parser to fail.
+    // Verified against a real `wrangler dev` in test/unit/asset-routing.test.ts,
+    // which fails on both counts if this line is removed. The workerd test
+    // pool cannot see any of this: SELF.fetch() there bypasses the asset
+    // router entirely.
+    //
+    // The bare namespace roots are listed separately from their `/*` globs
+    // (F11, verified empirically): `/v1/*` does not match `/v1` with no
+    // trailing segment, so without these two entries a bare `GET /v1` or
+    // `GET /internal` fell through to the SPA shell's HTML 200.
+    "run_worker_first": ["/v1/*", "/v1", "/internal/*", "/internal"]
+  },
+  // Retention purge (R20), api/src/retention.ts. Daily is the right cadence:
+  // the windows are 14 and 90 days, so an hourly sweep would buy nothing but
+  // 24x the invocations. 03:47 UTC rather than a round hour or midnight —
+  // cron minute 0 is when every scheduled job on the platform wakes up, and
+  // this one is happy to run in the quiet minutes between. A backlog larger
+  // than one invocation's batch budget drains over successive days and says so
+  // in `maintenance_runs.pending`.
+  "triggers": {
+    "crons": ["47 3 * * *"]
+  },
   "d1_databases": [
     {
       "binding": "DB",

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gtfs-compass — settings</title>
+    <meta name="description" content="Configure gtfs-compass: sign in, and check what location accuracy this phone reports." />
+    <meta name="theme-color" content="#0f1419" />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <!--
+      External module only. R19: the statically-served SPA ships zero inline
+      script under `script-src 'self'`, because static assets never enter the
+      Worker and so can never carry a per-request nonce. `type="module"` defers,
+      so the DOM is parsed before app.js runs.
+    -->
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <p id="single-user-banner" class="banner" role="status" hidden></p>
+
+    <header class="site-header">
+      <h1>gtfs-compass</h1>
+      <p class="tagline">Minutes until you should leave.</p>
+    </header>
+
+    <main>
+      <section class="card" aria-labelledby="sign-in-heading">
+        <h2 id="sign-in-heading">Sign in</h2>
+        <p class="muted">
+          There are no passwords. Enter your email address and we send a
+          single-use sign-in link.
+        </p>
+        <form id="sign-in-form" novalidate>
+          <label for="email">Email address</label>
+          <input
+            id="email"
+            name="email"
+            type="email"
+            autocomplete="email"
+            inputmode="email"
+            spellcheck="false"
+            autocapitalize="off"
+            placeholder="you@example.com"
+            required
+          />
+          <button id="sign-in-submit" type="submit">Email me a sign-in link</button>
+        </form>
+        <p id="sign-in-status" class="status" role="status" hidden></p>
+      </section>
+
+      <section class="card" aria-labelledby="capture-heading">
+        <h2 id="capture-heading">Location check</h2>
+        <p class="muted">
+          Reads this phone's position once and shows the raw accuracy the
+          browser reports. Nothing is sent anywhere — this is a local check that
+          your phone can produce a fix good enough to pick a platform entrance.
+        </p>
+        <button id="capture-button" type="button">Check my location</button>
+        <p id="capture-status" class="status" role="status" hidden></p>
+        <dl id="capture-result" class="fix" hidden>
+          <dt>Latitude</dt>
+          <dd id="fix-lat"></dd>
+          <dt>Longitude</dt>
+          <dd id="fix-lon"></dd>
+          <dt>Accuracy (raw)</dt>
+          <dd id="fix-accuracy"></dd>
+          <dt>Captured</dt>
+          <dd id="fix-captured"></dd>
+          <dt>Good enough for</dt>
+          <dd id="fix-verdict"></dd>
+        </dl>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p class="muted">
+        Transit data is served under each feed's own licence; attribution
+        travels with the data in the API response.
+      </p>
+    </footer>
+  </body>
+</html>

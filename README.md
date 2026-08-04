@@ -11,9 +11,11 @@ Durable Objects), and Phase 3 (the `/v1/nearby` read API, the `/v1/departures`
 leave-by timer endpoint with server-side walk times, WiFi geolocation,
 and Citi Bike GBFS) are built, with all three NYC systems live — subway,
 **MTA Bus** (six static GTFS sources + the citywide Bus Time realtime feed),
-and Citi Bike. Firmware and the config UI are specified in
-[`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md) and land in
-later phases.
+and Citi Bike. Phase 4 (firmware) and Phase 5 (accounts, pairing, and the
+config UI) are in progress — the config UI currently ships its shell, its
+sign-in form, and a local location check; the accounts behind them are
+landing alongside. Everything is specified in
+[`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md).
 
 ## Architecture at a glance
 
@@ -23,10 +25,12 @@ Mobility Database CSV ─┐
 MTA static GTFS zip  ──┘                                 │
                                                          v
                               api/ (Cloudflare Worker + Durable Objects,
-                               Phase 2+: GTFS-RT parsing, /v1 endpoints)
+                               Phase 2+: GTFS-RT parsing, /v1 endpoints;
+                               also serves config-ui/ as static assets)
                                                          │
-                                                         v
-                                        firmware/ (ESP32, Phase 4)
+                                    ┌────────────────────┴────────────┐
+                                    v                                 v
+                        firmware/ (ESP32, Phase 4)      config-ui/ (PWA, Phase 5)
 ```
 
 - **`ingest/`** — Python package, run on a cron box. Seeds a catalog of
@@ -42,6 +46,9 @@ MTA static GTFS zip  ──┘                                 │
   reading, self-suspends after 10 idle minutes, and serves per-stop arrival
   lists with an honest `fetched_at`. Reads never block on the upstream —
   the first poll returns last-known data instantly and refreshes behind.
+- **`config-ui/`** — the configuration PWA, plain HTML/CSS/ES modules with no
+  framework and no bundler. Built to `config-ui/dist/`, which the Worker
+  serves as static assets on the same origin as `/v1/*`.
 - Nothing assumes a single agency: every table keys on `feed_id`, route
   colors come from feed data, and adding a second agency is configuration,
   not code.
@@ -147,12 +154,14 @@ older than 90 s as stale. A feed whose upstream freezes (HTTP 200 but a
 non-advancing header timestamp) goes visibly stale rather than being
 re-stamped fresh.
 
-**No authentication yet.** The `/internal/*` and `/v1/*` routes are public
-until the device-token model lands (Phase 5); they are limited to the
-curated feed allowlist (`vars.CURATED_FEEDS` in `api/wrangler.jsonc`) and
-per-IP rate limiting, and expose only already-public transit data. The
-locate diagnostics surfaces are additionally gated by a `DIAG_TOKEN` Worker
-secret (see `.env.example`).
+**The transit routes are still unauthenticated.** `/internal/*` and the
+transit `/v1/*` routes stay public until the device-token model lands; they
+are limited to the curated feed allowlist (`vars.CURATED_FEEDS` in
+`api/wrangler.jsonc`) and per-IP rate limiting, and expose only
+already-public transit data. The locate diagnostics surfaces are gated by a
+`DIAG_TOKEN` Worker secret (see `.env.example`). Accounts exist on
+`/v1/auth/*` — see [Signing in](#signing-in) — and everything user-owned
+that arrives in later milestones goes behind them.
 
 ## The read API (Phase 3)
 
@@ -240,8 +249,8 @@ service, to resolve a position — that is their only use. This project never
 stores BSSIDs: only a one-way hash of the scanned set lives in a 10-minute
 in-memory cache, and only a *count* of access points appears in diagnostic
 rows. Operator-initiated diagnostic logging (`log: true`, `DIAG_TOKEN`
-required) stores the resolved position estimate; those rows currently
-persist until the Phase 5 retention purge ships. BeaconDB is explicitly
+required) stores the resolved position estimate; those rows are aged out on
+a schedule — see [Data retention](#data-retention). BeaconDB is explicitly
 experimental (no SLA) — an unavailable provider degrades to
 `{"known": false}` and the device falls back to its favorite-stop behavior.
 
@@ -422,6 +431,180 @@ nothing extra. To change sizes, weights, or glyph ranges, edit and re-run
 `firmware/tools/genfonts.sh` (needs node + curl + unzip; it downloads the pinned
 TTF releases into a gitignored cache). Attribution and license text:
 `firmware/components/ui/fonts/README.md` and `OFL.txt`.
+
+## Config UI (Phase 5)
+
+`config-ui/` is the configuration PWA. It is served as **static assets by the
+same Worker** that serves `/v1/*`, so it is same-origin with the API: no CORS
+to configure, and the session cookie is first-party.
+
+Today it holds the shell, the sign-in form (which posts an address to
+`POST /v1/auth/request` and never says whether that address has an account —
+the emailed link is redeemed by a separate Worker-served page), and the
+location check below. Device pairing and favorites editing land in later
+milestones.
+
+Prerequisites: Node.js 18+ — nothing else. There is no framework and no
+bundler; the UI is hand-written HTML, CSS, and native ES modules, and the
+"build" copies `config-ui/src/` to `config-ui/dist/` and fails if any emitted
+HTML contains an inline `<script>`, an inline `<style>`, an `on*` handler, or
+an inline `style` attribute. That last part is the point: the assets are
+served without passing through the Worker, so they can never carry a
+per-request CSP nonce, and the policy they ship under is `script-src 'self'`
+/ `style-src 'self'` with no `unsafe-inline` escape hatch.
+
+```bash
+cd config-ui
+npm install
+npm run check        # build + tests (this is the CI gate)
+npm run build        # dist/ only
+```
+
+You rarely need to run the build by hand: `api`'s `test`, `dev`, and `deploy`
+scripts all build the UI first, because `dist/` is generated and not
+committed.
+
+```bash
+cd api && npm run dev     # builds config-ui, then serves UI + API together
+```
+
+Routing, configured in `api/wrangler.jsonc`:
+
+| Path | Served by |
+|---|---|
+| `/v1/*`, `/internal/*` | the Worker, always (`assets.run_worker_first`) — including when a file of the same name exists in `dist/` |
+| an unknown `/v1/*` path | the Worker's JSON `404`, **never** the SPA shell |
+| `/`, `/app.js`, any other path | static assets, with unknown paths falling back to the shell (`not_found_handling: "single-page-application"`) |
+
+That ordering is not cosmetic: without the first row, a file that happened to
+be named `v1/nearby` would shadow the API and hand a device HTML where it
+expects JSON — the worst possible way for a device parser to fail.
+`api/test/unit/asset-routing.test.ts`
+runs a real `wrangler dev` and asserts each row — the workerd test pool
+bypasses the asset router entirely, so those assertions cannot live with the
+rest of the Worker tests.
+
+Security headers for the static side come from `config-ui/src/_headers`
+(CSP, `nosniff`, `Referrer-Policy: no-referrer`, `frame-ancestors 'none'`).
+The Worker-served sign-in callback is a separate route with its own
+nonce-based CSP.
+
+### Signing in
+
+There are no passwords. You type an address, the Worker mails a single-use
+link, and opening it signs the browser in.
+
+| Route | What it does |
+| --- | --- |
+| `POST /v1/auth/request` | Ask for a link. **Always** answers `200 {"ok":true}` |
+| `GET /v1/auth/callback` | The Worker-served interstitial the emailed link opens |
+| `POST /v1/auth/redeem` | The only thing that consumes a token |
+| `POST /v1/auth/signout` | Revokes the session server-side and clears the cookie |
+| `GET /v1/auth/mode` | `{"auth_mode":"single"\|"multi"}` — drives the single-user banner |
+
+Requesting a link requires a configured mail provider — set
+`AUTH_EMAIL_PROVIDER` (and its provider's variables) as described in
+`.env.example`. With none set, sign-in is disabled outright and
+`/v1/auth/request` answers `503`; there is deliberately no fallback that
+prints tokens. For local work, `AUTH_EMAIL_PROVIDER=console` prints the link
+to the Worker log and refuses to start without an `AUTH_ALLOWED_EMAILS` list.
+
+**Out of the box, sign-up is open to the internet.** `AUTH_ALLOWED_EMAILS`
+ships unset, and an empty allowlist means anyone who can reach the Worker can
+register — a deliberate opt-in, and almost certainly not what you want on a
+personal deployment. Set it to your own address before you deploy. Every
+account created under an empty allowlist logs a warning, so `wrangler tail`
+will tell you if you got there by accident. Once it is set, only listed
+addresses can receive a link; an address that is not on the list gets the
+same `200 {"ok":true}` as one that is — the response never reveals whether an
+address has an account, is on the allowlist, or has exhausted its daily send
+budget.
+
+Four details are load-bearing and easy to undo by accident:
+
+- **Asking again never kills the link you already have.** An address may hold
+  up to three un-redeemed links at once, each with its own untouched
+  ten-minute expiry; past that a repeat mails nothing and costs nothing.
+  Re-issuing the secret on the live row instead would let any anonymous `POST`
+  invalidate the link sitting in somebody else's inbox.
+- **The token rides in the URL fragment**, so it is never in a request line,
+  a query string, a `Referer`, or a server log. The interstitial reads
+  `location.hash`, strips it from the address bar, and `POST`s it.
+- **Only a POST consumes a token.** Mail gateways prefetch links with GETs;
+  a scanner's GET must not burn a sign-in link before its owner clicks it.
+- **A `__Host-` nonce cookie set at request time is matched at redemption.**
+  `SameSite=Lax` means it is simply absent when the link is opened on another
+  device or inside a mail app's webview, so a mismatch is not an error: the
+  interstitial names the address being signed in and asks for a confirmation,
+  and the token stays valid until you give it.
+
+Emailed links point at the origin of the request that asked for one. On a
+deployment answering to more than one hostname, set `AUTH_PUBLIC_ORIGIN` to
+pin them to the real front door.
+
+### The location check
+
+The **Check my location** button reads this phone's position once and shows
+the **raw** accuracy in metres, graded against the two thresholds that
+matter: 150 m (past which walk times are not routed) and 500 m (past which
+the API reports an unknown position rather than a wrong one). In this
+milestone it is local-only — nothing is sent anywhere.
+
+Geolocation is **secure-context-only**. Over `http://` on a LAN address —
+which is what `wrangler dev` gives you — browsers deny it with no prompt and
+no console error. The button detects that case and says so instead of
+failing silently, but the fix is the same either way: open the deployed
+`https://` address on the phone. Verifying this feature means using a real
+phone over HTTPS; a desktop browser on localhost proves nothing about the
+permission prompt.
+
+## Data retention
+
+Location data ages out on its own. A Cron Trigger (`triggers.crons` in
+`api/wrangler.jsonc`, 03:47 UTC daily) runs a two-tier purge:
+
+| After | What happens |
+|---|---|
+| `LOCATE_LOG_PRECISE_DAYS` (14) | `locate_log` loses its raw coordinates (`est_lat`/`est_lon`/`ref_lat`/`ref_lon`); the accuracies, `delta_m`, `provider`, `bssid_count` and timestamp stay. Any stored phone fix (`device_fixes`) is deleted. |
+| `LOCATE_LOG_RETENTION_DAYS` (90) | The `locate_log` row is deleted. |
+
+The split is deliberate: the question these diagnostic rows exist to answer —
+*was the estimate accurate enough at this platform entrance* — is answered by
+the metrics, not by the position, so the movement history ages out roughly six
+times faster than the residual measurements. The same run sweeps expired
+sign-in tokens, expired pairing codes, and yesterday's rate-limit counters.
+
+The sweep also covers expired `sessions` — closing a browser tab is not a
+sign-out, so nothing else bounds that table — and it deliberately **excludes**
+`auth_budgets` rows scoped `send:failure` from the daily counter cleanup: that
+scope is the only durable record that a mail-provider outage happened, and
+letting the next purge tick erase it would destroy the signal before an
+operator ever saw it.
+
+Every run is recorded, including one that finds nothing to do — otherwise
+"no rows deleted lately" is indistinguishable from a dead cron:
+
+```bash
+cd api
+npx wrangler d1 execute gtfs-compass --remote \
+  --command "SELECT * FROM maintenance_runs"
+# job              last_run_at  duration_ms  rows_affected  pending  detail
+# retention-purge  1785810156   84           37             0        {"locate_coords_nulled":12,...}
+```
+
+**A stale `last_run_at` is the alert condition**: if it is more than a day or
+two behind, the purge is not running and retention is not happening. `pending
+= 1` means one invocation's batch budget was not enough to drain the backlog
+and the next tick will continue — expected on a first run against an old
+database, a problem if it never clears. A run in progress is visible live with
+`npx wrangler tail --format pretty` (it prints one `retention purge: {...}`
+line per invocation); `npx wrangler dev --test-scheduled` plus
+`curl 'http://localhost:8787/__scheduled?cron=47+3+*+*+*'` triggers one
+locally.
+
+Windows and batch sizes are configurable — see `LOCATE_LOG_PRECISE_DAYS`,
+`LOCATE_LOG_RETENTION_DAYS`, `RETENTION_BATCH_LIMIT` and
+`RETENTION_MAX_BATCHES` in `.env.example`.
 
 ## Feed data licensing
 

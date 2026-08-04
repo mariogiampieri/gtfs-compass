@@ -108,7 +108,14 @@ describe("router", () => {
   });
 
   it("non-matching paths 404", async () => {
-    expect((await get("/")).status).toBe(404);
+    // `GET /` deliberately dropped from this test (U9). In production the
+    // config-UI PWA now ships from this Worker's `assets` directory, so `/`
+    // is the SPA shell, not a 404 — asserting 404 here would encode a
+    // contract that is false at the edge. It cannot simply be flipped to 200
+    // either: `SELF.fetch()` in the workerd pool bypasses the static-asset
+    // router entirely and always lands on the user Worker, so every asset
+    // path 404s in here regardless of config. The real assertions run against
+    // `wrangler dev` in test/unit/asset-routing.test.ts.
     expect((await get("/internal/mta-subway/ace")).status).toBe(404);
   });
 
@@ -117,6 +124,38 @@ describe("router", () => {
     expect(res.status).toBe(404);
     expect((await res.json<any>()).error).toBe("not found");
     expect(upstreamCalls).toBe(0);
+  });
+});
+
+describe("the /v1/auth/* bucket", () => {
+  // Deliberately identity-and-isolation assertions, not refill timing: this
+  // repo has been broken twice by tests racing a token-bucket refill window.
+  // At 0.2 tokens/sec a whole suite could run inside one refill tick, so
+  // nothing here depends on how long the loop below takes.
+  const authGet = (ip: string) =>
+    SELF.fetch("https://api.example/v1/auth/mode", { headers: { "CF-Connecting-IP": ip } });
+
+  it("routes /v1/auth/* through the Worker at all", async () => {
+    const res = await authGet("198.51.100.201");
+    expect(res.status).toBe(200);
+    expect(await res.json<any>()).toHaveProperty("auth_mode");
+  });
+
+  it("429s past the burst, on its own bucket, per IP", async () => {
+    const ip = "198.51.100.202";
+    const statuses: number[] = [];
+    for (let i = 0; i < 20; i++) statuses.push((await authGet(ip)).status);
+    // Capacity is 10; refill can only ever *add* tokens, so "the first ten are
+    // served" and "something in twenty is refused" both hold however slow the
+    // machine is.
+    expect(statuses.slice(0, 10).every((s) => s === 200)).toBe(true);
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
+
+    // Same IP, different prefix: separate bucket map, so the auth burst has
+    // not spent the general limiter (and vice versa).
+    expect((await get("/internal/mta-subway/zzz/stop/X", ip)).status).toBe(404);
+    // A different IP is untouched — the bucket is keyed, not global.
+    expect((await authGet("198.51.100.203")).status).toBe(200);
   });
 });
 

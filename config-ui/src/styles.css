@@ -1,0 +1,131 @@
+:root {
+  --bg: #0f1419;
+  --card: #171d24;
+  --edge: #27313c;
+  --ink: #e7edf3;
+  --muted: #97a3b0;
+  --accent: #4db8ff;
+  --warn-bg: #3a2a12;
+  --warn-edge: #7a5a22;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 1rem 3rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  max-width: 34rem;
+  margin-inline: auto;
+}
+
+h1 {
+  font-size: 1.35rem;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+}
+
+.site-header {
+  padding: 1.5rem 0 0.5rem;
+}
+
+.tagline,
+.muted {
+  color: var(--muted);
+  margin: 0.25rem 0 0;
+  font-size: 0.9rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--edge);
+  border-radius: 0.75rem;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+
+.banner {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-edge);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  margin: 1rem 0 0;
+  font-size: 0.85rem;
+}
+
+label {
+  display: block;
+  margin: 0.9rem 0 0.3rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+input[type="email"] {
+  width: 100%;
+  padding: 0.7rem;
+  font-size: 1rem;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+}
+
+button {
+  margin-top: 0.8rem;
+  width: 100%;
+  padding: 0.75rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #06131d;
+  background: var(--accent);
+  border: 0;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.status {
+  margin: 0.8rem 0 0;
+  font-size: 0.9rem;
+  color: var(--ink);
+}
+
+.fix {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.35rem 0.9rem;
+  margin: 0.9rem 0 0;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--edge);
+  font-size: 0.9rem;
+}
+
+.fix dt {
+  color: var(--muted);
+}
+
+.fix dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.site-footer {
+  margin-top: 2rem;
+}
+
+[hidden] {
+  display: none !important;
+}

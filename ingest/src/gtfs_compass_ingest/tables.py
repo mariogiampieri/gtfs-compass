@@ -13,6 +13,14 @@ class TableSpec:
     name: str
     columns: tuple[str, ...]
     pk_columns: tuple[str, ...]
+    # Columns the schema owns but the converge loop must neither read nor
+    # write. They still appear in `columns` because tests/test_schema_sync.py
+    # holds this spec to the migration's exact column list.
+    unmanaged_columns: tuple[str, ...] = ()
+
+    @property
+    def sync_columns(self) -> tuple[str, ...]:
+        return tuple(c for c in self.columns if c not in self.unmanaged_columns)
 
 
 FEEDS = TableSpec(
@@ -35,8 +43,14 @@ FEEDS = TableSpec(
         "direction_labels",
         "units",
         "mode",
+        "data_version",
     ),
     pk_columns=("id",),
+    # data_version is stamped out of band (it bumps when a feed's static data
+    # changes, and the device's config ETag reads it). Syncing it would either
+    # reset the stamp to whatever the catalog row happened to carry or rewrite
+    # every feed row on each run, so the metadata converge loop leaves it alone.
+    unmanaged_columns=("data_version",),
 )
 
 STOPS = TableSpec(

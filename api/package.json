@@ -4,9 +4,13 @@
   "scripts": {
     "migrate:local": "wrangler d1 migrations apply gtfs-compass --local",
     "migrate:remote": "wrangler d1 migrations apply gtfs-compass --remote",
+    "build:ui": "npm --prefix ../config-ui run build",
+    "pretest": "npm run build:ui",
     "test": "vitest run",
     "generate:proto": "./scripts/generate-proto.sh",
+    "predeploy": "npm run build:ui",
     "deploy": "wrangler d1 migrations apply gtfs-compass --remote && wrangler deploy",
+    "predev": "npm run build:ui",
     "dev": "wrangler dev"
   },
   "devDependencies": {
