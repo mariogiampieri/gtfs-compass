@@ -23,6 +23,7 @@ import {
   sessionCookie,
   validateSession,
 } from "../../src/auth";
+import { resetSchema } from "./schema";
 
 const DIAG_TOKEN = "test-diag-token"; // bound in vitest.config.ts miniflare bindings
 const ORIGIN = "https://api.example";
@@ -95,61 +96,7 @@ async function backdate(
 }
 
 beforeEach(async () => {
-  // Schema per migrations 0000 + 0003 (these suites build their own tables).
-  await env.DB.prepare("DROP TABLE IF EXISTS sessions").run();
-  await env.DB.prepare("DROP TABLE IF EXISTS devices").run();
-  await env.DB.prepare("DROP TABLE IF EXISTS locate_log").run();
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS users (
-       id             TEXT PRIMARY KEY NOT NULL,
-       email          TEXT UNIQUE,
-       created_at     INTEGER,
-       config_version INTEGER NOT NULL DEFAULT 0
-     )`,
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE sessions (
-       id           TEXT PRIMARY KEY NOT NULL,
-       user_id      TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-       expires_at   INTEGER,
-       created_at   INTEGER,
-       token_hash   TEXT,
-       last_used_at INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare("CREATE UNIQUE INDEX idx_sessions_token_hash ON sessions (token_hash)").run();
-  await env.DB.prepare(
-    `CREATE TABLE devices (
-       id           TEXT PRIMARY KEY NOT NULL,
-       user_id      TEXT REFERENCES users (id) ON DELETE CASCADE,
-       token_hash   TEXT,
-       name         TEXT,
-       paired_at    INTEGER,
-       last_seen    INTEGER,
-       fw_version   TEXT,
-       scopes       TEXT NOT NULL DEFAULT 'read:departures,read:config',
-       revoked_at   INTEGER,
-       last_used_at INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE locate_log (
-       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-       user_id      TEXT REFERENCES users (id) ON DELETE CASCADE,
-       device_id    TEXT,
-       ts           INTEGER,
-       est_lat      REAL,
-       est_lon      REAL,
-       est_accuracy REAL,
-       provider     TEXT,
-       bssid_count  INTEGER,
-       ref_lat      REAL,
-       ref_lon      REAL,
-       ref_accuracy REAL,
-       delta_m      REAL,
-       label        TEXT
-     )`,
-  ).run();
+  await resetSchema();
   const seed = env.DB.prepare("INSERT OR IGNORE INTO users (id, created_at) VALUES (?1, ?2)");
   await seed.bind(USER, nowSec()).run();
   await seed.bind(SINGLE_USER_ID, nowSec()).run();

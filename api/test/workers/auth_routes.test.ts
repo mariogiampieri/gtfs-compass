@@ -16,6 +16,7 @@ import {
   MAX_LIVE_TOKENS_PER_ADDRESS,
   routeAuth,
 } from "../../src/routes/auth";
+import { resetSchema } from "./schema";
 
 /**
  * /v1/auth/* — the sign-in surface (U4; R1, R2, R4, R4b, R19; AE1, AE2, AE3).
@@ -158,55 +159,7 @@ function recordingDb(log: string[]): D1Database {
 }
 
 beforeEach(async () => {
-  // Schema per migrations 0000 + 0003 (these suites build their own tables).
-  await env.DB.prepare("DROP TABLE IF EXISTS sessions").run();
-  await env.DB.prepare("DROP TABLE IF EXISTS magic_tokens").run();
-  await env.DB.prepare("DROP TABLE IF EXISTS auth_budgets").run();
-  await env.DB.prepare("DROP TABLE IF EXISTS users").run();
-  await env.DB.prepare(
-    `CREATE TABLE users (
-       id             TEXT PRIMARY KEY NOT NULL,
-       email          TEXT UNIQUE,
-       created_at     INTEGER,
-       config_version INTEGER NOT NULL DEFAULT 0
-     )`,
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE sessions (
-       id           TEXT PRIMARY KEY NOT NULL,
-       user_id      TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-       expires_at   INTEGER,
-       created_at   INTEGER,
-       token_hash   TEXT,
-       last_used_at INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare("CREATE UNIQUE INDEX idx_sessions_token_hash ON sessions (token_hash)").run();
-  await env.DB.prepare(
-    `CREATE TABLE magic_tokens (
-       id         TEXT PRIMARY KEY NOT NULL,
-       token_hash TEXT NOT NULL,
-       email      TEXT NOT NULL,
-       nonce_hash TEXT,
-       created_at INTEGER NOT NULL,
-       expires_at INTEGER NOT NULL,
-       used_at    INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare(
-    "CREATE UNIQUE INDEX idx_magic_tokens_token_hash ON magic_tokens (token_hash)",
-  ).run();
-  await env.DB.prepare("CREATE INDEX idx_magic_tokens_email ON magic_tokens (email, expires_at)").run();
-  await env.DB.prepare(
-    `CREATE TABLE auth_budgets (
-       scope TEXT NOT NULL,
-       key   TEXT NOT NULL,
-       day   INTEGER NOT NULL,
-       shard INTEGER NOT NULL,
-       count INTEGER NOT NULL DEFAULT 0,
-       PRIMARY KEY (scope, key, day, shard)
-     )`,
-  ).run();
+  await resetSchema();
   // KNOWN has an account; UNKNOWN and OUTSIDER do not.
   await env.DB.prepare("INSERT INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
     .bind("usr_known", KNOWN, nowSec())

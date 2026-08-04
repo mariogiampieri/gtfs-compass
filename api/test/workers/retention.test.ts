@@ -10,6 +10,7 @@ import {
   lastRetentionRun,
   runRetentionPurge,
 } from "../../src/retention";
+import { resetSchema } from "./schema";
 
 /**
  * Retention purge (U11; R20, AE11).
@@ -90,137 +91,7 @@ async function countOf(table: string): Promise<number> {
 }
 
 beforeEach(async () => {
-  // Schema per migrations 0000 + 0003 + 0004 + 0005 (these suites build their
-  // own tables). The purge indexes are created here as well: the partial ones
-  // are load-bearing for the self-latching phases, so the tests run against
-  // the shape production has.
-  for (const table of [
-    "maintenance_runs",
-    "auth_budgets",
-    "pairing_codes",
-    "magic_tokens",
-    "sessions",
-    "device_fixes",
-    "locate_log",
-    "devices",
-  ]) {
-    await env.DB.prepare(`DROP TABLE IF EXISTS ${table}`).run();
-  }
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS users (
-       id         TEXT PRIMARY KEY NOT NULL,
-       email      TEXT UNIQUE,
-       created_at INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE locate_log (
-       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-       user_id      TEXT REFERENCES users (id) ON DELETE CASCADE,
-       device_id    TEXT,
-       ts           INTEGER,
-       est_lat      REAL,
-       est_lon      REAL,
-       est_accuracy REAL,
-       provider     TEXT,
-       bssid_count  INTEGER,
-       ref_lat      REAL,
-       ref_lon      REAL,
-       ref_accuracy REAL,
-       delta_m      REAL,
-       label        TEXT
-     )`,
-  ).run();
-  await env.DB.prepare("CREATE INDEX idx_locate_log_ts ON locate_log (ts)").run();
-  await env.DB.prepare(
-    "CREATE INDEX idx_locate_log_precise_ts ON locate_log (ts) WHERE est_lat IS NOT NULL",
-  ).run();
-  await env.DB.prepare(
-    "CREATE INDEX idx_locate_log_ref_only_ts ON locate_log (ts) WHERE est_lat IS NULL AND ref_lat IS NOT NULL",
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE sessions (
-       id           TEXT PRIMARY KEY NOT NULL,
-       user_id      TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-       expires_at   INTEGER,
-       created_at   INTEGER,
-       token_hash   TEXT,
-       last_used_at INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare("CREATE INDEX idx_sessions_expires_at ON sessions (expires_at)").run();
-  await env.DB.prepare(
-    `CREATE TABLE devices (
-       id         TEXT PRIMARY KEY NOT NULL,
-       user_id    TEXT REFERENCES users (id) ON DELETE CASCADE,
-       token_hash TEXT,
-       name       TEXT,
-       paired_at  INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE device_fixes (
-       device_id   TEXT PRIMARY KEY NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
-       lat         REAL NOT NULL,
-       lon         REAL NOT NULL,
-       accuracy_m  REAL,
-       captured_at INTEGER NOT NULL,
-       received_at INTEGER NOT NULL
-     )`,
-  ).run();
-  await env.DB.prepare(
-    "CREATE INDEX idx_device_fixes_captured_at ON device_fixes (captured_at)",
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE magic_tokens (
-       id         TEXT PRIMARY KEY NOT NULL,
-       token_hash TEXT NOT NULL,
-       email      TEXT NOT NULL,
-       nonce_hash TEXT,
-       created_at INTEGER NOT NULL,
-       expires_at INTEGER NOT NULL,
-       used_at    INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare("CREATE INDEX idx_magic_tokens_expires_at ON magic_tokens (expires_at)").run();
-  await env.DB.prepare(
-    `CREATE TABLE pairing_codes (
-       id               TEXT PRIMARY KEY NOT NULL,
-       device_code_hash TEXT NOT NULL,
-       user_code        TEXT NOT NULL,
-       device_name      TEXT,
-       fw_version       TEXT,
-       attempts         INTEGER NOT NULL DEFAULT 0,
-       created_at       INTEGER NOT NULL,
-       expires_at       INTEGER NOT NULL,
-       claimed_by       TEXT,
-       claimed_at       INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare(
-    "CREATE INDEX idx_pairing_codes_expires_at ON pairing_codes (expires_at)",
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE auth_budgets (
-       scope TEXT NOT NULL,
-       key   TEXT NOT NULL,
-       day   INTEGER NOT NULL,
-       shard INTEGER NOT NULL,
-       count INTEGER NOT NULL DEFAULT 0,
-       PRIMARY KEY (scope, key, day, shard)
-     )`,
-  ).run();
-  await env.DB.prepare("CREATE INDEX idx_auth_budgets_day ON auth_budgets (day)").run();
-  await env.DB.prepare(
-    `CREATE TABLE maintenance_runs (
-       job           TEXT PRIMARY KEY NOT NULL,
-       last_run_at   INTEGER NOT NULL,
-       duration_ms   INTEGER NOT NULL,
-       rows_affected INTEGER NOT NULL,
-       pending       INTEGER NOT NULL DEFAULT 0,
-       detail        TEXT
-     )`,
-  ).run();
+  await resetSchema();
   await env.DB.prepare("INSERT OR IGNORE INTO users (id, created_at) VALUES (?1, ?2)")
     .bind(USER, nowSec())
     .run();

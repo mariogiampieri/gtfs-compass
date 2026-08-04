@@ -2,6 +2,7 @@ import { SELF, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { haversineM, resolveLocation } from "../../src/locate";
+import { resetSchema } from "./schema";
 
 const BEACON_URL = "https://api.beacondb.net/v1/geolocate";
 const TOKEN = "test-diag-token"; // bound in vitest.config.ts miniflare bindings
@@ -93,33 +94,7 @@ beforeEach(async () => {
     return beaconHandler(init ?? {});
   }) as typeof fetch;
 
-  // locate_log matching migration 0000 (fresh per test; AUTOINCREMENT ids).
-  await env.DB.prepare("DROP TABLE IF EXISTS locate_log").run();
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS users (
-       id         TEXT PRIMARY KEY NOT NULL,
-       email      TEXT UNIQUE,
-       created_at INTEGER
-     )`,
-  ).run();
-  await env.DB.prepare(
-    `CREATE TABLE locate_log (
-       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-       user_id      TEXT REFERENCES users (id) ON DELETE CASCADE,
-       device_id    TEXT,
-       ts           INTEGER,
-       est_lat      REAL,
-       est_lon      REAL,
-       est_accuracy REAL,
-       provider     TEXT,
-       bssid_count  INTEGER,
-       ref_lat      REAL,
-       ref_lon      REAL,
-       ref_accuracy REAL,
-       delta_m      REAL,
-       label        TEXT
-     )`,
-  ).run();
+  await resetSchema();
 });
 
 afterEach(() => {

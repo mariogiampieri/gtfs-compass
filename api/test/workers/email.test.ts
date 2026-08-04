@@ -28,6 +28,7 @@ import {
   type EmailSender,
   type OutboundEmail,
 } from "../../src/email";
+import { resetSchema } from "./schema";
 
 const KNOWN = "Mario@Example.com";
 const UNKNOWN = "stranger@example.net";
@@ -86,18 +87,7 @@ function okResponse(): Response {
 }
 
 beforeEach(async () => {
-  // Schema per migration 0003 (these suites build their own tables).
-  await env.DB.prepare("DROP TABLE IF EXISTS auth_budgets").run();
-  await env.DB.prepare(
-    `CREATE TABLE auth_budgets (
-       scope TEXT NOT NULL,
-       key   TEXT NOT NULL,
-       day   INTEGER NOT NULL,
-       shard INTEGER NOT NULL,
-       count INTEGER NOT NULL DEFAULT 0,
-       PRIMARY KEY (scope, key, day, shard)
-     )`,
-  ).run();
+  await resetSchema();
 });
 
 /* -------------------------------------------------------------------------- */
