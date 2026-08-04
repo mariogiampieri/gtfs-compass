@@ -108,7 +108,14 @@ describe("router", () => {
   });
 
   it("non-matching paths 404", async () => {
-    expect((await get("/")).status).toBe(404);
+    // `GET /` deliberately dropped from this test (U9). In production the
+    // config-UI PWA now ships from this Worker's `assets` directory, so `/`
+    // is the SPA shell, not a 404 — asserting 404 here would encode a
+    // contract that is false at the edge. It cannot simply be flipped to 200
+    // either: `SELF.fetch()` in the workerd pool bypasses the static-asset
+    // router entirely and always lands on the user Worker, so every asset
+    // path 404s in here regardless of config. The real assertions run against
+    // `wrangler dev` in test/unit/asset-routing.test.ts.
     expect((await get("/internal/mta-subway/ace")).status).toBe(404);
   });
 

@@ -9,6 +9,26 @@
     // explicit allowlist. A second agency is a config change, not code.
     "CURATED_FEEDS": ["mta-subway", "mta-bus", "citibike"]
   },
+  // The config-UI PWA ships from this same Worker so it is same-origin with
+  // /v1/* — no CORS, and the session cookie is first-party (R16). Built by
+  // `npm run build:ui` (config-ui/build.mjs); the directory is build output and
+  // is not committed, so `pretest` and `deploy` both build before anything
+  // reads it.
+  "assets": {
+    "directory": "../config-ui/dist",
+    // Paths that are not asset-first fall back to the shell, so a client-side
+    // route survives a reload.
+    "not_found_handling": "single-page-application",
+    // ...but never for these: API and operator paths reach the Worker first
+    // whatever exists in the assets tree, so a file that happens to be named
+    // `v1/nearby` cannot shadow the API and hand a device HTML where it
+    // expects JSON — the worst possible way for a device parser to fail.
+    // Verified against a real `wrangler dev` in test/unit/asset-routing.test.ts,
+    // which fails on both counts if this line is removed. The workerd test
+    // pool cannot see any of this: SELF.fetch() there bypasses the asset
+    // router entirely.
+    "run_worker_first": ["/v1/*", "/internal/*"]
+  },
   "d1_databases": [
     {
       "binding": "DB",

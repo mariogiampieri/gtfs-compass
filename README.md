@@ -11,9 +11,11 @@ Durable Objects), and Phase 3 (the `/v1/nearby` read API, the `/v1/departures`
 leave-by timer endpoint with server-side walk times, WiFi geolocation,
 and Citi Bike GBFS) are built, with all three NYC systems live — subway,
 **MTA Bus** (six static GTFS sources + the citywide Bus Time realtime feed),
-and Citi Bike. Firmware and the config UI are specified in
-[`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md) and land in
-later phases.
+and Citi Bike. Phase 4 (firmware) and Phase 5 (accounts, pairing, and the
+config UI) are in progress — the config UI currently ships its shell, its
+sign-in form, and a local location check; the accounts behind them are
+landing alongside. Everything is specified in
+[`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md).
 
 ## Architecture at a glance
 
@@ -23,10 +25,12 @@ Mobility Database CSV ─┐
 MTA static GTFS zip  ──┘                                 │
                                                          v
                               api/ (Cloudflare Worker + Durable Objects,
-                               Phase 2+: GTFS-RT parsing, /v1 endpoints)
+                               Phase 2+: GTFS-RT parsing, /v1 endpoints;
+                               also serves config-ui/ as static assets)
                                                          │
-                                                         v
-                                        firmware/ (ESP32, Phase 4)
+                                    ┌────────────────────┴────────────┐
+                                    v                                 v
+                        firmware/ (ESP32, Phase 4)      config-ui/ (PWA, Phase 5)
 ```
 
 - **`ingest/`** — Python package, run on a cron box. Seeds a catalog of
@@ -42,6 +46,9 @@ MTA static GTFS zip  ──┘                                 │
   reading, self-suspends after 10 idle minutes, and serves per-stop arrival
   lists with an honest `fetched_at`. Reads never block on the upstream —
   the first poll returns last-known data instantly and refreshes behind.
+- **`config-ui/`** — the configuration PWA, plain HTML/CSS/ES modules with no
+  framework and no bundler. Built to `config-ui/dist/`, which the Worker
+  serves as static assets on the same origin as `/v1/*`.
 - Nothing assumes a single agency: every table keys on `feed_id`, route
   colors come from feed data, and adding a second agency is configuration,
   not code.
@@ -384,6 +391,79 @@ when both exist.
 cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 ./build/test_model                   # model parser suite (ASAN)
 ```
+
+## Config UI (Phase 5)
+
+`config-ui/` is the configuration PWA. It is served as **static assets by the
+same Worker** that serves `/v1/*`, so it is same-origin with the API: no CORS
+to configure, and the session cookie is first-party.
+
+Today it holds the shell, the sign-in form (which posts an address to
+`POST /v1/auth/request` and never says whether that address has an account —
+the emailed link is redeemed by a separate Worker-served page), and the
+location check below. Device pairing and favorites editing land in later
+milestones.
+
+Prerequisites: Node.js 18+ — nothing else. There is no framework and no
+bundler; the UI is hand-written HTML, CSS, and native ES modules, and the
+"build" copies `config-ui/src/` to `config-ui/dist/` and fails if any emitted
+HTML contains an inline `<script>`, an inline `<style>`, an `on*` handler, or
+an inline `style` attribute. That last part is the point: the assets are
+served without passing through the Worker, so they can never carry a
+per-request CSP nonce, and the policy they ship under is `script-src 'self'`
+/ `style-src 'self'` with no `unsafe-inline` escape hatch.
+
+```bash
+cd config-ui
+npm install
+npm run check        # build + tests (this is the CI gate)
+npm run build        # dist/ only
+```
+
+You rarely need to run the build by hand: `api`'s `test`, `dev`, and `deploy`
+scripts all build the UI first, because `dist/` is generated and not
+committed.
+
+```bash
+cd api && npm run dev     # builds config-ui, then serves UI + API together
+```
+
+Routing, configured in `api/wrangler.jsonc`:
+
+| Path | Served by |
+|---|---|
+| `/v1/*`, `/internal/*` | the Worker, always (`assets.run_worker_first`) — including when a file of the same name exists in `dist/` |
+| an unknown `/v1/*` path | the Worker's JSON `404`, **never** the SPA shell |
+| `/`, `/app.js`, any other path | static assets, with unknown paths falling back to the shell (`not_found_handling: "single-page-application"`) |
+
+That ordering is not cosmetic: without the first row, a file that happened to
+be named `v1/nearby` would shadow the API and hand a device HTML where it
+expects JSON — the worst possible way for a device parser to fail.
+`api/test/unit/asset-routing.test.ts`
+runs a real `wrangler dev` and asserts each row — the workerd test pool
+bypasses the asset router entirely, so those assertions cannot live with the
+rest of the Worker tests.
+
+Security headers for the static side come from `config-ui/src/_headers`
+(CSP, `nosniff`, `Referrer-Policy: no-referrer`, `frame-ancestors 'none'`).
+The Worker-served sign-in callback is a separate route with its own
+nonce-based CSP.
+
+### The location check
+
+The **Check my location** button reads this phone's position once and shows
+the **raw** accuracy in metres, graded against the two thresholds that
+matter: 150 m (past which walk times are not routed) and 500 m (past which
+the API reports an unknown position rather than a wrong one). In this
+milestone it is local-only — nothing is sent anywhere.
+
+Geolocation is **secure-context-only**. Over `http://` on a LAN address —
+which is what `wrangler dev` gives you — browsers deny it with no prompt and
+no console error. The button detects that case and says so instead of
+failing silently, but the fix is the same either way: open the deployed
+`https://` address on the phone. Verifying this feature means using a real
+phone over HTTPS; a desktop browser on localhost proves nothing about the
+permission prompt.
 
 ## Feed data licensing
 

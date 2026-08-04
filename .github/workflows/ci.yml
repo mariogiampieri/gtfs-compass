@@ -26,6 +26,24 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm test
 
+  config-ui:
+    name: config-ui — build + vitest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: config-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: config-ui/package-lock.json
+      - run: npm ci
+      # `npm test` alone would not catch a build that emits inline script;
+      # `check` is build-then-test, and the build is where R19 is enforced.
+      - run: npm run check
+
   ingest:
     name: ingest — pytest
     runs-on: ubuntu-latest

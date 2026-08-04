@@ -1,0 +1,12 @@
+# Security headers for the statically-served SPA (R19).
+#
+# Static assets never enter the Worker, so they cannot carry a per-request CSP
+# nonce — hence a strict `'self'` policy with no inline anything, enforced at
+# build time by build.mjs. The Worker-served auth interstitial is a separate
+# route with its own nonce-based CSP; do not assume this file covers it.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; manifest-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  X-Frame-Options: DENY
+  Permissions-Policy: geolocation=(self), camera=(), microphone=(), interest-cohort=()

@@ -1,0 +1,14 @@
+{
+  "name": "gtfs-compass-config-ui",
+  "private": true,
+  "type": "module",
+  "description": "Config UI PWA for gtfs-compass, served as static assets by the same Worker as /v1/*.",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "vitest run",
+    "check": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "vitest": "4.1.10"
+  }
+}
