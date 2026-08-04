@@ -246,7 +246,12 @@ the Worker heard about it) and `quality` is `"current"` inside a 120-second
 horizon, `"last_known"` past it. A last-known fix is a distinct state, not a
 position with an old timestamp: the chain prefers anything a live provider can
 resolve and returns it only when nothing else does, labelled so the device
-renders "via phone, 3 min ago" instead of a silently stale number. Anonymous
+renders "via phone, 3 min ago" instead of a silently stale number. The horizon
+is measured from when the Worker received the fix, so a phone whose clock runs
+fast cannot stretch it, and a last-known fix has a hard ceiling of **4 hours**:
+past that it is treated as absent, the chain falls through to WiFi and then to
+`{"known": false}`, and no board is ever given a departure time computed from a
+position the user left this morning. Anonymous
 requests, boards that were never granted `read:fix`, and boards whose grant was
 revoked get exactly the WiFi response above — the grant governs the read as
 well as the relay, so a revocation takes effect on the board's very next call.
@@ -266,18 +271,39 @@ curl -X POST "https://<worker-host>/v1/locate/ref" \
   -H "Origin: https://<worker-host>" -b "__Host-gc_session=<token>" \
   -d '{"relay": true, "lat": 40.6923, "lon": -73.9873, "accuracy": 12,
        "captured_at": 1785000000}'
-# → {"relayed": {"devices": 2}}
+# → {"relayed": {"devices": 2, "stored": 2}}
 ```
+
+`devices` is how many boards were targeted and `stored` how many actually took
+this position. They differ in one case, and it is the case the store exists to
+handle: a board already holding a *strictly more accurate* fix from inside the
+120-second horizon keeps it, so a phone that briefly falls back to cell-tower
+accuracy cannot erase the good position the board is about to read. The config
+UI says so rather than reporting a delivery that did not replace anything.
 
 `accuracy` is stored exactly as the phone reported it — the accuracy gate lives
 at read time so a coarse fix falls through to the next provider instead of
 being lost — and `captured_at` (epoch **seconds**, optional, defaults to
-receipt) is what `quality` is measured from. Posts are budgeted per session and
-per client network per day (`RELAY_BUDGET_SESSION` / `RELAY_BUDGET_IP`); the
-client sends at most about once a minute, and the budget is the backstop rather
-than the mechanism. `DIAG_TOKEN` cannot relay: it names no user, and an
-operator post would need a caller-supplied `user_id` — exactly the ownership
-parameter the account-scoped design removes.
+receipt) is what `quality` is measured from. Posts are budgeted per **account**
+and per client network per day (`RELAY_BUDGET_USER`, and
+`RELAY_BUDGET_IP_FRESH` / `_REPEAT`); the client sends at most about once a
+minute, and the budget is the backstop rather than the mechanism. The account is
+the enforcing key because a session is not scarce — one mailbox can redeem
+several sign-in links a day — and the network cap is *split* for the same reason
+the pairing caps are: that key is shared with every other subscriber behind the
+same CGNAT /24, so one account must not be able to spend it and 429 the rest.
+`DIAG_TOKEN` cannot relay: it names no user, and an operator post would need a
+caller-supplied `user_id` — exactly the ownership parameter the account-scoped
+design removes.
+
+**A phone-sourced answer is never written to the diagnostic log.** `log: true`
+on `/v1/locate` records the *WiFi estimate* a walk produces, so that
+`/v1/locate/ref` can pair a phone reference against it and compute `delta_m`;
+when the relay answered, there is no estimate — the chain returned before WiFi
+was consulted — and a row whose estimate *is* the phone reference would be a
+durable copy of the most precise position in the system, in a table that
+revoking `read:fix` does not clear. The relayed position lives in exactly one
+place, and turning the permission off deletes it.
 
 `POST /v1/locate/ref` with `log: true` and `GET /v1/locate/log` support the
 accuracy walk described in the spec. They — and `log: true` on `/v1/locate` —
@@ -321,7 +347,9 @@ is ever stored in it, and why a relayed phone position (looked up per device)
 sits above it rather than inside it. Diagnostic logging (`log: true`, which
 takes `DIAG_TOKEN`, a session, or a paired board's token — never nothing at
 all) stores the resolved position estimate, attributed to the account when the
-caller had one; those rows are aged out on a schedule — see
+caller had one — but **never a phone-relayed position**, which lives only in the
+row the `read:fix` toggle deletes. Those diagnostic rows are aged out on a
+schedule — see
 [Data retention](#data-retention). A relayed phone position is stored as one
 row per receiving board, replaced in place rather than accumulated, and aged
 out on the same schedule. BeaconDB is explicitly
@@ -537,7 +565,10 @@ that and deletes the position already sent to that board.
 location* reads this phone's position and shows the raw accuracy — nothing
 leaves the phone. *Send my position to my devices* posts that same reading to
 every board holding the `read:fix` grant, and says how many received it,
-including "no device is set to receive it" when the answer is none. It is
+including "no device is set to receive it" when the answer is none — and how
+many actually took it, because a board holding a more accurate position from the
+last couple of minutes keeps that one, and "each keeps this position" would be
+the wrong sentence for a board still showing an earlier reading. It is
 gesture-triggered, throttled to about one send a minute, and never runs on its
 own; a board with the grant switched off is not a recipient, and switching it
 off deletes the position that board already had.
@@ -647,6 +678,29 @@ Four details are load-bearing and easy to undo by accident:
 Emailed links point at the origin of the request that asked for one. On a
 deployment answering to more than one hostname, set `AUTH_PUBLIC_ORIGIN` to
 pin them to the real front door.
+
+#### `AUTH_MODE=single` is an auth bypass, and it now writes as well as reads
+
+Setting the Worker var to the exact string `single` skips sign-in entirely and
+binds **every** request to one synthetic user. The CSRF and `Origin` checks stay
+on, but those constrain browsers: with no credential in play, any non-browser
+client that reaches the hostname *is* the account. Workers deploy to a public
+hostname by default, so the mode is only safe behind a network-level control
+(Cloudflare Access, a private hostname, or equivalent).
+
+What has changed with the relay is the blast radius. It is no longer only reads
+and configuration: `POST /v1/locate/ref` with `relay: true` is session-only, and
+in this mode every request is the session, so a single `curl` carrying an
+`Origin` header and `X-GC-CSRF` plants an arbitrary position on every board
+holding `read:fix` — and the board *navigates* by it, sorting stops, computing
+walk times, and telling its owner to leave for a platform they are nowhere near.
+
+There is deliberately no per-route carve-out refusing `relay: true` in this
+mode. The mode's meaning is "every request is the user", one rule that a reader
+can hold in their head; a list of routes that quietly opted out would be
+folklore, and it would break the relay in the one deployment shape where the
+phone has no other way to authenticate. Turn the mode off, or put the network
+control in front of it.
 
 ### Pairing a device
 

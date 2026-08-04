@@ -7,10 +7,43 @@
  * different fact from empty-but-located systems (200 with empty stops).
  */
 
-import { resolveCredential } from "../auth";
+import { refreshCookie, resolveCredential } from "../auth";
 import { readWifiScanBody, resolveLocation } from "../locate";
 import { type FeedInfo, MODES, composeNearby } from "../nearby";
 import type { FixQuality } from "../relay";
+
+/**
+ * Every response this route returns.
+ *
+ * `no-store` because a POST here now answers with a metre-accurate personal
+ * position when the caller is a board holding `read:fix` — the same reason
+ * `routes/config.ts`, `routes/auth.ts` and `routes/pair.ts` set it. A POST body
+ * is not cached by a conforming shared cache, so this is hardening against the
+ * proxy or service worker somebody puts in front later; `nosniff` for the same
+ * reason the credentialed routes carry it.
+ *
+ * The body is `JSON.stringify` of the value handed in, byte for byte what
+ * `Response.json` produced — AE9's byte-identical `location` object is a
+ * property of the object's key order, not of the helper.
+ */
+function noStoreJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+/** Append a slid session cookie to an answer that leaves the session in place. */
+function withCookie(res: Response, cookie: string | null): Response {
+  if (!cookie) return res;
+  const headers = new Headers(res.headers);
+  headers.append("Set-Cookie", cookie);
+  return new Response(res.body, { status: res.status, headers });
+}
 
 export async function routeNearby(
   request: Request,
@@ -31,6 +64,13 @@ export async function routeNearby(
    * forbids.
    */
   let relayed: { provider: string; captured_at?: number; quality: FixQuality } | null = null;
+  /**
+   * Set once a POST has resolved a session: `validateSession` slides the window
+   * in D1 past the half-life, and this route does not go through `authorize()`,
+   * so without re-issuing the cookie the browser keeps the `Max-Age` the session
+   * was minted with while D1 moves forward.
+   */
+  let refresh: string | null = null;
 
   if (request.method === "GET") {
     const latRaw = url.searchParams.get("lat");
@@ -39,7 +79,7 @@ export async function routeNearby(
     lat = latRaw === null || latRaw === "" ? NaN : Number(latRaw);
     lon = lonRaw === null || lonRaw === "" ? NaN : Number(lonRaw);
     if (!validCoords(lat, lon)) {
-      return Response.json({ error: "lat and lon required" }, { status: 400 });
+      return noStoreJson({ error: "lat and lon required" }, 400);
     }
   } else if (request.method === "POST") {
     const parsed = await readWifiScanBody(request);
@@ -49,6 +89,7 @@ export async function routeNearby(
     // other in the same minute, with this endpoint's distance sort and walk
     // heuristic running on the worse of the two.
     const credential = await resolveCredential(request, env);
+    refresh = refreshCookie(request, credential);
     const located = await resolveLocation({
       bssids: parsed.wifiAccessPoints,
       env,
@@ -56,7 +97,7 @@ export async function routeNearby(
     });
     if (!located.known) {
       // The device's designed "can't find you" state — not an empty board.
-      return Response.json({ error: "location unknown" }, { status: 422 });
+      return withCookie(noStoreJson({ error: "location unknown" }, 422), refresh);
     }
     lat = located.lat;
     lon = located.lon;
@@ -69,16 +110,19 @@ export async function routeNearby(
       };
     }
   } else {
-    return Response.json({ error: "not found" }, { status: 404 });
+    return noStoreJson({ error: "not found" }, 404);
   }
 
   const modes = parseModes(url.searchParams.get("modes"));
   if (modes === null) {
-    return Response.json({ error: "unknown modes" }, { status: 400 });
+    return withCookie(noStoreJson({ error: "unknown modes" }, 400), refresh);
   }
   const feeds = await loadFeedInfo(env, curatedFeeds);
   const body = await composeNearby(env, feeds, { lat, lon, modes });
-  return Response.json({ location: { lat, lon, accuracy, ...(relayed ?? {}) }, ...body });
+  return withCookie(
+    noStoreJson({ location: { lat, lon, accuracy, ...(relayed ?? {}) }, ...body }),
+    refresh,
+  );
 }
 
 /** Shared with routes/departures.ts's origin validation. */

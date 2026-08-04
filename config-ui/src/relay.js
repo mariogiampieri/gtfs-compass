@@ -17,9 +17,11 @@
  *    about one post a minute, so a user leaning on the button spends their own
  *    patience rather than the account's daily cap.
  *
- *  - **The success copy says how many boards received it, including zero.**
- *    "Sent" with the grant switched off everywhere would be true about the
- *    request and false about what the user was actually asking for.
+ *  - **The success copy says how many boards received it, including zero, and
+ *    how many actually took it.** "Sent" with the grant switched off everywhere
+ *    would be true about the request and false about what the user was actually
+ *    asking for; "each keeps this position" when the server kept a more
+ *    accurate one it already had would be false about the boards.
  */
 
 import { CSRF_HEADER } from "./auth.js";
@@ -59,11 +61,40 @@ export const RELAY_THROTTLED_MESSAGE =
 export const RELAY_NO_DEVICES_MESSAGE =
   "Sent, but no device is set to receive it. Turn on “Your phone's live position” for a board under Your devices.";
 
-/** @param {number} devices */
-export function relayedMessage(devices) {
+/**
+ * Every board was targeted and none took the fix: each already holds a more
+ * accurate position from the last couple of minutes, and the server keeps the
+ * better one. Saying "sent" and nothing else would be false about the sentence
+ * that follows it — the boards are showing an *older* reading, on purpose.
+ */
+export const RELAY_KEPT_BETTER_MESSAGE =
+  "Sent, but your devices are keeping a more accurate position they already had. This reading was less precise, so nothing changed on them.";
+
+/**
+ * What the send actually did.
+ *
+ * Two numbers, because the server reports two: how many boards were targeted,
+ * and how many took this position. They differ when the refinement fires — a
+ * board holding a strictly more accurate recent fix keeps it — and that is
+ * exactly the case where "each keeps this position until a newer one arrives"
+ * would be a lie about a board still showing where the phone was three streets
+ * ago.
+ *
+ * `stored` defaults to `devices` so a server that does not report it (or a body
+ * that did not parse) reads as a plain delivery rather than as a suppression.
+ *
+ * @param {number} devices
+ * @param {number} [stored]
+ */
+export function relayedMessage(devices, stored = devices) {
   if (!devices) return RELAY_NO_DEVICES_MESSAGE;
   const noun = devices === 1 ? "1 device" : `${devices} devices`;
-  return `Sent to ${noun}. Each keeps this position until a newer one arrives, and loses it the moment you turn the permission off.`;
+  if (stored >= devices) {
+    return `Sent to ${noun}. Each keeps this position until a newer one arrives, and loses it the moment you turn the permission off.`;
+  }
+  if (stored <= 0) return RELAY_KEPT_BETTER_MESSAGE;
+  const took = stored === 1 ? "1 took it" : `${stored} took it`;
+  return `Sent to ${noun}; ${took}. The rest are keeping a more accurate position they already had.`;
 }
 
 /**
@@ -118,7 +149,7 @@ export function fixBody(position, nowMs = Date.now()) {
  *
  * @param {{coords: object, timestamp: number}} position
  * @param {typeof fetch} [fetchImpl]
- * @returns {Promise<{state:"sent"|"signed-out"|"rate-limited"|"error", devices?: number, message: string}>}
+ * @returns {Promise<{state:"sent"|"signed-out"|"rate-limited"|"error", devices?: number, stored?: number, message: string}>}
  */
 export async function postFix(position, fetchImpl) {
   const doFetch = fetchImpl ?? globalThis.fetch.bind(globalThis);
@@ -139,14 +170,20 @@ export async function postFix(position, fetchImpl) {
   if (!res.ok) return { state: "error", message: RELAY_FAILED_MESSAGE };
 
   let devices = 0;
+  let stored = 0;
   try {
     const payload = await res.json();
     devices = Number(payload?.relayed?.devices) || 0;
+    const written = Number(payload?.relayed?.stored);
+    // Absent rather than zero: a server that does not report the distinction
+    // has not told us the fix was suppressed, so the honest reading is "all of
+    // them", not "none of them".
+    stored = Number.isFinite(written) ? written : devices;
   } catch {
-    // A 200 whose body did not parse still relayed the fix; the count is the
+    // A 200 whose body did not parse still relayed the fix; the counts are the
     // only thing lost, and reporting "sent to 0 devices" would be a lie about
     // the grant rather than about the parse.
-    return { state: "sent", devices: 0, message: "Sent." };
+    return { state: "sent", devices: 0, stored: 0, message: "Sent." };
   }
-  return { state: "sent", devices, message: relayedMessage(devices) };
+  return { state: "sent", devices, stored, message: relayedMessage(devices, stored) };
 }

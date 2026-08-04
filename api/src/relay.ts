@@ -72,6 +72,38 @@ const FIX_SCOPE: Scope = "read:fix";
  */
 export const FIX_HORIZON_S = 120;
 
+/**
+ * How old a relayed fix may be and still be served **at all** — 4 hours. Past
+ * it `getFix` reports absence, the chain falls through, and the device shows
+ * the `{known: false}` screen it already has a design for.
+ *
+ * The ceiling exists because the `last_known` label is not a control. It is an
+ * optional appended field (AE9), so every consumer is structurally entitled to
+ * ignore it — and the shipped firmware does: `firmware/main/model.c` reads
+ * `lat`/`lon`/`accuracy` and nothing else. Meanwhile the *server* does the
+ * arithmetic the label was supposed to caveat: `/v1/nearby` sorts stops,
+ * computes walk times and adds entry buffers from whatever position it is
+ * handed, and answers with the phone's original `accuracy` — so a fix from
+ * yesterday renders as a confident "leave in 3 min" for a platform the user is
+ * nowhere near. Labelling it is constraint #4 failing in the direction it
+ * exists to prevent; bounding it is the control.
+ *
+ * Four hours, not minutes and not days. The relay's job is to place a *board*,
+ * which is a fixed installation, from a phone that is usually in the same
+ * building, and the config UI posts on interaction rather than as a heartbeat —
+ * so a gap of hours across one visit is ordinary and a tight ceiling would make
+ * the relay useless for the case it exists to rescue (a BSSID set BeaconDB
+ * cannot place). Four hours is longer than a meal, a film or an errand and
+ * shorter than a workday, a night's sleep or a long flight — the absences after
+ * which "still where the phone last was" stops being the default assumption.
+ * It does not eliminate the risk inside the window; it bounds it, where
+ * retention's 14-day sweep was the only bound before.
+ *
+ * A constant, like the horizon, and for the same reason: it decides what the
+ * API is willing to vouch for.
+ */
+export const FIX_LAST_KNOWN_MAX_AGE_S = 4 * 60 * 60;
+
 /** Inside the horizon: a position, usable as *where the user is*. */
 export const QUALITY_CURRENT = "current";
 /** Past it: last-known, rendered with its age and never silently used as now. */
@@ -143,13 +175,35 @@ function nowS(): number {
  * comment describes; a user has a handful of devices, so the residual filter is
  * over a handful of rows.
  *
+ * **Latest means latest *capture*, not latest write.** An update whose incoming
+ * `captured_at` is strictly older than the stored one is refused outright: posts
+ * retry and reorder, and without that test an equally accurate replay walked
+ * `captured_at` backwards, after which `getFix` relabelled the older position
+ * `current` and the board rewound. The accuracy refinement below covers only
+ * the accuracy dimension and cannot see this.
+ *
  * **The refinement on latest-wins:** a newly-arrived fix does not replace a
  * strictly more accurate one that is still inside the horizon, so a momentary
  * coarse reading (a phone that briefly falls back to cell-tower accuracy) can't
  * erase the good position the device is about to read. An incomparable pair —
  * either side's accuracy unknown — is not "strictly more accurate", so it falls
  * through to plain latest-wins. Once the stored fix ages past the horizon it is
- * no longer a position at all (R13) and anything current outranks it.
+ * no longer a position at all (R13) and anything current outranks it — and
+ * "past the horizon" is spelled the same way here as in `getFix`, inclusive at
+ * exactly `FIX_HORIZON_S`, because it is one rule and the two sides disagreeing
+ * meant the read layer served a position the write layer had already written
+ * off.
+ *
+ * **`captured_at` is clamped to receipt.** The ingress route tolerates 60 s of
+ * forward clock skew, and every freshness question in this file is asked of
+ * `captured_at`, so an ordinary fast phone clock would stretch a 120 s horizon
+ * to 180 real seconds — the discriminator widened by a client, with no
+ * deployment change, which is exactly what the constant's comment says must not
+ * happen. Clamping at the one moment both numbers are known keeps a single
+ * freshness derivation downstream (age, the horizon, capture ordering, the
+ * retention cutoff) instead of a `min()` every reader has to remember, and it
+ * makes `captured_at <= received_at` an invariant of the table. A fix can only
+ * ever be *reported* as older than it was, never newer.
  *
  * The whole fan-out is one `batch()`, so a two-device account cannot end up
  * with one device holding this fix and the other holding the last one.
@@ -176,6 +230,7 @@ export async function putFixForUser(
   if (recipients.length === 0) return { targeted: 0, written: 0 };
 
   const accuracyM = fix.accuracyM ?? null;
+  const capturedAt = Math.min(fix.capturedAt, nowSec);
   const horizonFloor = nowSec - FIX_HORIZON_S;
   const statements = recipients.map((row) =>
     env.DB.prepare(
@@ -187,11 +242,12 @@ export async function putFixForUser(
          accuracy_m  = excluded.accuracy_m,
          captured_at = excluded.captured_at,
          received_at = excluded.received_at
-       WHERE NOT (device_fixes.captured_at > ?7
+       WHERE excluded.captured_at >= device_fixes.captured_at
+         AND NOT (device_fixes.captured_at >= ?7
                   AND device_fixes.accuracy_m IS NOT NULL
                   AND excluded.accuracy_m IS NOT NULL
                   AND device_fixes.accuracy_m < excluded.accuracy_m)`,
-    ).bind(row.id, fix.lat, fix.lon, accuracyM, fix.capturedAt, nowSec, horizonFloor),
+    ).bind(row.id, fix.lat, fix.lon, accuracyM, capturedAt, nowSec, horizonFloor),
   );
 
   const written = (await env.DB.batch(statements)).reduce(
@@ -217,14 +273,21 @@ export async function putFixForUser(
  * is what stops each caller re-deriving it — U8 renders it, U16 clears it, and
  * neither should own a copy of the 120-second rule.
  *
+ * **A row past `FIX_LAST_KNOWN_MAX_AGE_S` is the first state, not the third.**
+ * It is still in the table — retention owns deletion, on its own 14-day
+ * schedule, for its own reasons — but this function will not serve it, so the
+ * chain falls through as if nothing had ever been posted. Absence is the only
+ * signal a caller cannot ignore, and the alternative was `/v1/nearby` composing
+ * a departures board out of a position from last week and stamping it with the
+ * phone's original 8-metre accuracy.
+ *
  * No accuracy gate, no grant check. Both belong to the chain (R12, R9): this
  * function answers "what is stored", and a device that may not read it must be
  * refused before it gets here.
  *
- * A `captured_at` in the future — a phone with a skewed clock — floors to age 0
- * and reads as current, which is the same treatment a just-arrived fix gets.
- * Validating the posted timestamp is the ingress route's job (U14), not the
- * store's.
+ * `captured_at` is clamped to receipt on write, so age is measured against a
+ * number the server observed rather than one a client asserted; the floor at 0
+ * stays as a second belt for rows this file did not write.
  */
 export async function getFix(
   env: Env,
@@ -247,6 +310,8 @@ export async function getFix(
   if (!row) return null;
 
   const ageS = Math.max(0, nowSec - row.captured_at);
+  if (ageS > FIX_LAST_KNOWN_MAX_AGE_S) return null;
+
   return {
     deviceId: row.device_id,
     lat: row.lat,

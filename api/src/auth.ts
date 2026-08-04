@@ -674,9 +674,17 @@ export async function authorize(
  * The `Set-Cookie` a renewed session needs, or null. Rebuilt from the token the
  * request presented — the plaintext exists only in that header, never in D1 —
  * so this is the only point at which a slid window can reach the browser.
+ *
+ * Exported for the **anonymous-capable** routes (`/v1/locate`, `/v1/nearby`),
+ * which resolve a credential without going through `authorize()` and would
+ * otherwise slide the window in D1 while the browser kept the `Max-Age` it was
+ * minted with. Everything that authorizes gets this through `Authorized.refresh`
+ * instead; there is one implementation either way, which is the point.
  */
-function refreshCookie(request: Request, credential: Credential): string | null {
-  if (credential.kind !== "session" || credential.renewedExpiresAtS === undefined) return null;
+export function refreshCookie(request: Request, credential: Credential | null): string | null {
+  if (!credential || credential.kind !== "session" || credential.renewedExpiresAtS === undefined) {
+    return null;
+  }
   const token = readSessionCookie(request);
   if (!token) return null;
   return sessionCookie(token, Math.max(0, credential.renewedExpiresAtS - nowS()));

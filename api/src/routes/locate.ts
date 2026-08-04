@@ -40,6 +40,16 @@
  * is composed unconditionally into both statements, and the per-user half of it
  * comes from `auth.ts`'s `ownerPredicate` rather than a hand-written
  * `user_id = ?` — the scoping is the credential resolver's, not the route's.
+ *
+ * **A phone-sourced resolution is never written to `locate_log`.** The corpus
+ * exists to compare a device's WiFi *estimate* against a phone *reference*, and
+ * `device_fixes` — one row, latest-wins, deleted the instant `read:fix` is
+ * revoked — is the only place the relayed position is allowed to live. See
+ * `handleLocate`.
+ *
+ * **Client-supplied text is length-capped at ingress.** `device_id` and `label`
+ * are attacker-chosen strings on a surface any session or board may write to,
+ * and `DAILY_LOG_CAP` bounds the row *count*, not the row *size*.
  */
 
 import {
@@ -47,6 +57,7 @@ import {
   checkAmbientCsrf,
   hashToken,
   ownerPredicate,
+  refreshCookie,
   resolveCredential,
   type Authorized,
   type Credential,
@@ -61,12 +72,53 @@ const DAILY_LOG_CAP = 500;
 const REF_PAIR_WINDOW_S = 60;
 const LOG_PAGE_LIMIT = 500;
 
+/**
+ * Caps on the two client-chosen strings these routes store. Neither is bounded
+ * anywhere else: `readWifiScanBody` bounds the access-point array,
+ * `normalizeBssids` bounds each `macAddress`, and `DAILY_LOG_CAP` bounds how
+ * many rows a caller may insert per day — none of them bounds how big a row is.
+ * Against D1's row ceiling an uncapped `label` turns a 500-row daily allowance
+ * into a gigabyte of attacker-chosen text in the same database that serves
+ * feeds, stops and auth.
+ *
+ * Over-length is a 400, never a truncation: `device_id` is the key the daily cap
+ * and the reference pairing are addressed by, and silently shortening it would
+ * file the row under — and let it pair against — a different caller's id.
+ */
+const MAX_DEVICE_ID_LENGTH = 64;
+const MAX_LABEL_LENGTH = 128;
+
 /* `auth_budgets.scope` values this module owns (R11). ----------------------- */
 
-/** Relay posts per session per UTC day — the counter that does the enforcing. */
-export const RELAY_SESSION_SCOPE = "relay:session";
-/** The same posts counted per client network (/24 or /64), never per address. */
-export const RELAY_IP_SCOPE = "relay:ip";
+/**
+ * Relay posts per **user** per UTC day — the counter that does the enforcing.
+ *
+ * Keyed on the account and not on the session, which is the whole point: a
+ * session is not scarce (30-day TTL, a fresh row per magic-link redeem, five
+ * sends per address per day), so a per-session allowance is a per-account
+ * allowance multiplied by however many sessions the holder cares to mint. A
+ * user costs an email that R4's send slices already ration.
+ */
+export const RELAY_USER_SCOPE = "relay:user";
+/**
+ * The same posts counted per client network (/24 or /64, never per address),
+ * **split into two slices** exactly as `pair.ts` splits its deployment-wide
+ * caps. The network key is shared — a carrier CGNAT /24 holds hundreds of
+ * subscribers, on a feature whose premise is a phone on mobile data — so a
+ * single counter over it is a denial lever one account can pull. The slice a
+ * charge draws on is chosen by the *user's* own count for the day, so an
+ * account posting all day spends `repeat` and cannot exhaust the `fresh` pool a
+ * co-located user's ordinary sends land in.
+ */
+export const RELAY_IP_FRESH_SCOPE = "relay:ip:fresh";
+export const RELAY_IP_REPEAT_SCOPE = "relay:ip:repeat";
+/**
+ * Posts a spent network slice turned away, keyed by slice. Fixed cardinality
+ * (two keys, `BUDGET_SHARDS` rows apiece), so it is safe to write on the
+ * refusal path — see `pair.ts`'s `noteGlobalRefusal`, whose reasoning this
+ * shares: a shared key refusing an honest caller is invisible in the response.
+ */
+export const RELAY_REFUSED_SCOPE = "relay:refused";
 
 /**
  * A full day at the documented client cadence (about once a minute) plus
@@ -74,13 +126,32 @@ export const RELAY_IP_SCOPE = "relay:ip";
  * not — the relay is the phase's highest-frequency write and fans out to N
  * rows per call, so it is the one path that must not be uncapped.
  */
-const DEFAULT_RELAY_SESSION_BUDGET = 1500;
+const DEFAULT_RELAY_USER_BUDGET = 1500;
 /**
- * Four sessions' worth behind one shared network. Deliberately loose: everyone
- * behind a CGNAT /24 shares this key, and the per-session cap is what actually
- * enforces the cadence.
+ * The network's day, four fifths of it reserved for the traffic an abuser
+ * cannot manufacture cheaply. Same split and the same arithmetic as
+ * `PAIR_START_BUDGET_FRESH`/`_REPEAT` and `AUTH_SEND_BUDGET_KNOWN`/`UNKNOWN`;
+ * the two still total the 6000/day the single counter was.
  */
-const DEFAULT_RELAY_IP_BUDGET = 6000;
+const DEFAULT_RELAY_IP_FRESH_BUDGET = 4800;
+const DEFAULT_RELAY_IP_REPEAT_BUDGET = 1200;
+
+/**
+ * How many of one user's posts in a UTC day draw on the network's `fresh`
+ * slice.
+ *
+ * The honest shape is a gesture: the config UI sends on a button press and
+ * throttles itself to about one a minute, so a person actively relaying spends
+ * a handful to a few dozen in a day. Sixty covers that generously, and
+ * everything past it — hundreds of posts from one account — is the shape only a
+ * runaway client or an abuser has. Sized in posts rather than in
+ * `pair.ts`'s handful because the honest cadence here is a stream, not a
+ * once-in-a-device's-life request.
+ */
+const FRESH_SLICE_POSTS = 60;
+
+/** Which network slice a charge draws on. Operator-facing only — never a response. */
+type NetworkSlice = "fresh" | "repeat";
 
 /** How far ahead of the Worker a phone's clock may be and still be believed. */
 const MAX_FIX_SKEW_S = 60;
@@ -89,6 +160,46 @@ const MAX_FIX_AGE_S = 86_400;
 
 function nowS(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Every response these routes return.
+ *
+ * `no-store` because two of them now carry a metre-accurate personal position
+ * (the relayed phone fix) and one carries an account's diagnostic history — the
+ * same reason `routes/config.ts`, `routes/auth.ts` and `routes/pair.ts` all set
+ * it. A POST body is not cached by a conforming shared cache, so this is
+ * hardening against the GET form, proxy or service worker somebody adds later.
+ * `nosniff` because `/v1/locate/log` echoes client-chosen `device_id`/`label`
+ * text and the one way a JSON body becomes executable markup is a browser that
+ * sniffs it as HTML.
+ *
+ * The body is `JSON.stringify` of the value handed in, byte for byte what
+ * `Response.json` produced — AE9's byte-identical locate contract is a property
+ * of the object's key order, not of the helper.
+ */
+function noStoreJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+/**
+ * A client-supplied string, bounded. Returns `null` for "absent or empty" — the
+ * one representation of "the caller said nothing" — and a ready 400 for a value
+ * past `cap`.
+ */
+function boundedText(raw: unknown, field: string, cap: number): string | null | Response {
+  if (typeof raw !== "string" || raw === "") return null;
+  if (raw.length > cap) {
+    return noStoreJson({ error: `${field} must be at most ${cap} characters` }, 400);
+  }
+  return raw;
 }
 
 /** Header-only Bearer check. A token anywhere else (query param) never counts. */
@@ -110,15 +221,20 @@ function clientIp(request: Request): string {
 
 /**
  * Append the slid session cookie to any answer that leaves the session in
- * place. `authorize()` renews the window in D1; the browser cannot see that, so
- * a response that drops `refresh` silently shortens the session to whatever
- * `Max-Age` it was minted with.
+ * place. `validateSession` renews the window in D1; the browser cannot see
+ * that, so a response that drops the cookie silently shortens the session to
+ * whatever `Max-Age` it was minted with.
  */
-function withSession(auth: Authorized | null, res: Response): Response {
-  if (!auth?.refresh) return res;
+function withCookie(res: Response, cookie: string | null): Response {
+  if (!cookie) return res;
   const headers = new Headers(res.headers);
-  headers.append("Set-Cookie", auth.refresh);
+  headers.append("Set-Cookie", cookie);
   return new Response(res.body, { status: res.status, headers });
+}
+
+/** The `authorize()`-shaped half of `withCookie`, for the routes that use it. */
+function withSession(auth: Authorized | null, res: Response): Response {
+  return withCookie(res, auth?.refresh ?? null);
 }
 
 export async function routeLocate(request: Request, env: Env, url: URL): Promise<Response> {
@@ -131,7 +247,7 @@ export async function routeLocate(request: Request, env: Env, url: URL): Promise
   if (url.pathname === "/v1/locate/log" && request.method === "GET") {
     return handleLocateLog(request, env, url);
   }
-  return Response.json({ error: "not found" }, { status: 404 });
+  return noStoreJson({ error: "not found" }, 404);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -218,21 +334,64 @@ function historyPredicate(auth: Authorized | null, placeholderIndex: number): Ow
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Which network slice a user's next post draws on, given what that user has
+ * already spent today. The whole point of the split: the posts a single account
+ * can produce in volume are the ones past `FRESH_SLICE_POSTS`, so they get
+ * their own pool and cannot exhaust the one everybody else's ordinary sends
+ * land in.
+ */
+function sliceFor(userUsed: number): NetworkSlice {
+  return userUsed < FRESH_SLICE_POSTS ? "fresh" : "repeat";
+}
+
+/**
+ * Record — durably, not only in a log tail nobody is reading — that a network
+ * slice turned away a post that had done nothing wrong.
+ *
+ * The network key is shared, so a refusal here can be somebody else's fault
+ * entirely, and it is invisible in the response: the honest phone sees the same
+ * 429 an abuser does. A counter failure must not turn a 429 into a 500, so it
+ * is swallowed after being logged — it exists to report, never to gate.
+ */
+async function noteNetworkRefusal(env: Env, slice: NetworkSlice): Promise<void> {
+  console.error(
+    `[relay] refused: the ${slice} network slice is spent for today — honest callers behind ` +
+      `this /24 or /64 are being turned away (auth_budgets scope=${RELAY_REFUSED_SCOPE})`,
+  );
+  try {
+    await incrementBudget(env, RELAY_REFUSED_SCOPE, slice);
+  } catch (err) {
+    console.error(`[relay] refusal counter write failed: ${String(err)}`);
+  }
+}
+
+/**
  * Bound one relay post before it writes anything.
  *
- * **Both counters are read before either is written**, and the session bound is
- * checked before the network bound — the ordering `chargeSendBudget` and
- * `chargeStartBudget` established, and it is load bearing for the same reason:
- * the network key is caller-chosen, so charging it before the bound above it is
- * checked would persist one `auth_budgets` row per network for as long as
- * anyone cares to POST.
+ * **Every counter is read before any is written** — the ordering
+ * `chargeSendBudget` and `chargeStartBudget` established, and it is load bearing
+ * for the same reason: the network key is caller-chosen, so charging it before
+ * the bounds above it are checked would persist one `auth_budgets` row per
+ * network for as long as anyone cares to POST.
  *
- * No deployment-wide slice, unlike `pair/start`, and the difference is that
- * this route **requires a session**: the number of distinct network keys one
- * account can create in a day is already bounded by its own per-session cap,
- * and accounts are themselves bounded by R4's unknown-address send slice. The
- * unbounded-cardinality problem the global slices exist for does not arise
- * behind a credential that costs an email to obtain.
+ * **The enforcing bound is per user, and the shared bound is sliced** — the
+ * shape `chargeStartBudget` arrived at, for the same failure. A counter keyed
+ * on `sessions.id` bounds nothing an account has to respect: sessions live 30
+ * days, every magic-link redeem mints another, and five sends per address per
+ * day means one mailbox accumulates five live sessions a day, each with its own
+ * full allowance. So the account is the key, and the network — which is shared
+ * with strangers and cannot be made unshared — carries a split cap instead of a
+ * single one an attacker could spend to deny every other subscriber behind the
+ * same CGNAT /24. The residue is the one `email.ts` accepts on its `known`
+ * slice: an attacker who brings genuinely fresh *accounts* can still reach the
+ * fresh pool, at the cost of one registration — itself rationed by R4's
+ * unknown-address send slice — per `FRESH_SLICE_POSTS` posts.
+ *
+ * When `CF-Connecting-IP` is absent every caller collapses into one network key
+ * (see `clientIp`). That is still one shared, tighter budget rather than an open
+ * one, and the slice is what keeps the collapse survivable: a user's first
+ * `FRESH_SLICE_POSTS` of the day draw on a pool nobody's runaway client can
+ * spend.
  *
  * Not serializable, deliberately: two concurrent charges at the boundary can
  * both pass, so a limit of N admits N+1 in the worst case. That is the right
@@ -244,21 +403,30 @@ async function chargeRelayBudget(
   credential: Credential,
   ip: string,
 ): Promise<boolean> {
-  // Keyed on the session where there is one, so a single account's stolen
-  // cookie cannot spend every other tab's budget; `AUTH_MODE=single` has no
-  // session row and falls back to the user it binds everything to.
-  const sessionKey = await hashToken(
-    credential.kind === "session" ? (credential.sessionId ?? credential.userId) : credential.userId,
-  );
+  // The account, never the session. `AUTH_MODE=single` has no session row at
+  // all and binds every request to the same synthetic user, which this keys on
+  // exactly like any other.
+  const userKey = await hashToken(credential.userId);
   const ipKey = await hashToken(networkKey(ip));
-  const sessionUsed = await readBudget(env, RELAY_SESSION_SCOPE, sessionKey);
-  const ipUsed = await readBudget(env, RELAY_IP_SCOPE, ipKey);
-  if (sessionUsed >= budgetVar(env.RELAY_BUDGET_SESSION, DEFAULT_RELAY_SESSION_BUDGET)) {
+  // The user's count is read first because it selects the slice, which is a
+  // read too — no row exists until the last two statements.
+  const userUsed = await readBudget(env, RELAY_USER_SCOPE, userKey);
+  const slice = sliceFor(userUsed);
+  const ipScope = slice === "fresh" ? RELAY_IP_FRESH_SCOPE : RELAY_IP_REPEAT_SCOPE;
+  const ipLimit =
+    slice === "fresh"
+      ? budgetVar(env.RELAY_BUDGET_IP_FRESH, DEFAULT_RELAY_IP_FRESH_BUDGET)
+      : budgetVar(env.RELAY_BUDGET_IP_REPEAT, DEFAULT_RELAY_IP_REPEAT_BUDGET);
+  const ipUsed = await readBudget(env, ipScope, ipKey);
+  if (userUsed >= budgetVar(env.RELAY_BUDGET_USER, DEFAULT_RELAY_USER_BUDGET)) {
     return false;
   }
-  if (ipUsed >= budgetVar(env.RELAY_BUDGET_IP, DEFAULT_RELAY_IP_BUDGET)) return false;
-  await incrementBudget(env, RELAY_SESSION_SCOPE, sessionKey);
-  await incrementBudget(env, RELAY_IP_SCOPE, ipKey);
+  if (ipUsed >= ipLimit) {
+    await noteNetworkRefusal(env, slice);
+    return false;
+  }
+  await incrementBudget(env, RELAY_USER_SCOPE, userKey);
+  await incrementBudget(env, ipScope, ipKey);
   return true;
 }
 
@@ -272,7 +440,10 @@ async function handleLocate(request: Request, env: Env): Promise<Response> {
   if (parsed instanceof Response) return parsed;
   const { body, wifiAccessPoints } = parsed;
 
-  const deviceId = typeof body.device_id === "string" && body.device_id ? body.device_id : null;
+  const deviceId = boundedText(body.device_id, "device_id", MAX_DEVICE_ID_LENGTH);
+  if (deviceId instanceof Response) return deviceId;
+  const label = boundedText(body.label, "label", MAX_LABEL_LENGTH);
+  if (label instanceof Response) return label;
   const wantsLog = body.log === true;
 
   // `resolveCredential` rather than `authorize`: this route is anonymous-capable
@@ -281,6 +452,10 @@ async function handleLocate(request: Request, env: Env): Promise<Response> {
   // rather than a 403 — the grant enables a provider, it does not gate the
   // route. An anonymous multi-user request resolves to null without a query.
   const credential = await resolveCredential(request, env);
+  // Resolving a session slides its window in D1, which the browser cannot see;
+  // this route does not go through `authorize()`, so the cookie is re-issued
+  // here or the slid window never reaches the client.
+  const refresh = refreshCookie(request, credential);
 
   // DIAG_TOKEN wins over any credential the same request happens to carry: it
   // *is* the operator diagnostic path, and its rows belong to the walk rather
@@ -293,13 +468,29 @@ async function handleLocate(request: Request, env: Env): Promise<Response> {
 
   if (wantsLog) {
     const denial = await checkLogInsert(request, env, credential, diag, attributed);
-    if (denial) return denial;
+    if (denial) return withCookie(denial, refresh);
   }
 
   const result = await resolveLocation({ bssids: wifiAccessPoints, env, credential });
 
-  if (wantsLog) {
-    const label = typeof body.label === "string" ? body.label : null;
+  // A phone-sourced resolution is never persisted as a diagnostic estimate.
+  //
+  // `quality` is on the wire for a relayed fix and for nothing else (see
+  // `locate.ts`'s `toResolved`), which makes it the discriminator rather than a
+  // provider-name string copied across module boundaries. Two things compose
+  // into a leak without it: `log:true` now takes any session or device token,
+  // and the chain answers from the relay first — so a board holding `read:fix`
+  // could copy its owner's metre-accurate GPS position into `locate_log`, where
+  // revoking the grant does not delete it and the 14-day sweep is the only
+  // reaper. `device_fixes` is the one place that position lives, precisely
+  // because `clearFix` empties it the instant the grant goes.
+  //
+  // Suppressing the row loses nothing the corpus wants: it exists to compare a
+  // WiFi *estimate* against a phone *reference*, and when the phone answered
+  // there is no estimate — the chain returned before WiFi was consulted.
+  const phoneSourced = result.known && result.quality !== undefined;
+
+  if (wantsLog && !phoneSourced) {
     await env.DB.prepare(
       `INSERT INTO locate_log
          (user_id, device_id, device_row_id, ts, est_lat, est_lon, est_accuracy,
@@ -321,7 +512,7 @@ async function handleLocate(request: Request, env: Env): Promise<Response> {
       .run();
   }
 
-  return Response.json(result);
+  return withCookie(noStoreJson(result), refresh);
 }
 
 /**
@@ -348,7 +539,7 @@ async function checkLogInsert(
   attributed: Attribution,
 ): Promise<Response | null> {
   if (!diag && !credential) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
+    return noStoreJson({ error: "unauthorized" }, 401);
   }
   // Ambient credentials only (R3): the session cookie is the one thing a
   // browser attaches on its own, and this branch writes a row. Bearer
@@ -361,10 +552,10 @@ async function checkLogInsert(
   if (!attributed.capKey) {
     // Only reachable on the anonymous branch: an authenticated insert is keyed
     // by the credential, so it needs no client-supplied identifier at all.
-    return Response.json({ error: "device_id required when log is true" }, { status: 400 });
+    return noStoreJson({ error: "device_id required when log is true" }, 400);
   }
   if (await dailyCapReached(env, attributed)) {
-    return Response.json({ error: "daily log cap reached" }, { status: 429 });
+    return noStoreJson({ error: "daily log cap reached" }, 429);
   }
   return null;
 }
@@ -399,13 +590,13 @@ async function handleLocateRef(request: Request, env: Env): Promise<Response> {
   try {
     body = (await request.json()) ?? {};
   } catch {
-    return Response.json({ error: "invalid JSON body" }, { status: 400 });
+    return noStoreJson({ error: "invalid JSON body" }, 400);
   }
 
   const wantsRelay = body.relay === true;
   const wantsLog = typeof body.log === "boolean" ? body.log : !wantsRelay;
   if (!wantsRelay && !wantsLog) {
-    return Response.json({ error: "relay or log must be true" }, { status: 400 });
+    return noStoreJson({ error: "relay or log must be true" }, 400);
   }
 
   const diag = diagAuthorized(request, env);
@@ -426,18 +617,20 @@ async function handleLocateRef(request: Request, env: Env): Promise<Response> {
   const lat = body.lat;
   const lon = body.lon;
   if (!isLatitude(lat) || !isLongitude(lon)) {
-    return Response.json({ error: "lat and lon required, in range" }, { status: 400 });
+    return withSession(auth, noStoreJson({ error: "lat and lon required, in range" }, 400));
   }
   const accuracy = typeof body.accuracy === "number" && Number.isFinite(body.accuracy)
     ? body.accuracy
     : null;
-  const label = typeof body.label === "string" ? body.label : null;
-  const deviceId = typeof body.device_id === "string" && body.device_id ? body.device_id : null;
+  const label = boundedText(body.label, "label", MAX_LABEL_LENGTH);
+  if (label instanceof Response) return withSession(auth, label);
+  const deviceId = boundedText(body.device_id, "device_id", MAX_DEVICE_ID_LENGTH);
+  if (deviceId instanceof Response) return withSession(auth, deviceId);
   if (wantsLog && !deviceId) {
-    return Response.json({ error: "device_id required when log is true" }, { status: 400 });
+    return withSession(auth, noStoreJson({ error: "device_id required when log is true" }, 400));
   }
   const capturedAt = readCapturedAt(body.captured_at);
-  if (capturedAt instanceof Response) return capturedAt;
+  if (capturedAt instanceof Response) return withSession(auth, capturedAt);
 
   const payload: Record<string, unknown> = {};
 
@@ -446,23 +639,30 @@ async function handleLocateRef(request: Request, env: Env): Promise<Response> {
     // either returned a denial or produced a session. Spelled as a refusal
     // rather than an assertion so a future edit to that branch cannot turn a
     // missing credential into a silent 200.
-    if (!auth) return Response.json({ error: "unauthorized" }, { status: 401 });
+    if (!auth) return noStoreJson({ error: "unauthorized" }, 401);
     if (!(await chargeRelayBudget(env, auth.credential, clientIp(request)))) {
-      return withSession(auth, Response.json({ error: "relay budget spent" }, { status: 429 }));
+      return withSession(auth, noStoreJson({ error: "relay budget spent" }, 429));
     }
     // Ungated on purpose (R12): whatever the phone reports is stored,
     // `accuracy_m` and all, and the provider chain gates it at read time so a
     // coarse fix falls through to the next provider instead of being lost.
-    const { targeted } = await putFixForUser(env, auth.credential.userId, {
+    const { targeted, written } = await putFixForUser(env, auth.credential.userId, {
       lat,
       lon,
       accuracyM: accuracy,
       capturedAt,
     });
-    // A count of the caller's *own* boards, which the caller can already read
-    // from `/v1/config/devices`; it is what lets the UI say "no device is set
-    // to receive this" instead of implying the fix went somewhere.
-    payload.relayed = { devices: targeted };
+    // Counts of the caller's *own* boards, which the caller can already read
+    // from `/v1/config/devices`; `devices` is what lets the UI say "no device is
+    // set to receive this" instead of implying the fix went somewhere.
+    //
+    // `stored` is reported separately because the two differ, and the case they
+    // differ in is the one the fan-out's accuracy refinement exists for: a
+    // board holding a strictly more accurate fix from inside the horizon keeps
+    // it. Reporting `targeted` alone would let the UI say "each keeps this
+    // position until a newer one arrives" about a board that is still showing
+    // the position from three streets back.
+    payload.relayed = { devices: targeted, stored: written };
   }
 
   if (wantsLog && deviceId) {
@@ -478,7 +678,7 @@ async function handleLocateRef(request: Request, env: Env): Promise<Response> {
       // was the whole request. A relay post that also asked to pair has already
       // done the thing it was for.
       if (!wantsRelay) {
-        return withSession(auth, Response.json({ error: "no unpaired estimate within 60s" }, { status: 404 }));
+        return withSession(auth, noStoreJson({ error: "no unpaired estimate within 60s" }, 404));
       }
     } else {
       payload.id = paired.id;
@@ -486,7 +686,7 @@ async function handleLocateRef(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  return withSession(auth, Response.json(payload));
+  return withSession(auth, noStoreJson(payload));
 }
 
 function isLatitude(value: unknown): value is number {
@@ -510,15 +710,12 @@ function isLongitude(value: unknown): value is number {
 function readCapturedAt(raw: unknown): number | Response {
   if (raw === undefined || raw === null) return nowS();
   if (typeof raw !== "number" || !Number.isFinite(raw)) {
-    return Response.json({ error: "captured_at must be epoch seconds" }, { status: 400 });
+    return noStoreJson({ error: "captured_at must be epoch seconds" }, 400);
   }
   const captured = Math.floor(raw);
   const now = nowS();
   if (captured > now + MAX_FIX_SKEW_S || captured < now - MAX_FIX_AGE_S) {
-    return Response.json(
-      { error: "captured_at is not a plausible epoch-seconds time" },
-      { status: 400 },
-    );
+    return noStoreJson({ error: "captured_at is not a plausible epoch-seconds time" }, 400);
   }
   return captured;
 }
@@ -599,14 +796,14 @@ async function pairReference(
  */
 async function handleLocateLog(request: Request, env: Env, url: URL): Promise<Response> {
   if (!diagAuthorized(request, env)) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
+    return noStoreJson({ error: "unauthorized" }, 401);
   }
 
   const deviceId = url.searchParams.get("device_id");
   const sinceRaw = url.searchParams.get("since");
   const since = sinceRaw === null ? null : Number(sinceRaw);
   if (since !== null && !Number.isFinite(since)) {
-    return Response.json({ error: "since must be an epoch-seconds number" }, { status: 400 });
+    return noStoreJson({ error: "since must be an epoch-seconds number" }, 400);
   }
 
   const clauses: string[] = [];
@@ -629,5 +826,5 @@ async function handleLocateLog(request: Request, env: Env, url: URL): Promise<Re
     .bind(...binds)
     .all();
 
-  return Response.json({ rows: rows.results });
+  return noStoreJson({ rows: rows.results });
 }

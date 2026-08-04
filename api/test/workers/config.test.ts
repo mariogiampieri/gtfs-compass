@@ -668,6 +668,46 @@ describe("revoking read:fix clears the position already delivered", () => {
     expect(await fixCount(deviceId)).toBe(0);
   });
 
+  /**
+   * The orphan a fan-out racing a revocation leaves behind, and the reason a
+   * *grant* clears too.
+   *
+   * The fan-out's recipient SELECT and its batched upsert are separate round
+   * trips: a post that read this board as a recipient, then lost the race to
+   * the revocation, re-creates the row `clearFix` had just deleted. The read
+   * gate (AE6d above) correctly refuses to serve it while the grant is off —
+   * and would hand it straight over the moment the owner turned the permission
+   * back on, which is the one thing the toggle promises it will not do.
+   */
+  it("turning the permission back on never serves a position captured while it was off", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId, token } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await grant(cookie, deviceId, "read:fix", false);
+    // The row the racing fan-out wrote back, after the revocation's delete.
+    await seedFix(deviceId);
+
+    await grant(cookie, deviceId, "read:fix", true);
+
+    expect(await fixCount(deviceId)).toBe(0);
+    // ...and the board, whose grant is now live again, is told nothing rather
+    // than where its owner was while the relay was supposed to be off.
+    expect(await locateAs(token)).toEqual({ known: false });
+  });
+
+  it("a grant does not disturb a fix that arrives after it", async () => {
+    // The clear sits on the side of the write where the grant is off — before
+    // a grant, after a revoke — so an honest post landing once the permission
+    // is live is not swept up by the toggle that enabled it.
+    const cookie = await session(OWNER);
+    const { deviceId, token } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    expect(await fixCount(deviceId)).toBe(1);
+    expect(await locateAs(token)).toMatchObject({ known: true, provider: "phone" });
+  });
+
   it("does not clear the fix when a different scope is revoked", async () => {
     const cookie = await session(OWNER);
     const { deviceId } = await pairDevice(cookie);

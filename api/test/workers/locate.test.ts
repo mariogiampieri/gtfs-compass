@@ -13,7 +13,12 @@ import {
 import { budgetDay } from "../../src/email";
 import { haversineM, resolveFromWifi, resolveLocation } from "../../src/locate";
 import { getFix } from "../../src/relay";
-import { RELAY_IP_SCOPE, RELAY_SESSION_SCOPE } from "../../src/routes/locate";
+import {
+  RELAY_IP_FRESH_SCOPE,
+  RELAY_IP_REPEAT_SCOPE,
+  RELAY_REFUSED_SCOPE,
+  RELAY_USER_SCOPE,
+} from "../../src/routes/locate";
 import { resetSchema } from "./schema";
 
 const BEACON_URL = "https://api.beacondb.net/v1/geolocate";
@@ -664,6 +669,19 @@ describe("the phone provider", () => {
     expect(await res.json()).toMatchObject({ known: true, provider: "beacondb" });
   });
 
+  it("a negative accuracy fails the gate rather than reading as metre-perfect", async () => {
+    // `accuracy` is client-supplied on the relay path, and the gate is a single
+    // upper bound: `-1 <= 500` passed, so an impossible reading outranked every
+    // honest one.
+    const { deviceId, token } = await seedDevice();
+    await seedFix(deviceId, { ageS: 10, accuracyM: -1 });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(await res.json()).toMatchObject({ known: true, provider: "beacondb" });
+  });
+
   it("the gate value comes from the same env var as every other provider", async () => {
     const { deviceId, credential } = await seedDevice();
     await seedFix(deviceId, { ageS: 10, accuracyM: 900 });
@@ -848,8 +866,25 @@ describe("the phone provider", () => {
     beaconOk(40.6931, -73.9871, 42);
     const res = await post("/v1/nearby", { wifiAccessPoints: uniqueAps() });
     expect(res.status).toBe(200);
-    const body = await res.json<{ location: unknown }>();
-    expect(body.location).toEqual({ lat: 40.6931, lon: -73.9871, accuracy: 42 });
+
+    // Bytes, like the /v1/locate cases above, and for the same reason: a
+    // parsed-object comparison cannot see key order, and key order is the wire
+    // contract for a board that is already flashed. `location` is asserted as a
+    // literal substring rather than the whole body because the rest of the
+    // payload is feed data that legitimately varies.
+    expect(await res.text()).toContain('"location":{"lat":40.6931,"lon":-73.9871,"accuracy":42}');
+  });
+
+  it("/v1/nearby is byte-identical for a granted board with no fix posted", async () => {
+    const { token } = await seedDevice(); // holds read:fix; no phone has posted
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await post("/v1/nearby", { wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(res.status).toBe(200);
+    // The nearby mirror of the /v1/locate granted-but-no-fix case: consulting
+    // the relay and finding nothing must leave the wire exactly as it was.
+    expect(await res.text()).toContain('"location":{"lat":40.6931,"lon":-73.9871,"accuracy":42}');
   });
 });
 
@@ -896,6 +931,21 @@ function postLocate(body: unknown, opts: AuthOpts = {}) {
     headers: authHeaders(opts),
     body: JSON.stringify(body),
   });
+}
+
+function postNearby(body: unknown, opts: AuthOpts = {}) {
+  return SELF.fetch(`${ORIGIN}/v1/nearby`, {
+    method: "POST",
+    headers: authHeaders(opts),
+    body: JSON.stringify(body),
+  });
+}
+
+/** Push a session past its half-life, so the next read slides it in D1. */
+async function ageSession(cookie: string): Promise<void> {
+  await env.DB.prepare("UPDATE sessions SET expires_at = ?1 WHERE token_hash = ?2")
+    .bind(nowSec() + 60, await hashToken(cookie))
+    .run();
 }
 
 async function signIn(userId: string): Promise<{ token: string; sessionId: string }> {
@@ -951,7 +1001,7 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
     // No unpaired estimate exists anywhere — the pairing lookup is short
     // circuited, so this is a 200 rather than the diagnostic path's 404.
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ relayed: { devices: 1 } });
+    expect(await res.json()).toEqual({ relayed: { devices: 1, stored: 1 } });
 
     const mine = await getFix(env as unknown as Env, granted.deviceId);
     expect(mine).toMatchObject({
@@ -980,7 +1030,7 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ relayed: { devices: 1 } });
+    expect(await res.json()).toEqual({ relayed: { devices: 1, stored: 1 } });
     expect(await getFix(env as unknown as Env, mine.deviceId)).not.toBeNull();
     expect(await getFix(env as unknown as Env, theirs.deviceId)).toBeNull();
   });
@@ -1036,47 +1086,113 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("posts above the budgeted cadence are refused, per session and per network", async () => {
-    const { token: cookie, sessionId } = await signIn("usr_budget");
+  it("the enforcing bound is the account: a second session does not buy a second allowance", async () => {
+    const first = await signIn("usr_budget");
     const board = await seedDevice({ userId: "usr_budget" });
-    await spendBudget(RELAY_SESSION_SCOPE, sessionId, 1500);
+    await spendBudget(RELAY_USER_SCOPE, "usr_budget", 1500);
 
-    const refused = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie });
+    const refused = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie: first.token });
     expect(refused.status).toBe(429);
-    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
 
-    // A second session for the same user is not refused by the first one's
-    // counter, and its post charges the network key too.
+    // Every magic-link redeem mints a fresh `sessions` row, and an address may
+    // ask for five links a day: keyed on the session, one mailbox held five
+    // full allowances by tomorrow and the account's cadence was unenforced past
+    // day one.
     const second = await signIn("usr_budget");
-    const ip = "198.19.7.9";
-    const allowed = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie: second.token, ip });
-    expect(allowed.status).toBe(200);
-
-    await spendBudget(RELAY_IP_SCOPE, "198.19.7.0/24", 6000);
-    const netRefused = await postRef(
-      { relay: true, lat: 40.71, lon: -74.01 },
-      { cookie: second.token, ip: "198.19.7.55" },
+    const stillRefused = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0 },
+      { cookie: second.token },
     );
-    expect(netRefused.status).toBe(429);
-    // The refused post left the earlier fix in place rather than overwriting it.
-    expect(await getFix(env as unknown as Env, board.deviceId)).toMatchObject({ lat: 40.7 });
+    expect(stillRefused.status).toBe(429);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
   });
 
-  it("a spent session budget writes no per-network counter row", async () => {
+  it("one account cannot spend the shared network budget out from under its neighbours", async () => {
+    const heavy = await signIn("usr_heavy");
+    const neighbour = await signIn("usr_neighbour");
+    await seedDevice({ userId: "usr_heavy" });
+    const theirBoard = await seedDevice({ userId: "usr_neighbour" });
+
+    // Past its own fresh allowance for the day, so this account's posts draw on
+    // the repeat slice — and that slice is spent.
+    await spendBudget(RELAY_USER_SCOPE, "usr_heavy", 60);
+    await spendBudget(RELAY_IP_REPEAT_SCOPE, "198.19.9.0/24", 1200);
+
+    const refused = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0 },
+      { cookie: heavy.token, ip: "198.19.9.42" },
+    );
+    expect(refused.status).toBe(429);
+
+    // The neighbour behind the same /24 — a carrier CGNAT block holds hundreds
+    // of subscribers — is untouched: their first posts of the day land in a
+    // slice nothing the heavy account does can reach.
+    const allowed = await postRef(
+      { relay: true, lat: 40.71, lon: -74.01 },
+      { cookie: neighbour.token, ip: "198.19.9.99" },
+    );
+    expect(allowed.status).toBe(200);
+    expect(await getFix(env as unknown as Env, theirBoard.deviceId)).not.toBeNull();
+  });
+
+  it("records a durable refusal when a spent network slice turns a post away", async () => {
+    const { token: cookie } = await signIn("usr_slice");
+    await seedDevice({ userId: "usr_slice" });
+    await spendBudget(RELAY_IP_FRESH_SCOPE, "198.19.11.0/24", 4800);
+
+    const res = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0 },
+      { cookie, ip: "198.19.11.5" },
+    );
+
+    expect(res.status).toBe(429);
+    // The shared key means this refusal can be somebody else's fault entirely,
+    // and it is invisible in the response — so it lands on a counter.
+    const row = await env.DB.prepare(
+      "SELECT COALESCE(SUM(count), 0) AS n FROM auth_budgets WHERE scope = ?1 AND key = ?2",
+    )
+      .bind(RELAY_REFUSED_SCOPE, "fresh")
+      .first<{ n: number }>();
+    expect(row?.n).toBe(1);
+  });
+
+  it("a spent account budget writes no per-network counter row", async () => {
     // The ordering `chargeSendBudget` established: every read before any write,
     // and the caller-chosen key is never charged ahead of the bound above it.
-    const { token: cookie, sessionId } = await signIn("usr_order");
-    await spendBudget(RELAY_SESSION_SCOPE, sessionId, 1500);
+    const { token: cookie } = await signIn("usr_order");
+    await spendBudget(RELAY_USER_SCOPE, "usr_order", 1500);
 
     const res = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie, ip: "198.20.4.4" });
 
     expect(res.status).toBe(429);
     const row = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM auth_budgets WHERE scope = ?1 AND key = ?2",
+      "SELECT COUNT(*) AS n FROM auth_budgets WHERE scope IN (?1, ?2) AND key = ?3",
     )
-      .bind(RELAY_IP_SCOPE, await hashToken("198.20.4.0/24"))
+      .bind(RELAY_IP_FRESH_SCOPE, RELAY_IP_REPEAT_SCOPE, await hashToken("198.20.4.0/24"))
       .first<{ n: number }>();
     expect(row?.n).toBe(0);
+  });
+
+  it("reports how many boards stored the fix, not only how many were targeted", async () => {
+    const { token: cookie } = await signIn("usr_refine");
+    const board = await seedDevice({ userId: "usr_refine" });
+    // The board already holds a metre-accurate fix from inside the horizon.
+    const held = await seedFix(board.deviceId, { ageS: 20, accuracyM: 8 });
+
+    const res = await postRef(
+      { relay: true, lat: 40.9, lon: -74.9, accuracy: 60 },
+      { cookie },
+    );
+
+    // Targeted, and deliberately not written: the refinement keeps the better
+    // position. Reporting only `devices` let the UI say "each keeps this
+    // position until a newer one arrives" about a board showing the older one.
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ relayed: { devices: 1, stored: 0 } });
+    expect(await getFix(env as unknown as Env, board.deviceId)).toMatchObject({
+      lat: held.lat,
+      accuracyM: 8,
+    });
   });
 
   it("relay and log are independent", async () => {
@@ -1091,7 +1207,7 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
 
     expect(both.status).toBe(200);
     const body = await both.json<{ id: number; delta_m: number; relayed: { devices: number } }>();
-    expect(body.relayed).toEqual({ devices: 1 });
+    expect(body.relayed).toEqual({ devices: 1, stored: 1 });
     expect(body.delta_m).toBeGreaterThan(110);
     expect(await getFix(env as unknown as Env, board.deviceId)).toMatchObject({ lat: 40.001 });
 
@@ -1110,7 +1226,7 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
     await seedEstimate("walk-3", { userId: "usr_both" });
     const relayOnly = await postRef({ relay: true, lat: 40.5, lon: -73.5 }, { cookie });
     expect(relayOnly.status).toBe(200);
-    expect(await relayOnly.json()).toEqual({ relayed: { devices: 1 } });
+    expect(await relayOnly.json()).toEqual({ relayed: { devices: 1, stored: 1 } });
     const untouched = await env.DB.prepare(
       "SELECT ref_lat FROM locate_log WHERE device_id = 'walk-3'",
     ).first<{ ref_lat: number | null }>();
@@ -1127,7 +1243,7 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ relayed: { devices: 1 } });
+    expect(await res.json()).toEqual({ relayed: { devices: 1, stored: 1 } });
     expect(await getFix(env as unknown as Env, board.deviceId)).not.toBeNull();
   });
 
@@ -1172,15 +1288,167 @@ describe("POST /v1/locate/ref — relay: true (R11)", () => {
   });
 
   it("neither flag → 400, and the budget is untouched", async () => {
-    const { token: cookie, sessionId } = await signIn("usr_noop");
+    const { token: cookie } = await signIn("usr_noop");
     const res = await postRef({ relay: false, log: false, lat: 40.7, lon: -74.0 }, { cookie });
     expect(res.status).toBe(400);
     const spent = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM auth_budgets WHERE scope = ?1 AND key = ?2",
     )
-      .bind(RELAY_SESSION_SCOPE, await hashToken(sessionId))
+      .bind(RELAY_USER_SCOPE, await hashToken("usr_noop"))
       .first<{ n: number }>();
     expect(spent?.n).toBe(0);
+  });
+});
+
+describe("a phone-sourced answer is never a diagnostic estimate", () => {
+  /**
+   * The composition that made this a leak: `log:true` takes any session or
+   * board token now, and the chain answers from the relay before WiFi. Without
+   * the suppression a board holding `read:fix` copied its owner's
+   * metre-accurate GPS position into `locate_log`, where revoking the grant
+   * does not delete it, unpairing does not delete it, and the 14-day precise
+   * sweep is the only reaper — a durable movement trail behind the one row the
+   * config UI promises is deleted when the permission goes off.
+   */
+  it("a board with read:fix cannot copy its owner's position into locate_log", async () => {
+    const { deviceId, token } = await seedDevice();
+    const posted = await seedFix(deviceId, { ageS: 10, accuracyM: 8 });
+
+    const res = await postLocate(
+      { wifiAccessPoints: [], device_id: "board-trail", log: true },
+      { token },
+    );
+
+    // The board still gets its answer — this is not a refusal, it is a refusal
+    // to *persist*.
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      known: true,
+      provider: "phone",
+      lat: posted.lat,
+      lon: posted.lon,
+    });
+    expect(await logRows("board-trail")).toHaveLength(0);
+    const anywhere = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM locate_log WHERE provider = 'phone' OR est_lat = ?1",
+    )
+      .bind(posted.lat)
+      .first<{ n: number }>();
+    expect(anywhere?.n).toBe(0);
+  });
+
+  it("the same board still logs a WiFi estimate, which is what the corpus is for", async () => {
+    const { deviceId, token } = await seedDevice();
+    await seedFix(deviceId, { ageS: 10, accuracyM: 8 });
+    // Grant gone: the chain falls through to WiFi, and that answer *is* an
+    // estimate a phone reference can later be paired against.
+    await env.DB.prepare("UPDATE devices SET scopes = 'read:departures' WHERE id = ?1")
+      .bind(deviceId)
+      .run();
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: "board-estimate", log: true },
+      { token },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await logRows("board-estimate"))[0]).toMatchObject({
+      provider: "beacondb",
+      est_lat: 40.6931,
+    });
+  });
+});
+
+describe("client-supplied text is bounded at ingress", () => {
+  it("refuses an oversized device_id or label rather than storing it", async () => {
+    beaconOk(40.6931, -73.9871, 42);
+    const longId = "d".repeat(65);
+    const tooLongId = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: longId, log: true },
+      { token: TOKEN },
+    );
+    expect(tooLongId.status).toBe(400);
+    expect((await tooLongId.json<{ error: string }>()).error).toMatch(/device_id/);
+    expect(await logRows(longId)).toHaveLength(0);
+
+    // `DAILY_LOG_CAP` bounds how many rows a caller writes, never how big one
+    // is: 500 rows of megabyte labels is the same database that serves feeds,
+    // stops and auth.
+    const tooLongLabel = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: "dev-label", log: true, label: "x".repeat(129) },
+      { token: TOKEN },
+    );
+    expect(tooLongLabel.status).toBe(400);
+    expect((await tooLongLabel.json<{ error: string }>()).error).toMatch(/label/);
+    expect(await logRows("dev-label")).toHaveLength(0);
+  });
+
+  it("accepts the boundary values, so the cap is a cap and not a paper cut", async () => {
+    beaconOk(40.6931, -73.9871, 42);
+    const id = "d".repeat(64);
+    const res = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: id, log: true, label: "y".repeat(128) },
+      { token: TOKEN },
+    );
+    expect(res.status).toBe(200);
+    expect(await logRows(id)).toHaveLength(1);
+  });
+
+  it("bounds the same two fields on the reference ingress, before anything is relayed", async () => {
+    const { token: cookie } = await signIn("usr_bounds");
+    const board = await seedDevice({ userId: "usr_bounds" });
+
+    const res = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0, label: "z".repeat(129) },
+      { cookie },
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: string }>()).error).toMatch(/label/);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+
+    const longId = await postRef(
+      { relay: true, log: true, lat: 40.7, lon: -74.0, device_id: "d".repeat(65) },
+      { cookie },
+    );
+    expect(longId.status).toBe(400);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+  });
+});
+
+describe("the two responses that now carry a live position", () => {
+  it("are marked no-store, like every other credentialed route", async () => {
+    beaconOk(40.6931, -73.9871, 42);
+    const located = await postLocate({ wifiAccessPoints: uniqueAps() });
+    expect(located.headers.get("Cache-Control")).toBe("no-store");
+    expect(located.headers.get("Content-Type")).toBe("application/json");
+    expect(located.headers.get("X-Content-Type-Options")).toBe("nosniff");
+
+    beaconOk(40.6931, -73.9871, 42);
+    const nearby = await postNearby({ wifiAccessPoints: uniqueAps() });
+    expect(nearby.status).toBe(200);
+    expect(nearby.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("re-issue the slid session cookie rather than moving D1 alone", async () => {
+    const { token: cookie } = await signIn("usr_slide");
+    await ageSession(cookie);
+    beaconOk(40.6931, -73.9871, 42);
+
+    // Neither route goes through `authorize()` — they are anonymous-capable —
+    // so without re-issuing the cookie here the window slides in D1 while the
+    // browser keeps the `Max-Age` it was minted with.
+    const located = await postLocate({ wifiAccessPoints: uniqueAps() }, { cookie });
+    expect(located.status).toBe(200);
+    expect(located.headers.get("Set-Cookie")).toContain(`${SESSION_COOKIE}=${cookie}`);
+
+    const second = await signIn("usr_slide2");
+    await ageSession(second.token);
+    beaconOk(40.6931, -73.9871, 42);
+    const nearby = await postNearby({ wifiAccessPoints: uniqueAps() }, { cookie: second.token });
+    expect(nearby.status).toBe(200);
+    expect(nearby.headers.get("Set-Cookie")).toContain(`${SESSION_COOKIE}=${second.token}`);
   });
 });
 

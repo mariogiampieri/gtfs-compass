@@ -114,20 +114,25 @@ declare global {
     PAIR_CLAIM_BUDGET_REPEAT?: string;
     /**
      * Phone-position relay posts (`POST /v1/locate/ref` with `relay: true`)
-     * one session may make per UTC day (R11, default 1500 — a full day at the
-     * client's once-a-minute cadence, with headroom). This is the relay's
+     * one **account** may make per UTC day (R11, default 1500 — a full day at
+     * the client's once-a-minute cadence, with headroom). This is the relay's
      * enforcing bound: it is the phase's highest-frequency write and fans out
-     * to one row per granted device. `0` switches the relay off outright — a
-     * kill switch, not a fall back to the default.
+     * to one row per granted device. Keyed on the user rather than the session
+     * because sessions are not scarce — one mailbox can mint several a day,
+     * each with its own allowance. `0` switches the relay off outright — a kill
+     * switch, not a fall back to the default.
      */
-    RELAY_BUDGET_SESSION?: string;
+    RELAY_BUDGET_USER?: string;
     /**
-     * The same posts counted per client network (/24 or /64, default 6000).
-     * Deliberately loose next to the per-session cap, because everyone behind
-     * one CGNAT /24 shares this key; it bounds a single network's share of D1
-     * rather than any one user's cadence. `0` disables the relay.
+     * The same posts counted per client network (/24 or /64), split into two
+     * slices (defaults 4800 and 1200, still the 6000/day total). Everyone
+     * behind one CGNAT /24 shares this key, so a single counter over it is a
+     * denial lever: an account's first posts of the day draw on FRESH, and
+     * everything past its daily allowance draws on REPEAT and cannot exhaust
+     * FRESH. `0` on either refuses that class.
      */
-    RELAY_BUDGET_IP?: string;
+    RELAY_BUDGET_IP_FRESH?: string;
+    RELAY_BUDGET_IP_REPEAT?: string;
     /**
      * Retention tier one (R20): days after which `locate_log` raw coordinates
      * are nulled and `device_fixes` rows are deleted (default 14). The derived

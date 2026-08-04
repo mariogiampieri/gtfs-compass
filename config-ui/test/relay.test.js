@@ -5,6 +5,7 @@ import {
   MAX_TIMESTAMP_DRIFT_S,
   MIN_POST_INTERVAL_MS,
   RELAY_FAILED_MESSAGE,
+  RELAY_KEPT_BETTER_MESSAGE,
   RELAY_NO_DEVICES_MESSAGE,
   RELAY_OFFLINE_MESSAGE,
   RELAY_PATH,
@@ -96,6 +97,29 @@ describe("postFix", () => {
     expect(JSON.parse(init.body).relay).toBe(true);
     expect(result).toMatchObject({ state: "sent", devices: 2 });
     expect(result.message).toContain("2 devices");
+  });
+
+  it("says what the boards did with the fix, not only that it was sent", async () => {
+    // The server reports two numbers because they differ: a board holding a
+    // strictly more accurate position from inside the horizon keeps it, which
+    // is the case the refinement exists for and the case "each keeps this
+    // position until a newer one arrives" is false about.
+    const suppressed = vi.fn().mockResolvedValue(json({ relayed: { devices: 2, stored: 0 } }));
+    const kept = await postFix(position(), suppressed);
+    expect(kept).toMatchObject({ state: "sent", devices: 2, stored: 0 });
+    expect(kept.message).toBe(RELAY_KEPT_BETTER_MESSAGE);
+    expect(kept.message).not.toContain("until a newer one arrives");
+
+    const partial = vi.fn().mockResolvedValue(json({ relayed: { devices: 3, stored: 1 } }));
+    const some = await postFix(position(), partial);
+    expect(some.message).toContain("1 took it");
+    expect(some.message).toContain("more accurate position");
+
+    // And the ordinary case is unchanged.
+    expect(relayedMessage(2, 2)).toContain("until a newer one arrives");
+    // A server that does not report the distinction is read as a plain
+    // delivery, never as a suppression.
+    expect(relayedMessage(2)).toBe(relayedMessage(2, 2));
   });
 
   it("says so when the fix went nowhere, rather than reporting a bare success", async () => {

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { formatScopes, type Scope } from "../../src/auth";
 import {
   FIX_HORIZON_S,
+  FIX_LAST_KNOWN_MAX_AGE_S,
   QUALITY_CURRENT,
   QUALITY_LAST_KNOWN,
   clearFix,
@@ -290,6 +291,48 @@ describe("latest-wins", () => {
     });
   });
 
+  it("still protects the accurate fix at exactly the horizon", async () => {
+    // The write side's "is the stored fix still a position" test and the read
+    // side's `current` label are one rule with two spellings; at exactly 120 s
+    // the read layer served this row as a usable position while the write layer
+    // treated it as expendable.
+    await seedGranted("dev_kitchen");
+    const now = nowSec();
+    await putFixForUser(e(), OWNER, { ...PRECISE, capturedAt: now }, now);
+    const atHorizon = now + FIX_HORIZON_S;
+
+    const result = await putFixForUser(e(), OWNER, { ...COARSE, capturedAt: atHorizon }, atHorizon);
+
+    expect(result).toEqual({ targeted: 1, written: 0 });
+    expect(await getFix(e(), "dev_kitchen", atHorizon)).toMatchObject({
+      accuracyM: 8,
+      quality: QUALITY_CURRENT,
+    });
+  });
+
+  it("refuses a fix captured before the stored one — latest capture, not latest write", async () => {
+    // A retried or reordered post. The accuracy refinement covers only the
+    // accuracy dimension, so an equally accurate but *older* capture used to
+    // overwrite unconditionally and walk `captured_at` backwards, after which
+    // `getFix` relabelled the older position `current`.
+    await seedGranted("dev_kitchen");
+    const now = nowSec();
+    await putFixForUser(e(), OWNER, { ...PRECISE, capturedAt: now }, now);
+
+    const result = await putFixForUser(
+      e(),
+      OWNER,
+      { lat: 40.6, lon: -73.9, accuracyM: PRECISE.accuracyM, capturedAt: now - 90 },
+      now + 1,
+    );
+
+    expect(result).toEqual({ targeted: 1, written: 0 });
+    expect(await getFix(e(), "dev_kitchen", now + 1)).toMatchObject({
+      lat: PRECISE.lat,
+      capturedAt: now,
+    });
+  });
+
   it("lets an equally accurate reading through — the guard is strict", async () => {
     await seedGranted("dev_kitchen");
     const now = nowSec();
@@ -374,6 +417,36 @@ describe("freshness", () => {
       quality: QUALITY_CURRENT,
     });
     expect(await getFix(e(), "dev_kitchen", now + FIX_HORIZON_S + 1)).toMatchObject({
+      quality: QUALITY_LAST_KNOWN,
+    });
+  });
+
+  it("stops serving a last-known fix past the age ceiling", async () => {
+    // Nothing consumes `quality` — it is an optional appended field (AE9) and
+    // the firmware reads lat/lon/accuracy only — so past the ceiling absence is
+    // the only honest answer the chain can act on.
+    await seedGranted("dev_kitchen");
+    const now = nowSec();
+    await putFixForUser(e(), OWNER, { ...PRECISE, capturedAt: now }, now);
+
+    expect(await getFix(e(), "dev_kitchen", now + FIX_LAST_KNOWN_MAX_AGE_S)).toMatchObject({
+      quality: QUALITY_LAST_KNOWN,
+    });
+    expect(await getFix(e(), "dev_kitchen", now + FIX_LAST_KNOWN_MAX_AGE_S + 1)).toBeNull();
+  });
+
+  it("measures the horizon from receipt, so a fast phone clock cannot widen it", async () => {
+    // Ingress tolerates 60 s of forward skew (`MAX_FIX_SKEW_S`); inheriting it
+    // here would make `current` mean 180 real seconds — ~150 m at walking pace,
+    // the difference between two subway entrances.
+    await seedGranted("dev_kitchen");
+    const now = nowSec();
+
+    await putFixForUser(e(), OWNER, { ...PRECISE, capturedAt: now + 60 }, now);
+
+    expect(await getFix(e(), "dev_kitchen", now + FIX_HORIZON_S + 1)).toMatchObject({
+      capturedAt: now,
+      ageS: FIX_HORIZON_S + 1,
       quality: QUALITY_LAST_KNOWN,
     });
   });

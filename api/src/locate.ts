@@ -222,12 +222,18 @@ export function maxAccuracyM(env: Env): number {
  * show it is inside the gate is not shown to be inside the gate. It falls
  * through to the next provider like any other rejection, so the cost of failing
  * closed is a WiFi lookup, not a `{known: false}`.
+ *
+ * The bound is two-sided. A radius below zero is not a very good reading, it is
+ * an impossible one, and `accuracy` is client-supplied on the relay path — an
+ * upper bound alone let `-1` pass as better than metre-perfect and outrank every
+ * honest provider below it.
  */
 export function withinAccuracyGate(
   accuracy: number | null | undefined,
   env: Env,
 ): accuracy is number {
   if (typeof accuracy !== "number" || !Number.isFinite(accuracy)) return false;
+  if (accuracy < 0) return false;
   return accuracy <= maxAccuracyM(env);
 }
 

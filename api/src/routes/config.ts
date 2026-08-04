@@ -31,11 +31,14 @@
  *     not see is a different bug from a read that hides it, and is the one that
  *     would not show up in a list.
  *
- *  3. **Revoking `read:fix` clears the fix already delivered** (R9). Unpair and
- *     an explicit toggle-off do exactly the same two writes in the same order —
- *     revoke the grant, then `clearFix()` — because "revocation is immediate on
- *     both sides, not merely prospective" is a property of the *grant*, not of
- *     the unpair button. Ordering and the seam are argued in `../relay`.
+ *  3. **Moving `read:fix` in either direction clears the fix already
+ *     delivered** (R9). Unpair and an explicit toggle-off do exactly the same
+ *     two writes in the same order — revoke the grant, then `clearFix()` —
+ *     because "revocation is immediate on both sides, not merely prospective"
+ *     is a property of the *grant*, not of the unpair button. A grant clears
+ *     too, before its write, so that turning the permission back on can never
+ *     hand a board a position captured while it was off. Ordering and the seam
+ *     are argued in `../relay` and on `handleScope`.
  *
  * Device-supplied text (`name`, `fw_version`) is returned as stored: sanitized
  * of control characters and length-capped at rest by `pair.ts`, tagged
@@ -263,6 +266,23 @@ async function handleScope(request: Request, env: Env, deviceId: string): Promis
 
   const row = await readDevice(env, auth, deviceId);
   if (!row) return withSession(auth, noSuchDevice());
+
+  // **Both edges of the `read:fix` toggle clear the stored position, and the
+  // clear always runs on the side of the write where the grant is off** —
+  // before a grant, after a revoke — so no fan-out can land in the window and
+  // leave a row behind.
+  //
+  // Granting clears because the fan-out's recipient SELECT and its batched
+  // upsert are separate round trips (see `../relay`): a post that read this
+  // board as a recipient, then lost the race to a revocation, re-creates the
+  // row after `clearFix` deleted it. The read gate stops that row being served
+  // while the grant is off — and would hand it straight to the board the moment
+  // the owner turned the permission back on. A position captured while the user
+  // believed the relay was off is never served, so re-enabling starts empty and
+  // waits for the next post.
+  if (granted && scope === FIX_SCOPE) {
+    await clearFix(env, deviceId);
+  }
 
   const current = new Set(parseScopes(row.scopes));
   if (granted) current.add(scope);
