@@ -1,8 +1,19 @@
 import { SELF, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { type Credential, DEVICE_TOKEN_PREFIX, hashToken, parseScopes } from "../../src/auth";
+import {
+  CSRF_HEADER,
+  DEVICE_TOKEN_PREFIX,
+  SESSION_COOKIE,
+  hashToken,
+  mintSession,
+  parseScopes,
+  type Credential,
+} from "../../src/auth";
+import { budgetDay } from "../../src/email";
 import { haversineM, resolveFromWifi, resolveLocation } from "../../src/locate";
+import { getFix } from "../../src/relay";
+import { RELAY_IP_SCOPE, RELAY_SESSION_SCOPE } from "../../src/routes/locate";
 import { resetSchema } from "./schema";
 
 const BEACON_URL = "https://api.beacondb.net/v1/geolocate";
@@ -839,5 +850,515 @@ describe("the phone provider", () => {
     expect(res.status).toBe(200);
     const body = await res.json<{ location: unknown }>();
     expect(body.location).toEqual({ lat: 40.6931, lon: -73.9871, accuracy: 42 });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The relay write path and locate_log attribution (U14; R11, R17, R21)        */
+/* -------------------------------------------------------------------------- */
+
+const ORIGIN = "https://api.example";
+
+interface AuthOpts {
+  /** Session token for the `__Host-` cookie. */
+  cookie?: string;
+  /** `null` omits the CSRF header — the 403 case. */
+  csrf?: string | null;
+  /** `null` omits `Origin`, which `checkAmbientCsrf` also refuses. */
+  origin?: string | null;
+  token?: string;
+  ip?: string;
+}
+
+function authHeaders(opts: AuthOpts): Record<string, string> {
+  const headers: Record<string, string> = {
+    "CF-Connecting-IP": opts.ip ?? freshIp(),
+    "Content-Type": "application/json",
+  };
+  if (opts.cookie) headers.Cookie = `${SESSION_COOKIE}=${opts.cookie}`;
+  if (opts.csrf !== null) headers[CSRF_HEADER] = opts.csrf ?? "1";
+  if (opts.origin !== null) headers.Origin = opts.origin ?? ORIGIN;
+  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  return headers;
+}
+
+function postRef(body: unknown, opts: AuthOpts = {}) {
+  return SELF.fetch(`${ORIGIN}/v1/locate/ref`, {
+    method: "POST",
+    headers: authHeaders(opts),
+    body: JSON.stringify(body),
+  });
+}
+
+function postLocate(body: unknown, opts: AuthOpts = {}) {
+  return SELF.fetch(`${ORIGIN}/v1/locate`, {
+    method: "POST",
+    headers: authHeaders(opts),
+    body: JSON.stringify(body),
+  });
+}
+
+async function signIn(userId: string): Promise<{ token: string; sessionId: string }> {
+  await seedUser(userId);
+  const minted = await mintSession(env as unknown as Env, userId);
+  return { token: minted.token, sessionId: minted.sessionId };
+}
+
+/**
+ * Spend a sharded daily counter outright: the counter is a SUM across shards,
+ * so one row carrying the whole cap exhausts it. `ON CONFLICT` rather than a
+ * bare insert because a real charge may already have landed on this shard —
+ * `incrementBudget` picks one at random, and a 1-in-8 primary-key collision is
+ * a flaky test rather than an interesting one.
+ */
+async function spendBudget(scope: string, key: string, count: number): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO auth_budgets (scope, key, day, shard, count) VALUES (?1, ?2, ?3, 0, ?4)
+     ON CONFLICT (scope, key, day, shard) DO UPDATE SET count = count + excluded.count`,
+  )
+    .bind(scope, await hashToken(key), budgetDay(), count)
+    .run();
+}
+
+/** The estimate a diagnostic walk leaves behind, ready for a reference to pair. */
+async function seedEstimate(
+  deviceId: string,
+  extra: { userId?: string | null; deviceRowId?: string | null } = {},
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO locate_log (user_id, device_id, device_row_id, ts, est_lat, est_lon, provider)
+     VALUES (?1, ?2, ?3, ?4, 40.0, -73.95, 'beacondb')`,
+  )
+    .bind(extra.userId ?? null, deviceId, extra.deviceRowId ?? null, nowSec())
+    .run();
+}
+
+describe("POST /v1/locate/ref — relay: true (R11)", () => {
+  it("fans the fix out to the granting devices and 200s with no estimate to pair", async () => {
+    const { token: cookie } = await signIn("usr_relay");
+    const granted = await seedDevice({ userId: "usr_relay" });
+    const ungranted = await seedDevice({
+      userId: "usr_relay",
+      scopes: "read:departures,read:config",
+    });
+    const capturedAt = nowSec() - 5;
+
+    const res = await postRef(
+      { relay: true, lat: 40.7052, lon: -74.0136, accuracy: 11, captured_at: capturedAt },
+      { cookie },
+    );
+
+    // No unpaired estimate exists anywhere — the pairing lookup is short
+    // circuited, so this is a 200 rather than the diagnostic path's 404.
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ relayed: { devices: 1 } });
+
+    const mine = await getFix(env as unknown as Env, granted.deviceId);
+    expect(mine).toMatchObject({
+      lat: 40.7052,
+      lon: -74.0136,
+      accuracyM: 11,
+      capturedAt,
+      quality: "current",
+    });
+    // The grant is the fan-out control (R9/R11): a board of the same account
+    // without it is not a recipient.
+    expect(await getFix(env as unknown as Env, ungranted.deviceId)).toBeNull();
+  });
+
+  it("writes nothing for another user's devices", async () => {
+    const { token: cookie } = await signIn("usr_poster");
+    const mine = await seedDevice({ userId: "usr_poster" });
+    const theirs = await seedDevice({ userId: "usr_stranger" });
+
+    // The request names no device (R11) — there is no parameter to point at
+    // somebody else's board, so the only thing to assert is that the seam's
+    // user argument is the one the credential produced.
+    const res = await postRef(
+      { relay: true, lat: 40.7052, lon: -74.0136, accuracy: 9, device_id: theirs.deviceId },
+      { cookie },
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ relayed: { devices: 1 } });
+    expect(await getFix(env as unknown as Env, mine.deviceId)).not.toBeNull();
+    expect(await getFix(env as unknown as Env, theirs.deviceId)).toBeNull();
+  });
+
+  it("without the CSRF header → 403 and nothing written", async () => {
+    const { token: cookie } = await signIn("usr_csrf");
+    const board = await seedDevice({ userId: "usr_csrf" });
+
+    const missingHeader = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0 },
+      { cookie, csrf: null },
+    );
+    expect(missingHeader.status).toBe(403);
+
+    const missingOrigin = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0 },
+      { cookie, origin: null },
+    );
+    expect(missingOrigin.status).toBe(403);
+
+    const crossOrigin = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0 },
+      { cookie, origin: "https://evil.example" },
+    );
+    expect(crossOrigin.status).toBe(403);
+
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+  });
+
+  it("DIAG_TOKEN and no session → 401 (the operator secret names no user)", async () => {
+    await seedUser("usr_diag");
+    const board = await seedDevice({ userId: "usr_diag" });
+
+    const res = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { token: TOKEN });
+
+    expect(res.status).toBe(401);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+  });
+
+  it("a device token → 403: a board is not an account", async () => {
+    const board = await seedDevice({ userId: "usr_board" });
+
+    // `authorize()` refuses device credentials on any route naming no scope,
+    // so this is the chokepoint's denial, not a guard written here.
+    const res = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { token: board.token });
+
+    expect(res.status).toBe(403);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+  });
+
+  it("anonymous → 401", async () => {
+    const res = await postRef({ relay: true, lat: 40.7, lon: -74.0 });
+    expect(res.status).toBe(401);
+  });
+
+  it("posts above the budgeted cadence are refused, per session and per network", async () => {
+    const { token: cookie, sessionId } = await signIn("usr_budget");
+    const board = await seedDevice({ userId: "usr_budget" });
+    await spendBudget(RELAY_SESSION_SCOPE, sessionId, 1500);
+
+    const refused = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie });
+    expect(refused.status).toBe(429);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+
+    // A second session for the same user is not refused by the first one's
+    // counter, and its post charges the network key too.
+    const second = await signIn("usr_budget");
+    const ip = "198.19.7.9";
+    const allowed = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie: second.token, ip });
+    expect(allowed.status).toBe(200);
+
+    await spendBudget(RELAY_IP_SCOPE, "198.19.7.0/24", 6000);
+    const netRefused = await postRef(
+      { relay: true, lat: 40.71, lon: -74.01 },
+      { cookie: second.token, ip: "198.19.7.55" },
+    );
+    expect(netRefused.status).toBe(429);
+    // The refused post left the earlier fix in place rather than overwriting it.
+    expect(await getFix(env as unknown as Env, board.deviceId)).toMatchObject({ lat: 40.7 });
+  });
+
+  it("a spent session budget writes no per-network counter row", async () => {
+    // The ordering `chargeSendBudget` established: every read before any write,
+    // and the caller-chosen key is never charged ahead of the bound above it.
+    const { token: cookie, sessionId } = await signIn("usr_order");
+    await spendBudget(RELAY_SESSION_SCOPE, sessionId, 1500);
+
+    const res = await postRef({ relay: true, lat: 40.7, lon: -74.0 }, { cookie, ip: "198.20.4.4" });
+
+    expect(res.status).toBe(429);
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM auth_budgets WHERE scope = ?1 AND key = ?2",
+    )
+      .bind(RELAY_IP_SCOPE, await hashToken("198.20.4.0/24"))
+      .first<{ n: number }>();
+    expect(row?.n).toBe(0);
+  });
+
+  it("relay and log are independent", async () => {
+    const { token: cookie } = await signIn("usr_both");
+    const board = await seedDevice({ userId: "usr_both" });
+    await seedEstimate("walk-1", { userId: "usr_both" });
+
+    const both = await postRef(
+      { relay: true, log: true, device_id: "walk-1", lat: 40.001, lon: -73.95, accuracy: 5 },
+      { cookie },
+    );
+
+    expect(both.status).toBe(200);
+    const body = await both.json<{ id: number; delta_m: number; relayed: { devices: number } }>();
+    expect(body.relayed).toEqual({ devices: 1 });
+    expect(body.delta_m).toBeGreaterThan(110);
+    expect(await getFix(env as unknown as Env, board.deviceId)).toMatchObject({ lat: 40.001 });
+
+    // log alone: the pairing happens and nothing is relayed.
+    await seedEstimate("walk-2", { userId: "usr_both" });
+    await env.DB.prepare("DELETE FROM device_fixes").run();
+    const logOnly = await postRef(
+      { log: true, device_id: "walk-2", lat: 40.001, lon: -73.95 },
+      { cookie },
+    );
+    expect(logOnly.status).toBe(200);
+    expect(await logOnly.json<Record<string, unknown>>()).not.toHaveProperty("relayed");
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+
+    // relay alone with a pairable estimate sitting right there: still no pairing.
+    await seedEstimate("walk-3", { userId: "usr_both" });
+    const relayOnly = await postRef({ relay: true, lat: 40.5, lon: -73.5 }, { cookie });
+    expect(relayOnly.status).toBe(200);
+    expect(await relayOnly.json()).toEqual({ relayed: { devices: 1 } });
+    const untouched = await env.DB.prepare(
+      "SELECT ref_lat FROM locate_log WHERE device_id = 'walk-3'",
+    ).first<{ ref_lat: number | null }>();
+    expect(untouched?.ref_lat).toBeNull();
+  });
+
+  it("a relay post that also asked to pair does not 404 when there is nothing to pair", async () => {
+    const { token: cookie } = await signIn("usr_nopair");
+    const board = await seedDevice({ userId: "usr_nopair" });
+
+    const res = await postRef(
+      { relay: true, log: true, device_id: "never-scanned", lat: 40.7, lon: -74.0 },
+      { cookie },
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ relayed: { devices: 1 } });
+    expect(await getFix(env as unknown as Env, board.deviceId)).not.toBeNull();
+  });
+
+  it("a coarse fix is stored ungated (R12) and still pairs as a reference", async () => {
+    const { token: cookie } = await signIn("usr_coarse");
+    const board = await seedDevice({ userId: "usr_coarse" });
+    await seedEstimate("coarse-walk", { userId: "usr_coarse" });
+
+    const res = await postRef(
+      { relay: true, log: true, device_id: "coarse-walk", lat: 40.001, lon: -73.95, accuracy: 900 },
+      { cookie },
+    );
+
+    expect(res.status).toBe(200);
+    // 900 m is far past LOCATE_MAX_ACCURACY_M; the store keeps it and the
+    // provider chain is what refuses it (AE7 above).
+    expect(await getFix(env as unknown as Env, board.deviceId)).toMatchObject({ accuracyM: 900 });
+    const row = await env.DB.prepare(
+      "SELECT ref_accuracy, delta_m FROM locate_log WHERE device_id = 'coarse-walk'",
+    ).first<{ ref_accuracy: number; delta_m: number }>();
+    expect(row?.ref_accuracy).toBe(900);
+    expect(row?.delta_m).toBeGreaterThan(110);
+  });
+
+  it("refuses an out-of-range or millisecond captured_at rather than storing it", async () => {
+    const { token: cookie } = await signIn("usr_clock");
+    const board = await seedDevice({ userId: "usr_clock" });
+
+    const ms = await postRef(
+      { relay: true, lat: 40.7, lon: -74.0, captured_at: Date.now() },
+      { cookie },
+    );
+    expect(ms.status).toBe(400);
+
+    const nonsense = await postRef({ relay: true, lat: 91, lon: -74.0 }, { cookie });
+    expect(nonsense.status).toBe(400);
+
+    const noPosition = await postRef({ relay: true, lon: -74.0 }, { cookie });
+    expect(noPosition.status).toBe(400);
+
+    expect(await getFix(env as unknown as Env, board.deviceId)).toBeNull();
+  });
+
+  it("neither flag → 400, and the budget is untouched", async () => {
+    const { token: cookie, sessionId } = await signIn("usr_noop");
+    const res = await postRef({ relay: false, log: false, lat: 40.7, lon: -74.0 }, { cookie });
+    expect(res.status).toBe(400);
+    const spent = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM auth_budgets WHERE scope = ?1 AND key = ?2",
+    )
+      .bind(RELAY_SESSION_SCOPE, await hashToken(sessionId))
+      .first<{ n: number }>();
+    expect(spent?.n).toBe(0);
+  });
+});
+
+describe("locate_log attribution (R21) and its two identity spaces", () => {
+  it("a device-token insert carries user_id and device_row_id; an anonymous one keeps both NULL", async () => {
+    const board = await seedDevice({ userId: "usr_attr" });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const attributed = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: "board-walk", log: true },
+      { token: board.token },
+    );
+    expect(attributed.status).toBe(200);
+
+    beaconOk(40.6931, -73.9871, 42);
+    const anonymous = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: "anon-walk", log: true },
+      { token: TOKEN },
+    );
+    expect(anonymous.status).toBe(200);
+
+    expect((await logRows("board-walk"))[0]).toMatchObject({
+      user_id: "usr_attr",
+      device_row_id: board.deviceId,
+    });
+    expect((await logRows("anon-walk"))[0]).toMatchObject({
+      user_id: null,
+      device_row_id: null,
+    });
+  });
+
+  it("a session insert is attributed, needs no device_id, and is CSRF-gated", async () => {
+    const { token: cookie } = await signIn("usr_session_log");
+    beaconOk(40.6931, -73.9871, 42);
+
+    const forged = await postLocate(
+      { wifiAccessPoints: uniqueAps(), log: true },
+      { cookie, csrf: null },
+    );
+    expect(forged.status).toBe(403);
+
+    beaconOk(40.6931, -73.9871, 42);
+    const res = await postLocate({ wifiAccessPoints: uniqueAps(), log: true }, { cookie });
+    expect(res.status).toBe(200);
+
+    const rows = await env.DB.prepare("SELECT * FROM locate_log WHERE user_id = ?1")
+      .bind("usr_session_log")
+      .all<Record<string, unknown>>();
+    expect(rows.results).toHaveLength(1);
+    expect(rows.results[0]).toMatchObject({ device_id: null, device_row_id: null });
+  });
+
+  it("the operator path stays anonymous even for a caller who is also signed in", async () => {
+    const { token: cookie } = await signIn("usr_operator");
+    beaconOk(40.6931, -73.9871, 42);
+
+    // DIAG_TOKEN wins: the walk's rows belong to the walk, and stay readable
+    // through /v1/locate/log rather than disappearing into an account.
+    const res = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: "op-walk", log: true },
+      { cookie, token: TOKEN },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await logRows("op-walk"))[0]).toMatchObject({ user_id: null, device_row_id: null });
+  });
+
+  it("the two caps are separate spaces: an anonymous id cannot burn a board's", async () => {
+    const board = await seedDevice({ userId: "usr_caps" });
+    // 500 anonymous rows naming the board's server-minted id as free-form text.
+    await env.DB.prepare(
+      `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 500)
+       INSERT INTO locate_log (device_id, ts) SELECT ?1, ?2 FROM c`,
+    )
+      .bind(board.deviceId, nowSec())
+      .run();
+
+    // The anonymous space is full for that string...
+    const anonymous = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: board.deviceId, log: true },
+      { token: TOKEN },
+    );
+    expect(anonymous.status).toBe(429);
+
+    // ...and the board's own cap, counted on devices.id, is untouched.
+    beaconOk(40.6931, -73.9871, 42);
+    const authenticated = await postLocate(
+      { wifiAccessPoints: uniqueAps(), device_id: board.deviceId, log: true },
+      { token: board.token },
+    );
+    expect(authenticated.status).toBe(200);
+    const attributedRows = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM locate_log WHERE device_row_id = ?1",
+    )
+      .bind(board.deviceId)
+      .first<{ n: number }>();
+    expect(attributedRows?.n).toBe(1);
+  });
+
+  it("a board's own cap refuses its 501st row of the day", async () => {
+    const board = await seedDevice({ userId: "usr_devcap" });
+    await env.DB.prepare(
+      `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 500)
+       INSERT INTO locate_log (device_row_id, user_id, ts) SELECT ?1, ?2, ?3 FROM c`,
+    )
+      .bind(board.deviceId, "usr_devcap", nowSec())
+      .run();
+
+    const res = await postLocate(
+      { wifiAccessPoints: uniqueAps(), log: true },
+      { token: board.token },
+    );
+
+    expect(res.status).toBe(429);
+    expect(beaconCalls).toBe(0); // refused before the provider was consulted
+  });
+});
+
+describe("locate_log tenancy (the predicate the SELECT * used to lack)", () => {
+  it("a session cannot pair a reference onto another account's estimate", async () => {
+    const { token: cookie } = await signIn("usr_a");
+    await seedUser("usr_b");
+    await seedEstimate("shared-label", { userId: "usr_b" });
+
+    const res = await postRef(
+      { log: true, device_id: "shared-label", lat: 40.001, lon: -73.95 },
+      { cookie },
+    );
+
+    // Same 404 an estimate that does not exist gets — the account boundary is
+    // not something a device_id guesser gets to probe.
+    expect(res.status).toBe(404);
+    const row = await env.DB.prepare(
+      "SELECT ref_lat FROM locate_log WHERE device_id = 'shared-label'",
+    ).first<{ ref_lat: number | null }>();
+    expect(row?.ref_lat).toBeNull();
+  });
+
+  it("the operator secret cannot pair a reference onto an attributed estimate", async () => {
+    await seedUser("usr_c");
+    await seedEstimate("op-target", { userId: "usr_c" });
+
+    const res = await postRef(
+      { log: true, device_id: "op-target", lat: 40.001, lon: -73.95 },
+      { token: TOKEN },
+    );
+
+    expect(res.status).toBe(404);
+    const row = await env.DB.prepare(
+      "SELECT ref_lat FROM locate_log WHERE device_id = 'op-target'",
+    ).first<{ ref_lat: number | null }>();
+    expect(row?.ref_lat).toBeNull();
+  });
+
+  it("a session pairs its own estimate, including one its board wrote", async () => {
+    const { token: cookie } = await signIn("usr_own");
+    const board = await seedDevice({ userId: "usr_own" });
+    await seedEstimate("own-walk", { userId: "usr_own", deviceRowId: board.deviceId });
+
+    const res = await postRef(
+      { log: true, device_id: "own-walk", lat: 40.001, lon: -73.95 },
+      { cookie },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json<{ delta_m: number }>()).delta_m).toBeGreaterThan(110);
+  });
+
+  it("GET /v1/locate/log returns only the rows that belong to no user", async () => {
+    await seedUser("usr_hidden");
+    await seedEstimate("mixed", { userId: "usr_hidden" });
+    await seedEstimate("mixed");
+
+    const res = await get("/v1/locate/log?device_id=mixed", { token: TOKEN });
+
+    expect(res.status).toBe(200);
+    const rows = (await res.json<{ rows: { user_id: string | null }[] }>()).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].user_id).toBeNull();
   });
 });

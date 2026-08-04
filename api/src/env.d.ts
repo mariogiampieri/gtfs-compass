@@ -113,6 +113,22 @@ declare global {
     PAIR_CLAIM_BUDGET_FRESH?: string;
     PAIR_CLAIM_BUDGET_REPEAT?: string;
     /**
+     * Phone-position relay posts (`POST /v1/locate/ref` with `relay: true`)
+     * one session may make per UTC day (R11, default 1500 — a full day at the
+     * client's once-a-minute cadence, with headroom). This is the relay's
+     * enforcing bound: it is the phase's highest-frequency write and fans out
+     * to one row per granted device. `0` switches the relay off outright — a
+     * kill switch, not a fall back to the default.
+     */
+    RELAY_BUDGET_SESSION?: string;
+    /**
+     * The same posts counted per client network (/24 or /64, default 6000).
+     * Deliberately loose next to the per-session cap, because everyone behind
+     * one CGNAT /24 shares this key; it bounds a single network's share of D1
+     * rather than any one user's cadence. `0` disables the relay.
+     */
+    RELAY_BUDGET_IP?: string;
+    /**
      * Retention tier one (R20): days after which `locate_log` raw coordinates
      * are nulled and `device_fixes` rows are deleted (default 14). The derived
      * metrics survive to LOCATE_LOG_RETENTION_DAYS.

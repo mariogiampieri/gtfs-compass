@@ -13,7 +13,8 @@ and Citi Bike GBFS) are built, with all three NYC systems live — subway,
 **MTA Bus** (six static GTFS sources + the citywide Bus Time realtime feed),
 and Citi Bike. Phase 4 (firmware) and Phase 5 (accounts, pairing, and the
 config UI) are in progress — the config UI currently ships its shell, its
-sign-in form, device pairing and the device list, and a local location check.
+sign-in form, device pairing, the device list, a local location check, and the
+button that relays this phone's position to the boards you granted it to.
 Everything is specified in
 [`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md).
 
@@ -253,9 +254,35 @@ well as the relay, so a revocation takes effect on the board's very next call.
 `location` object; both fields are absent whenever the position did not come
 from a phone.
 
-`POST /v1/locate/ref` and `GET /v1/locate/log` support the accuracy walk
-described in the spec. They — and `log: true` on `/v1/locate` — require the
-`DIAG_TOKEN` secret as a Bearer header (query-param tokens are rejected):
+**`POST /v1/locate/ref` with `relay: true`** — the write half of the relay, and
+the only client that can produce a fix is a phone. It is **session-only**: the
+request names no device, the signed-in session says whose position it is, and
+the server writes it to every board on that account holding `read:fix`. There
+is no device parameter to get wrong and no device picker in the UI.
+
+```bash
+curl -X POST "https://<worker-host>/v1/locate/ref" \
+  -H 'content-type: application/json' -H 'X-GC-CSRF: 1' \
+  -H "Origin: https://<worker-host>" -b "__Host-gc_session=<token>" \
+  -d '{"relay": true, "lat": 40.6923, "lon": -73.9873, "accuracy": 12,
+       "captured_at": 1785000000}'
+# → {"relayed": {"devices": 2}}
+```
+
+`accuracy` is stored exactly as the phone reported it — the accuracy gate lives
+at read time so a coarse fix falls through to the next provider instead of
+being lost — and `captured_at` (epoch **seconds**, optional, defaults to
+receipt) is what `quality` is measured from. Posts are budgeted per session and
+per client network per day (`RELAY_BUDGET_SESSION` / `RELAY_BUDGET_IP`); the
+client sends at most about once a minute, and the budget is the backstop rather
+than the mechanism. `DIAG_TOKEN` cannot relay: it names no user, and an
+operator post would need a caller-supplied `user_id` — exactly the ownership
+parameter the account-scoped design removes.
+
+`POST /v1/locate/ref` with `log: true` and `GET /v1/locate/log` support the
+accuracy walk described in the spec. They — and `log: true` on `/v1/locate` —
+accept the `DIAG_TOKEN` secret as a Bearer header (query-param tokens are
+rejected):
 
 ```bash
 # 1. log an estimate for a device (within 60 s of step 2)
@@ -271,6 +298,16 @@ curl "https://<worker-host>/v1/locate/log?device_id=<opaque-id>" \
   -H "Authorization: Bearer $DIAG_TOKEN"
 ```
 
+A signed-in browser or a paired board may also log an estimate, in which case
+the row records **who** it belongs to (`user_id`, and `device_row_id` for a
+board) so that "delete all my location history" has something to delete. Those
+attributed rows live in a different identity space from the anonymous ones:
+the daily insert cap counts each space separately, so an anonymous caller who
+learns a board's id cannot burn that board's cap or write into its owner's
+history. `GET /v1/locate/log` is the operator surface and returns **only the
+unattributed rows** — `DIAG_TOKEN` names no user, so the rows that belong to
+one are not its to read.
+
 ### Location privacy
 
 Submitted BSSIDs (WiFi MAC addresses) are **forwarded to
@@ -281,9 +318,13 @@ in-memory cache, and only a *count* of access points appears in diagnostic
 rows. That cache is keyed on the access points alone, so two boards in one
 household share its entries — which is why nothing derived from a credential
 is ever stored in it, and why a relayed phone position (looked up per device)
-sits above it rather than inside it. Operator-initiated diagnostic logging (`log: true`, `DIAG_TOKEN`
-required) stores the resolved position estimate; those rows are aged out on
-a schedule — see [Data retention](#data-retention). BeaconDB is explicitly
+sits above it rather than inside it. Diagnostic logging (`log: true`, which
+takes `DIAG_TOKEN`, a session, or a paired board's token — never nothing at
+all) stores the resolved position estimate, attributed to the account when the
+caller had one; those rows are aged out on a schedule — see
+[Data retention](#data-retention). A relayed phone position is stored as one
+row per receiving board, replaced in place rather than accumulated, and aged
+out on the same schedule. BeaconDB is explicitly
 experimental (no SLA) — an unavailable provider degrades to
 `{"known": false}` and the device falls back to its favorite-stop behavior.
 
@@ -491,6 +532,15 @@ permission, and an unpair button. The `read:fix` checkbox is the one that
 matters and it says so: turning it on means *this device will receive your
 phone's live position* until you turn it off, and turning it off both stops
 that and deletes the position already sent to that board.
+
+**The location card has two buttons, and they do different things.** *Check my
+location* reads this phone's position and shows the raw accuracy — nothing
+leaves the phone. *Send my position to my devices* posts that same reading to
+every board holding the `read:fix` grant, and says how many received it,
+including "no device is set to receive it" when the answer is none. It is
+gesture-triggered, throttled to about one send a minute, and never runs on its
+own; a board with the grant switched off is not a recipient, and switching it
+off deletes the position that board already had.
 
 The other two checkboxes are labelled **recorded, but not enforced yet**, and
 the label is deliberate. `/v1/departures` and `/v1/nearby` are anonymous by
