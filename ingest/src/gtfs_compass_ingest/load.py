@@ -179,7 +179,10 @@ def sync(
     is excluded from change comparison and only written when a row's other
     values changed — identical re-runs write zero rows.
     """
-    columns = list(table.columns)
+    # sync_columns, not columns: a column the schema owns but the converge
+    # loop does not manage (feeds.data_version) must stay out of the diff, the
+    # INSERT list, and the upsert's SET clause, or every run would clobber it.
+    columns = list(table.sync_columns)
     pk_columns = list(table.pk_columns)
 
     desired: dict[tuple, dict] = {}
