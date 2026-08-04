@@ -1,5 +1,6 @@
 import { adapterGroups } from "./adapters";
 import { routeAuth } from "./routes/auth";
+import { routeConfig } from "./routes/config";
 import { routeDepartures } from "./routes/departures";
 import { routeLocate } from "./routes/locate";
 import { routeNearby } from "./routes/nearby";
@@ -176,6 +177,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return Response.json({ error: "rate limited" }, { status: 429 });
       }
       return routePair(request, env, url);
+    }
+
+    // The account's own configuration (U10: the device list, scope grants,
+    // unpair). Standard bucket rather than the auth one: it is session-only and
+    // low-frequency, and the auth bucket's 12/minute is sized for a sign-in —
+    // strangling a *revocation* because the same browser also loaded a list is
+    // the wrong failure for the surface that turns a board off.
+    if (url.pathname === "/v1/config" || url.pathname.startsWith("/v1/config/")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (rateLimited(ip, Date.now())) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routeConfig(request, env, url);
     }
 
     if (

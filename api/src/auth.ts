@@ -107,7 +107,14 @@ export const NONCE_TTL_S = 600;
 /** Device scopes (R9). Separately grantable and revocable; `read:fix` is never implied. */
 export type Scope = "read:departures" | "read:config" | "read:fix";
 
-const KNOWN_SCOPES: readonly Scope[] = ["read:departures", "read:config", "read:fix"];
+/**
+ * Every scope that exists, in the order they are stored and displayed. Exported
+ * because the grant surface (U10's `routes/config.ts`) has to answer "is this a
+ * scope at all" and has to write the column back in a canonical order — a
+ * toggle that reordered `devices.scopes` would make the compare-and-set it
+ * depends on fail against a semantically identical value.
+ */
+export const KNOWN_SCOPES: readonly Scope[] = ["read:departures", "read:config", "read:fix"];
 
 /**
  * A resolved credential. `session` is the account itself (ambient, cookie-borne);

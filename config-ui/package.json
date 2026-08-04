@@ -9,6 +9,7 @@
     "check": "npm run build && npm test"
   },
   "devDependencies": {
+    "happy-dom": "20.11.1",
     "vitest": "4.1.10"
   }
 }

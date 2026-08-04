@@ -199,6 +199,41 @@ describe("the pairing bucket (U5)", () => {
   });
 });
 
+describe("the config surface (U10)", () => {
+  // A list read with no cookie is refused before any storage is touched, which
+  // makes it the cheapest probe for "did this path reach routeConfig at all".
+  // A 404 with `{"error":"not found"}` here would mean the prefix fell through
+  // to the internal-route matcher; an HTML 200 would mean the asset router
+  // answered it with the SPA shell.
+  const devices = (ip: string) =>
+    SELF.fetch("https://api.example/v1/config/devices", { headers: { "CF-Connecting-IP": ip } });
+
+  it("routes /v1/config/* through the Worker", async () => {
+    const res = await devices("198.51.100.221");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(await res.json<any>()).toEqual({ error: "unauthorized" });
+  });
+
+  it("answers an unknown config path with the route's JSON 404", async () => {
+    const res = await SELF.fetch("https://api.example/v1/config", {
+      headers: { "CF-Connecting-IP": "198.51.100.222" },
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json<any>()).toEqual({ error: "not found" });
+  });
+
+  it("shares the standard bucket rather than the auth one", async () => {
+    const ip = "198.51.100.223";
+    const statuses: number[] = [];
+    for (let i = 0; i < 20; i++) statuses.push((await devices(ip)).status);
+    // Capacity is 20: a session-only, low-frequency surface has no reason to
+    // sit in the sign-in bucket, where a burst of 10 is the whole allowance.
+    expect(statuses.every((s) => s === 401)).toBe(true);
+    expect((await devices(ip)).status).toBe(429);
+  });
+});
+
 describe("rateLimited refill math", () => {
   it("refills tokens over time at the configured rate", async () => {
     const { rateLimited } = await import("../../src/index");

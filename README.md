@@ -13,8 +13,8 @@ and Citi Bike GBFS) are built, with all three NYC systems live — subway,
 **MTA Bus** (six static GTFS sources + the citywide Bus Time realtime feed),
 and Citi Bike. Phase 4 (firmware) and Phase 5 (accounts, pairing, and the
 config UI) are in progress — the config UI currently ships its shell, its
-sign-in form, and a local location check; the accounts behind them are
-landing alongside. Everything is specified in
+sign-in form, device pairing and the device list, and a local location check.
+Everything is specified in
 [`docs/plans/01-guiding-spec.md`](docs/plans/01-guiding-spec.md).
 
 ## Architecture at a glance
@@ -442,10 +442,24 @@ to configure, and the session cookie is first-party.
 
 Today it holds the shell, the sign-in form (which posts an address to
 `POST /v1/auth/request` and never says whether that address has an account —
-the emailed link is redeemed by a separate Worker-served page), and the
-location check below. The pairing **API** is live (see [Pairing a
-device](#pairing-a-device)); its code-entry and confirm screens, the device
-list, and favorites editing land in later milestones.
+the emailed link is redeemed by a separate Worker-served page), the **pairing
+screens** and the **device list** described below, and the location check.
+Favorites and walk-time editing land in a later milestone.
+
+**Pairing a board from the browser.** The device shows an eight-letter code and
+sends you to `/pair`, which is this same shell with the cursor in the code box.
+Typing a code shows a **confirm screen** first: it names the board — as text
+the device reported and nothing has verified — and says plainly that a code
+must come off a screen you are holding, because the attack this step exists to
+stop (RFC 8628 §5.4) is a code read to you over the phone. Nothing is bound
+until you confirm.
+
+**The device list** shows every board on the account with its name, firmware
+version, when it was paired, when it last called home, a checkbox per
+permission, and an unpair button. The `read:fix` checkbox is the one that
+matters and it says so: turning it on means *this device will receive your
+phone's live position* until you turn it off, and turning it off both stops
+that and deletes the position already sent to that board.
 
 Prerequisites: Node.js 18+ — nothing else. There is no framework and no
 bundler; the UI is hand-written HTML, CSS, and native ES modules, and the
@@ -616,9 +630,13 @@ under a unique index and resolves in one indexed lookup.
   request for a scope the device was not granted is also a `403`; a device
   token holding `read:config` may read *its own* device's configuration and no
   other board's, including boards on the same account.
-- **Revocation is immediate.** Unpairing sets `revoked_at` and the very next
-  request is a `401` — the same `401`, byte for byte, that a token which never
-  existed gets, so a token found in flash tells its holder nothing.
+- **Revocation is immediate, on both sides.** Unpairing sets `revoked_at` and
+  the very next request is a `401` — the same `401`, byte for byte, that a
+  token which never existed gets, so a token found in flash tells its holder
+  nothing. It also **deletes the phone position already delivered to that
+  board**, and so does turning the `read:fix` permission off on its own:
+  revocation that only stopped the *next* fix would leave the last one
+  readable indefinitely.
 - **Theft is visible.** Every device request refreshes `last_used_at` (at most
   once every five minutes, so a board polling every 20 s does not put a
   database write on each poll). The device list shows it: a board you are
@@ -630,6 +648,32 @@ meaning "persist this and use it from now on". Nothing emits it today, and a
 device that ignores it keeps working — firmware that handles it now is what
 makes switching rotation on later a non-breaking change instead of a
 fleet-wide reflash.
+
+#### Managing paired devices
+
+Three routes behind the device list, all of them **session-only** — a board's
+own token is refused outright, so a stolen credential cannot enumerate the
+account's other boards, widen its own permissions, or unpair anything.
+
+| Route | What it does |
+| --- | --- |
+| `GET /v1/config/devices` | This account's boards: `id`, `paired_at`, `last_seen`, `scopes`, and the device's own `name`/`fw_version` tagged `untrusted` |
+| `PATCH /v1/config/devices/<device_id>` | `{"scope": "read:fix", "granted": true}` — one permission per request, so a stale browser tab cannot restore a grant you just revoked |
+| `DELETE /v1/config/devices/<device_id>` | Unpair: revoke the credential and delete the stored position |
+
+```bash
+curl "https://<worker-host>/v1/config/devices" -b cookies.txt
+
+curl -X PATCH "https://<worker-host>/v1/config/devices/dev_abc123" \
+  -b cookies.txt -H 'content-type: application/json' -H 'X-GC-CSRF: 1' \
+  -H "Origin: https://<worker-host>" \
+  -d '{"scope":"read:fix","granted":true}'
+```
+
+A device id that belongs to somebody else answers `404`, the same as one that
+does not exist, and the write it named does not happen — the ownership
+predicate is in the `WHERE` clause of every statement, not in a check a route
+had to remember.
 
 ### The location check
 

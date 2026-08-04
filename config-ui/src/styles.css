@@ -122,6 +122,80 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+/* The device list (U10). Every rule lives here rather than in a `style`
+   attribute: `style-src 'self'` has no `unsafe-inline`, so an inline style is
+   silently dead in the browser and fails the build besides. */
+
+.devices {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.device {
+  border-top: 1px solid var(--edge);
+  padding-top: 0.9rem;
+  margin-top: 0.9rem;
+}
+
+.device-name {
+  font-size: 1rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.scope {
+  margin-top: 0.9rem;
+}
+
+.scope-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  color: var(--ink);
+  font-size: 0.95rem;
+}
+
+.scope-label input {
+  width: 1.1rem;
+  height: 1.1rem;
+  accent-color: var(--accent);
+}
+
+.scope-warning {
+  color: var(--ink);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-edge);
+  border-radius: 0.5rem;
+  padding: 0.6rem;
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+
+.confirm {
+  margin-top: 1rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--edge);
+}
+
+.confirm h3 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+button.secondary {
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--edge);
+}
+
+button.danger {
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--warn-edge);
+}
+
 .site-footer {
   margin-top: 2rem;
 }
