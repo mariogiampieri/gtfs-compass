@@ -53,3 +53,14 @@ The convergence operation that makes a database table match a freshly parsed sou
 
 ### Prune
 The deletion half of Sync: removing rows no longer present in the source, computed as an explicit delete-set (never a chunked NOT-IN). Guarded — an empty keep-set or a deletion above a sanity threshold refuses to run without an explicit force flag, so a truncated source download cannot wipe a table.
+
+## Worker operations
+
+### Retention Purge
+The daily Cron-triggered job that ages out stored location data in two tiers: past the Precise Window it strips raw coordinates from diagnostic rows and deletes stored phone fixes; past the Retention Window it deletes the diagnostic row entirely. The same run sweeps expired sign-in tokens, pairing codes, and stale rate-limit counters. Bounded per invocation and self-latching, so a partial run simply resumes on the next tick.
+
+### Precise Window / Retention Window
+The two ages the Retention Purge acts on (14 and 90 days by default). Inside the Precise Window a location row keeps full fidelity; between the two it keeps only the derived metrics that answer *how accurate was the estimate here* — accuracies, delta, provider, timestamp — with no position; past the Retention Window it does not exist.
+
+### Purge Run Record
+The single `maintenance_runs` row the Retention Purge upserts on every completed run, including a run that found nothing to do. A stale `last_run_at` is the alert condition — a silently failing cron is indistinguishable from a quiet one without it — and a failed run deliberately leaves the timestamp untouched.

@@ -3,6 +3,7 @@ import { routeAuth } from "./routes/auth";
 import { routeDepartures } from "./routes/departures";
 import { routeLocate } from "./routes/locate";
 import { routeNearby } from "./routes/nearby";
+import { runRetentionPurge } from "./retention";
 
 export { FeedDO } from "./feed_do";
 export { GbfsDO } from "./gbfs_do";
@@ -110,6 +111,27 @@ export default {
       // D1 hiccups and other unexpected failures keep the JSON error contract.
       console.error("route failed:", error);
       return Response.json({ error: "internal error" }, { status: 500 });
+    }
+  },
+
+  /**
+   * Cron Trigger (R20): the retention purge. Schedule lives in
+   * wrangler.jsonc `triggers.crons`; the work lives in `retention.ts`.
+   *
+   * Awaited rather than handed to `ctx.waitUntil`, so a failure fails the
+   * invocation instead of being reported as a successful cron that quietly
+   * purged nothing. The run is only recorded on success — a stale
+   * `maintenance_runs.last_run_at` is exactly the signal R20's "has not run in
+   * N days" alert reads.
+   */
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    try {
+      const result = await runRetentionPurge(env, controller.scheduledTime);
+      // One structured line per run so `wrangler tail` shows the counts.
+      console.log(`retention purge: ${JSON.stringify(result)}`);
+    } catch (error) {
+      console.error("retention purge failed:", error);
+      throw error;
     }
   },
 } satisfies ExportedHandler<Env>;

@@ -249,8 +249,8 @@ service, to resolve a position — that is their only use. This project never
 stores BSSIDs: only a one-way hash of the scanned set lives in a 10-minute
 in-memory cache, and only a *count* of access points appears in diagnostic
 rows. Operator-initiated diagnostic logging (`log: true`, `DIAG_TOKEN`
-required) stores the resolved position estimate; those rows currently
-persist until the Phase 5 retention purge ships. BeaconDB is explicitly
+required) stores the resolved position estimate; those rows are aged out on
+a schedule — see [Data retention](#data-retention). BeaconDB is explicitly
 experimental (no SLA) — an unavailable provider degrades to
 `{"known": false}` and the device falls back to its favorite-stop behavior.
 
@@ -510,6 +510,47 @@ failing silently, but the fix is the same either way: open the deployed
 `https://` address on the phone. Verifying this feature means using a real
 phone over HTTPS; a desktop browser on localhost proves nothing about the
 permission prompt.
+
+## Data retention
+
+Location data ages out on its own. A Cron Trigger (`triggers.crons` in
+`api/wrangler.jsonc`, 03:47 UTC daily) runs a two-tier purge:
+
+| After | What happens |
+|---|---|
+| `LOCATE_LOG_PRECISE_DAYS` (14) | `locate_log` loses its raw coordinates (`est_lat`/`est_lon`/`ref_lat`/`ref_lon`); the accuracies, `delta_m`, `provider`, `bssid_count` and timestamp stay. Any stored phone fix (`device_fixes`) is deleted. |
+| `LOCATE_LOG_RETENTION_DAYS` (90) | The `locate_log` row is deleted. |
+
+The split is deliberate: the question these diagnostic rows exist to answer —
+*was the estimate accurate enough at this platform entrance* — is answered by
+the metrics, not by the position, so the movement history ages out roughly six
+times faster than the residual measurements. The same run sweeps expired
+sign-in tokens, expired pairing codes, and yesterday's rate-limit counters.
+
+Every run is recorded, including one that finds nothing to do — otherwise
+"no rows deleted lately" is indistinguishable from a dead cron:
+
+```bash
+cd api
+npx wrangler d1 execute gtfs-compass --remote \
+  --command "SELECT * FROM maintenance_runs"
+# job              last_run_at  duration_ms  rows_affected  pending  detail
+# retention-purge  1785810156   84           37             0        {"locate_coords_nulled":12,...}
+```
+
+**A stale `last_run_at` is the alert condition**: if it is more than a day or
+two behind, the purge is not running and retention is not happening. `pending
+= 1` means one invocation's batch budget was not enough to drain the backlog
+and the next tick will continue — expected on a first run against an old
+database, a problem if it never clears. A run in progress is visible live with
+`npx wrangler tail --format pretty` (it prints one `retention purge: {...}`
+line per invocation); `npx wrangler dev --test-scheduled` plus
+`curl 'http://localhost:8787/__scheduled?cron=47+3+*+*+*'` triggers one
+locally.
+
+Windows and batch sizes are configurable — see `LOCATE_LOG_PRECISE_DAYS`,
+`LOCATE_LOG_RETENTION_DAYS`, `RETENTION_BATCH_LIMIT` and
+`RETENTION_MAX_BATCHES` in `.env.example`.
 
 ## Feed data licensing
 

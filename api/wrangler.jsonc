@@ -29,6 +29,16 @@
     // router entirely.
     "run_worker_first": ["/v1/*", "/internal/*"]
   },
+  // Retention purge (R20), api/src/retention.ts. Daily is the right cadence:
+  // the windows are 14 and 90 days, so an hourly sweep would buy nothing but
+  // 24x the invocations. 03:47 UTC rather than a round hour or midnight —
+  // cron minute 0 is when every scheduled job on the platform wakes up, and
+  // this one is happy to run in the quiet minutes between. A backlog larger
+  // than one invocation's batch budget drains over successive days and says so
+  // in `maintenance_runs.pending`.
+  "triggers": {
+    "crons": ["47 3 * * *"]
+  },
   "d1_databases": [
     {
       "binding": "DB",

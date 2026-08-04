@@ -66,6 +66,18 @@ declare global {
      * real front door on a deployment reachable under more than one hostname.
      */
     AUTH_PUBLIC_ORIGIN?: string;
+    /**
+     * Retention tier one (R20): days after which `locate_log` raw coordinates
+     * are nulled and `device_fixes` rows are deleted (default 14). The derived
+     * metrics survive to LOCATE_LOG_RETENTION_DAYS.
+     */
+    LOCATE_LOG_PRECISE_DAYS?: string;
+    /** Retention tier two (R20): days after which a `locate_log` row is deleted (default 90). */
+    LOCATE_LOG_RETENTION_DAYS?: string;
+    /** Rows per purge statement (default 500). */
+    RETENTION_BATCH_LIMIT?: string;
+    /** Statements per purge phase per cron invocation (default 20). */
+    RETENTION_MAX_BATCHES?: string;
   }
   // `cloudflare:test`'s env (and workers-types' import { env }) are typed as
   // Cloudflare.Env; bridge the project Env into it.
