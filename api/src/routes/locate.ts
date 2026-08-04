@@ -169,6 +169,11 @@ async function handleLocateLog(request: Request, env: Env, url: URL): Promise<Re
     binds.push(since);
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  // Operator-only surface: every row here is anonymous today (the insert above
+  // hardcodes user_id NULL), which is the only reason this read may be
+  // unscoped. The moment R21 attributes locate_log rows to a user, this query
+  // must AND in `authorize()`'s owner predicate from ../auth — a per-user
+  // history read that keeps this `SELECT *` is a tenancy hole.
   const rows = await env.DB.prepare(
     `SELECT * FROM locate_log ${where} ORDER BY ts DESC, id DESC LIMIT ${LOG_PAGE_LIMIT}`,
   )

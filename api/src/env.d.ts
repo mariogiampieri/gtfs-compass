@@ -19,6 +19,17 @@ declare global {
     /** JSON map of feed id → realtime API key for rt_needs_key feeds
      * (wrangler secret, e.g. {"mta-bus": "..."}). */
     RT_FEED_KEYS?: string;
+    /**
+     * Auth bypass (R5). The **exact** string "single" binds every request to
+     * the synthetic user `usr_single` and skips login; anything unset or
+     * unrecognized fails closed to multi-user. Browser-only controls still
+     * apply, so this is safe only behind a network-level control.
+     */
+    AUTH_MODE?: string;
+    /** Sliding session window in days (default 30, renewed at half-life). */
+    SESSION_TTL_DAYS?: string;
+    /** Absolute session lifetime in days from created_at (default 180). */
+    SESSION_ABSOLUTE_TTL_DAYS?: string;
   }
   // `cloudflare:test`'s env (and workers-types' import { env }) are typed as
   // Cloudflare.Env; bridge the project Env into it.
