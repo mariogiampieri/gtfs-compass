@@ -161,10 +161,18 @@ async function storedScopes(deviceId: string): Promise<string[]> {
 /**
  * Seed the relay row a phone would have posted.
  *
- * Direct SQL because the write half of the seam (`putFixForUser`) is U7 and
- * does not exist yet — this is a *test* reaching for it, never product code
- * (the Definition of Done's "no SQL touches `device_fixes` outside the relay
- * seam" is about `src/`). U7 replaces this helper's body with the real call.
+ * Direct SQL, and it stays that way now that U7 has landed `putFixForUser`.
+ * Half the cases below need a fix on a board that does *not* currently hold
+ * `read:fix` — another account's default-scoped device, or the row a
+ * half-completed revocation left behind — and the fan-out write refuses
+ * exactly those by design (R11's predicate is the grant *and* `revoked_at IS
+ * NULL`). Routing this helper through the seam would make those tests seed
+ * nothing and pass vacuously against a `fixCount` of 0.
+ *
+ * This is a *test* reaching past the seam, never product code: the Definition
+ * of Done's "no SQL touches `device_fixes` outside the relay seam" is about
+ * `src/`. The relay suite (`relay.test.ts`) exercises the seam's own round
+ * trip.
  */
 async function seedFix(deviceId: string): Promise<void> {
   const now = nowSec();
