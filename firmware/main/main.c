@@ -1,19 +1,41 @@
 /*
- * main.c — the M1 vertical slice (plan U5).
+ * main.c — device glue: display, touch, net consumption, render scheduling
+ * (M1 vertical slice; reworked for the M2 U3 view dispatcher).
  *
  * Boot: display + loading skeleton immediately, console + battery, then the
- * net task. The LVGL side owns all rendering: a 250 ms queue consumer copies
- * fresh models and full-renders (jitter applies); a 1 s tick updates the
- * chip in place and handles the state machine (LIVE → STALE at 90 s data
- * age with fetches succeeding; OFFLINE on fetch failures; NO_LOCATION on
- * 422). Countdowns decrement locally once per minute via a full render —
- * the device does no other time math (spec).
+ * net task. The LVGL side owns all rendering, through ONE render-request
+ * path (R6 deferral contract):
+ *
+ *   - gc_request_render() renders immediately unless a press or transition
+ *     animation is in progress (ui_input_busy()); while busy it latches a
+ *     pending flag, drained by the 250 ms consumer after release.
+ *   - Net messages are STAGED at receive and applied when not busy. The
+ *     stash is by-value (latest-wins overwrite): msg.model points into the
+ *     net task's alternating PSRAM double buffer, which the publisher
+ *     reuses on the fetch after next (~60 s) — copying into a main-owned
+ *     staged buffer within one 250 ms poll of publish is the ordering that
+ *     can never read a reused buffer, and the deferral then holds no
+ *     net-task pointers at all. Apply is a pointer swap (staged ↔ applied),
+ *     so the applied model g_ui_model — and therefore the rendered tree and
+ *     its tap targets — cannot change mid-press: press-time and
+ *     release-time hit-testing see the same snapshot (KTD-2).
+ *   - Deferred applies seed freshness as initial_age_s + defer time, so
+ *     staleness is never under-reported (R6).
+ *   - Navigation renders (tap/swipe results) bypass the deferral: they are
+ *     the press's own intent — a swipe swallows the rest of its press and
+ *     a tap resolves at release, so the rebuild races nothing.
+ *
+ * A 1 s tick updates the chip in place, ticks the per-system data ages
+ * (KTD-7; STALE derives per system at 90 s), and decrements countdowns once
+ * per minute — full render on the rail board, jitter nudge elsewhere (R7).
+ * Failure paths change treatment, never the view (R6).
  */
 #include <stdlib.h>
 #include <string.h>
 
 #include "battery.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/touch.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -23,6 +45,7 @@
 #include "net_task.h"
 #include "nvs_flash.h"
 #include "ui.h"
+#include "ui_input.h"
 #include "wifi_creds.h"
 
 extern void gc_console_start(void); /* console.c */
@@ -35,52 +58,84 @@ static const char *TAG = "gtfs-compass";
 #define DIM_PCT 40
 
 static QueueHandle_t g_net_queue;
-static model_nearby_t *g_ui_model; /* UI-owned copy (PSRAM) */
+static model_nearby_t *g_ui_model;     /* applied model (owns the rendered tree) */
+static model_nearby_t *g_staged_model; /* deferral stash (copy-at-receive) */
 static bool g_have_model;
-static ui_state_t g_state = {.conn = UI_CONN_LOADING, .battery_pct = -1};
+static ui_state_t g_state; /* ui_state_init() in app_main: LOADING, ages -1 */
 static int64_t g_flash_until_ms;
 static int64_t g_last_success_ms;
 static int64_t g_last_minute_ms;
+static int64_t g_last_touch_ms; /* 0 at boot: a never-touched device drifts */
 static bool g_dimmed;
+
+/* Staged net message (by value, latest-wins — R6 deferral contract). */
+static bool g_staged_have_model;    /* staged model copy awaits apply */
+static gc_net_status_t g_staged_status;
+static bool g_staged_have_status;   /* any message awaits apply */
+static int64_t g_staged_recv_ms;    /* when the staged model was received */
+static bool g_render_pending;       /* deferred render-only request */
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
-static void full_render(void) { ui_board_show(g_have_model ? g_ui_model : NULL, &g_state); }
+static void full_render(void) {
+  g_render_pending = false;
+  /* R11 instrumentation: render+layout cost and LVGL-task stack headroom,
+   * logged per full render — the numbers that decide R9 motion and catch
+   * the M1 stack-overflow class before it panics. Flush happens async after
+   * the timer callback returns, so this is build cost, not wire time. */
+  int64_t t0 = esp_timer_get_time();
+  ui_render(g_have_model ? g_ui_model : NULL, &g_state);
+  ESP_LOGI(TAG, "render: view=%d sys=%d %lld ms, lvgl stack free %u B",
+           g_state.view, g_state.sys, (esp_timer_get_time() - t0) / 1000,
+           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+}
 
-/* 250 ms: drain the net queue */
-static void consume_cb(lv_timer_t *t) {
-  (void)t;
-  gc_net_msg_t msg;
-  if (xQueueReceive(g_net_queue, &msg, 0) != pdTRUE) return;
+/* THE render-request path: every non-navigation full-render trigger (model
+ * apply, minute decrement, stale transition, failure treatment) goes
+ * through here so it can defer while a press/animation is in progress. */
+static void gc_request_render(void) {
+  if (ui_input_busy()) {
+    g_render_pending = true;
+    return;
+  }
+  full_render();
+}
 
-  switch (msg.status) {
-    case GC_NET_OK: {
-      memcpy(g_ui_model, msg.model, sizeof(*g_ui_model)); /* copy before net reuses */
-      g_have_model = true;
-      /* Staleness lives in the API response (spec): seed the counter with
-       * the server-computed data age so an upstream stall is honest from
-       * the first render — never stale-as-live. */
-      int32_t age = g_ui_model->rail.initial_age_s;
-      g_state.secs_since_fetch = age > 0 ? (uint32_t)age : 0;
-      g_state.conn = g_state.secs_since_fetch > STALE_AFTER_S ? UI_CONN_STALE : UI_CONN_LIVE;
-      g_state.flash_now = g_state.conn == UI_CONN_LIVE;
-      g_flash_until_ms = now_ms() + FLASH_MS;
-      g_last_success_ms = now_ms();
-      g_last_minute_ms = now_ms(); /* fresh etas: restart the decrement clock */
-      if (g_dimmed) {
-        bsp_display_brightness_set(100);
-        g_dimmed = false;
-      }
-      break;
+/* Apply the staged message: swap the model in, reconcile by identity with
+ * the defer time folded into the age seed, then the status treatment. */
+static void gc_apply_staged(void) {
+  gc_net_status_t status = g_staged_status;
+  if (g_staged_have_model) {
+    model_nearby_t *tmp = g_ui_model;
+    g_ui_model = g_staged_model;
+    g_staged_model = tmp;
+    g_have_model = true;
+    int32_t defer_s = (int32_t)((now_ms() - g_staged_recv_ms) / 1000);
+    /* Staleness lives in the API response (spec): ages seed from the
+     * server-computed initial_age_s, plus however long the apply was
+     * deferred — never under-reported (R6). */
+    ui_reconcile_deferred(&g_state, g_ui_model, defer_s);
+    g_state.secs_since_fetch = defer_s > 0 ? (uint32_t)defer_s : 0;
+    g_last_success_ms = now_ms();
+    g_last_minute_ms = now_ms(); /* fresh etas: restart the decrement clock */
+    if (g_dimmed) {
+      bsp_display_brightness_set(100);
+      g_dimmed = false;
     }
-    case GC_NET_NO_LOCATION:
-      g_state.conn = UI_CONN_NO_LOCATION;
+  }
+  switch (status) {
+    case GC_NET_OK:
+      g_state.conn = UI_CONN_LIVE;
+      /* chip evaluates per-system staleness before the flash, so a fetch
+       * that lands already-old data never flashes green as live */
+      g_state.flash_now = true;
+      g_flash_until_ms = now_ms() + FLASH_MS;
       break;
+    case GC_NET_NO_LOCATION:
     case GC_NET_NO_CREDS:
-      /* honest un-provisioned state; the R10 screen's copy fits ("no known
-       * WiFi networks") and the console hint lives in the logs */
+      /* honest un-provisioned/unlocatable state; with a prior model the
+       * view degrades in place — failures never change the view (R6) */
       g_state.conn = UI_CONN_NO_LOCATION;
-      ESP_LOGW(TAG, "unprovisioned — wifi_set <ssid> <pass> on the console");
       break;
     default:
       /* Failure never regresses the screen: keep NO_LOCATION if that's the
@@ -89,27 +144,75 @@ static void consume_cb(lv_timer_t *t) {
       if (g_state.conn != UI_CONN_NO_LOCATION) g_state.conn = UI_CONN_OFFLINE;
       break;
   }
+  g_staged_have_model = false;
+  g_staged_have_status = false;
   g_state.battery_pct = (int8_t)gc_battery_pct();
   full_render();
 }
 
-/* 1 s: chip tick, state transitions, minute decrement */
+/* 250 ms: drain the net queue into the stash; apply when not busy. This
+ * cadence is also what applies deferred work after a release. */
+static void consume_cb(lv_timer_t *t) {
+  (void)t;
+  gc_net_msg_t msg;
+  if (xQueueReceive(g_net_queue, &msg, 0) == pdTRUE) {
+    if (msg.status == GC_NET_OK) {
+      memcpy(g_staged_model, msg.model, sizeof(*g_staged_model)); /* copy before net reuses */
+      g_staged_have_model = true;
+      g_staged_recv_ms = now_ms();
+    }
+    if (msg.status == GC_NET_NO_CREDS) {
+      ESP_LOGW(TAG, "unprovisioned — wifi_set <ssid> <pass> on the console");
+    }
+    g_staged_status = msg.status; /* latest-wins; stash is by-value so the
+                                     displaced message needs no freeing */
+    g_staged_have_status = true;
+  }
+  /* Deferral ceiling (review): a sustained accidental press — pocket, palm,
+   * object resting on the glass — would otherwise defer applies and board
+   * renders indefinitely (staleness accounting stays honest, but content
+   * freezes). A press this long is not interaction; apply through it. */
+  static int64_t busy_since_ms;
+  if (ui_input_busy()) {
+    if (busy_since_ms == 0) busy_since_ms = now_ms();
+    if (now_ms() - busy_since_ms < 15000) return; /* defer: apply after release */
+    ESP_LOGW(TAG, "deferral ceiling hit (15 s press) — applying through it");
+  } else {
+    busy_since_ms = 0;
+  }
+  if (g_staged_have_status) {
+    gc_apply_staged();
+  } else if (g_render_pending) {
+    full_render();
+  }
+}
+
+/* 1 s: chip tick, per-system ages, stale boundary, minute decrement */
 static void tick_cb(lv_timer_t *t) {
   (void)t;
-  if (g_state.conn == UI_CONN_LIVE || g_state.conn == UI_CONN_STALE ||
-      g_state.conn == UI_CONN_OFFLINE) {
+  if (g_state.conn == UI_CONN_LIVE || g_state.conn == UI_CONN_OFFLINE) {
     g_state.secs_since_fetch++;
+  }
+  /* Per-system data ages tick at 1 Hz (KTD-7); -1 = no data, never ages. */
+  bool stale_crossed = false;
+  for (int i = 0; i < UI_SYS_COUNT; i++) {
+    if (g_state.age_s[i] >= 0) {
+      g_state.age_s[i]++;
+      if (i == g_state.sys && g_state.age_s[i] == STALE_AFTER_S + 1) stale_crossed = true;
+    }
   }
   if (g_state.flash_now && now_ms() > g_flash_until_ms) g_state.flash_now = false;
 
-  /* R6: fetches succeeding but data old → STALE (amber), distinct from OFFLINE */
-  if (g_state.conn == UI_CONN_LIVE && g_state.secs_since_fetch > STALE_AFTER_S) {
-    g_state.conn = UI_CONN_STALE;
-    full_render();
+  /* R6/KTD-7: the CURRENT system crossing the 90 s contract changes the
+   * content treatment (amber chip, ~ countdowns, 60% + banner) → full
+   * render, through the deferral path. Other systems' crossings render
+   * when swiped to. */
+  if (stale_crossed && g_state.conn == UI_CONN_LIVE) {
+    gc_request_render();
     return;
   }
 
-  /* local countdown decrement, once per minute, via a full render (jitter ok) */
+  /* local countdown decrement, once per minute; render is view-aware (R7) */
   if (g_have_model && now_ms() - g_last_minute_ms >= 60000) {
     g_last_minute_ms = now_ms();
     for (int s = 0; s < g_ui_model->rail.stop_count; s++) {
@@ -123,8 +226,21 @@ static void tick_cb(lv_timer_t *t) {
         }
       }
     }
-    full_render();
-    return;
+    if (g_state.view == UI_VIEW_BOARD && g_state.sys == UI_SYS_RAIL) {
+      gc_request_render(); /* full render through the deferral gate */
+      return;
+    }
+    if (g_state.view == UI_VIEW_DETAIL) {
+      /* R7: countdown labels rewritten in place — no rebuild, scroll
+       * preserved, so no press/animation gate is needed (U4) */
+      ui_detail_minute_tick(g_ui_model, &g_state);
+    }
+    /* Burn-in drift, parked-device only (Mario: visible jitter was too
+     * distracting): one ±1 px step per minute, and only after 5 min with
+     * no touch — active use never moves. */
+    if (!ui_input_busy() && now_ms() - g_last_touch_ms > 5 * 60 * 1000) {
+      ui_jitter_nudge();
+    }
   }
 
   /* M1 brightness placeholder: dim after long no-data — boot time counts as
@@ -135,7 +251,7 @@ static void tick_cb(lv_timer_t *t) {
     g_dimmed = true;
   }
 
-  ui_board_tick(&g_state);
+  ui_tick(&g_state);
 }
 
 /*
@@ -201,10 +317,66 @@ static lv_display_t *gc_display_start(void) {
   return disp;
 }
 
+/*
+ * FT3168 touch (plan U2, R1). Same bypass rule as the display: never through
+ * bsp_display_start. bsp_touch_new + lvgl_port_add_touch is exactly what the
+ * BSP's own indev init does, minus the bsp_display_start wrapper — I2C probe
+ * at 0x38 via the FT5x06 driver, INT on GPIO 38 (event-mode indev), touch
+ * reset on GPIO 9 (separate from LCD reset 8; the BSP comment claiming
+ * shared is stale).
+ */
+static lv_indev_t *gc_touch_start(lv_display_t *disp) {
+  esp_lcd_touch_handle_t tp = NULL;
+  /* Review: a transient I2C probe failure under ESP_ERROR_CHECK would
+   * abort → reboot → fail again — a panic loop on an unproven path. Retry
+   * once, then boot without touch: the M1 read-only board still works. */
+  esp_err_t terr = bsp_touch_new(NULL, &tp);
+  if (terr != ESP_OK) {
+    ESP_LOGW(TAG, "touch probe failed (%s) — retrying once", esp_err_to_name(terr));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    terr = bsp_touch_new(NULL, &tp);
+  }
+  if (terr != ESP_OK) {
+    ESP_LOGE(TAG, "touch unavailable (%s) — booting read-only", esp_err_to_name(terr));
+    return NULL;
+  }
+  lv_indev_t *indev = lvgl_port_add_touch(&(lvgl_port_touch_cfg_t){.disp = disp, .handle = tp});
+  assert(indev);
+  ESP_LOGI(TAG, "touch up: FT3168 enumerated, event-mode indev registered");
+  return indev;
+}
+
+/*
+ * U3 gesture routing: taps hit-test the current view, swipes drive the
+ * carousel/stop cycling/pop-to-board — both through the shared ui_nav
+ * transitions (the sim keys call the same functions). Navigation renders
+ * happen immediately (see file header). Callbacks run in LVGL context.
+ */
+static void gc_input_press(int32_t x, int32_t y, void *user) {
+  (void)user;
+  g_last_touch_ms = now_ms(); /* holds the burn-in drift while in active use */
+  ESP_LOGD(TAG, "input: press %ld,%ld", (long)x, (long)y);
+}
+
+static void gc_input_tap(int32_t x, int32_t y, void *user) {
+  (void)user;
+  if (ui_views_on_tap(x, y, g_have_model ? g_ui_model : NULL, &g_state)) {
+    full_render();
+  }
+}
+
+static void gc_input_swipe(ui_swipe_t dir, void *user) {
+  (void)user;
+  if (ui_views_on_swipe(dir, g_have_model ? g_ui_model : NULL, &g_state)) {
+    full_render();
+  }
+}
+
 void app_main(void) {
-  ESP_LOGI(TAG, "gtfs-compass firmware — M1 vertical slice");
+  ESP_LOGI(TAG, "gtfs-compass firmware — M2 (touch + carousel)");
   int64_t t0 = now_ms();
   srand(esp_random()); /* burn-in jitter must differ across boots */
+  ui_state_init(&g_state); /* LOADING, ages/battery unknown (-1) */
 
   /* NVS underpins credentials AND esp_wifi's own storage — init first, with
    * the standard erase-and-retry for version/page migrations. */
@@ -215,11 +387,20 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(nvs_err);
 
-  gc_display_start();
+  lv_display_t *disp = gc_display_start();
   bsp_display_backlight_on();
+  lv_indev_t *touch = gc_touch_start(disp);
+  if (touch) {
+    bsp_display_lock(0);
+    ui_input_attach(touch, &(ui_input_callbacks_t){.on_press = gc_input_press,
+                                                   .on_tap = gc_input_tap,
+                                                   .on_swipe = gc_input_swipe});
+    bsp_display_unlock();
+  }
 
   g_ui_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
-  assert(g_ui_model);
+  g_staged_model = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
+  assert(g_ui_model && g_staged_model);
 
   bsp_display_lock(0);
   ui_init();
