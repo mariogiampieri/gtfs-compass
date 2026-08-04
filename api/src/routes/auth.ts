@@ -152,8 +152,12 @@ function looksLikeAddress(email: string): boolean {
  * from the `Host` header, and a deployment reachable under more than one
  * hostname would otherwise mail a link built from whichever name the requester
  * used. Set it and the link is pinned to the real front door.
+ *
+ * Exported because `routes/pair.ts` builds RFC 8628's `verification_uri` from
+ * the same question — "where is this deployment's front door" has to have one
+ * answer, not one per route.
  */
-function publicOrigin(request: Request, env: Env): string {
+export function publicOrigin(request: Request, env: Env): string {
   const configured = (env.AUTH_PUBLIC_ORIGIN ?? "").trim();
   if (configured) {
     try {

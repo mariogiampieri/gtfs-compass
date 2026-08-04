@@ -160,7 +160,8 @@ are limited to the curated feed allowlist (`vars.CURATED_FEEDS` in
 `api/wrangler.jsonc`) and per-IP rate limiting, and expose only
 already-public transit data. The locate diagnostics surfaces are gated by a
 `DIAG_TOKEN` Worker secret (see `.env.example`). Accounts exist on
-`/v1/auth/*` — see [Signing in](#signing-in) — and everything user-owned
+`/v1/auth/*` — see [Signing in](#signing-in) — devices get their own scoped
+credentials through [pairing](#pairing-a-device), and everything user-owned
 that arrives in later milestones goes behind them.
 
 ## The read API (Phase 3)
@@ -441,8 +442,9 @@ to configure, and the session cookie is first-party.
 Today it holds the shell, the sign-in form (which posts an address to
 `POST /v1/auth/request` and never says whether that address has an account —
 the emailed link is redeemed by a separate Worker-served page), and the
-location check below. Device pairing and favorites editing land in later
-milestones.
+location check below. The pairing **API** is live (see [Pairing a
+device](#pairing-a-device)); its code-entry and confirm screens, the device
+list, and favorites editing land in later milestones.
 
 Prerequisites: Node.js 18+ — nothing else. There is no framework and no
 bundler; the UI is hand-written HTML, CSS, and native ES modules, and the
@@ -541,6 +543,60 @@ Four details are load-bearing and easy to undo by accident:
 Emailed links point at the origin of the request that asked for one. On a
 deployment answering to more than one hostname, set `AUTH_PUBLIC_ORIGIN` to
 pin them to the real front door.
+
+### Pairing a device
+
+The board has no keyboard and must never hold your password, so pairing
+follows **RFC 8628** (the OAuth device authorization grant): the device asks
+for a pairing request, shows you an eight-character code, and polls until you
+have claimed that code in a browser you are already signed in to.
+
+| Route | Caller | What it does |
+| --- | --- | --- |
+| `POST /v1/device/pair/start` | the device, unauthenticated | Mints a 256-bit `device_code` (stored hashed) and an 8-character `user_code`; answers `device_code`, `user_code`, `verification_uri`, `expires_in`, `interval` |
+| `POST /v1/device/pair/poll` | the device, `Authorization: Bearer <device_code>` | `authorization_pending` until claimed, then the device token **exactly once** |
+| `POST /v1/pair/claim` | the browser, session cookie + `X-GC-CSRF` | Names the pending request by its `user_code`; the first call previews the device, a second call with `"confirm": true` binds it |
+
+```bash
+# what the firmware does, by hand
+curl -X POST "https://<worker-host>/v1/device/pair/start" \
+  -H 'content-type: application/json' \
+  -d '{"device_name":"Kitchen board","fw_version":"1.4.0"}'
+# -> {"device_code":"…","user_code":"BCDF-GHJK","verification_uri":"https://…/pair", …}
+
+curl -X POST "https://<worker-host>/v1/device/pair/poll" \
+  -H "Authorization: Bearer <device_code>"
+# -> 400 {"error":"authorization_pending"} until you claim it, then the token
+```
+
+Five properties are load-bearing:
+
+- **The short code authenticates nothing.** It is ~34.5 bits and gets read off
+  a screen; all it does is *name* a pending request. The credential is the
+  256-bit `device_code`, which never leaves the device, is stored hashed, and
+  is sent as a `Bearer` header — a copy in the query string is refused
+  outright rather than accepted, because a query string reaches every access
+  log along the way.
+- **The claiming browser never sees the device token.** Claiming writes
+  ownership and nothing else; the token is minted on the device's next poll
+  and returned only to whoever holds the device code. It is issued exactly
+  once — a replay gets `expired_token`.
+- **Claiming takes a confirm step.** That screen is a security control, not a
+  nicety: RFC 8628 §5.4's attack is talking someone into typing a code from a
+  device they are not holding. The preview names the device — as **untrusted,
+  escaped, length-capped** text, because the name is whatever the device said
+  it was — before anything is bound.
+- **Guessing is budgeted in D1, not in memory.** Attempts are counted per
+  signed-in claimer *and* per IP, **including attempts against codes that do
+  not exist**, since a per-code counter is no defense against spraying the
+  live-code space. A specific code is separately destroyed after five attempts
+  against it, and a pairing request expires in five minutes. Tune the caps
+  with the `PAIR_*_BUDGET_*` variables in `.env.example`; each takes `0` as a
+  kill switch.
+- **A freshly paired device cannot see your location.** Pairing grants
+  `read:departures` and `read:config` only. `read:fix` — the scope that lets a
+  board receive your phone's live position — is never implied by pairing and
+  is granted separately, per device.
 
 ### The location check
 

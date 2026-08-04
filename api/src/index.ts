@@ -3,6 +3,7 @@ import { routeAuth } from "./routes/auth";
 import { routeDepartures } from "./routes/departures";
 import { routeLocate } from "./routes/locate";
 import { routeNearby } from "./routes/nearby";
+import { routePair } from "./routes/pair";
 import { runRetentionPurge } from "./retention";
 
 export { FeedDO } from "./feed_do";
@@ -44,6 +45,20 @@ const LOCATE_RATE_REFILL_PER_SEC = 1;
 const AUTH_RATE_CAPACITY = 10; // burst
 const AUTH_RATE_REFILL_PER_SEC = 0.2;
 
+// Pairing is also a credential-issuing surface, but it deliberately does NOT
+// share the auth bucket: /v1/device/pair/poll is a polling loop (RFC 8628
+// advertises a 5-second `interval`), and the auth bucket's 12/minute would
+// strangle a device that is doing exactly what it was told to do. Sized for
+// that loop instead — 30/minute sustained, 15 burst.
+//
+// The looser bucket is safe because it is not the control that bounds abuse
+// here: /v1/device/pair/start and /v1/pair/claim are bounded by per-IP,
+// per-claimer and global budgets in D1 (R7), which survive isolate recycle and
+// count across the whole deployment. This bucket only keeps one caller from
+// making the Worker do arithmetic all day.
+const PAIR_RATE_CAPACITY = 15; // burst
+const PAIR_RATE_REFILL_PER_SEC = 0.5;
+
 type RateBuckets = Map<string, { tokens: number; lastMs: number }>;
 
 // In-isolate caches: best-effort (reset on isolate recycle), which is the
@@ -52,6 +67,7 @@ const adapterCache = new Map<string, string | null>();
 const rateBuckets: RateBuckets = new Map();
 const locateRateBuckets: RateBuckets = new Map();
 const authRateBuckets: RateBuckets = new Map();
+const pairRateBuckets: RateBuckets = new Map();
 
 export function rateLimited(
   ip: string,
@@ -147,6 +163,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return Response.json({ error: "rate limited" }, { status: 429 });
       }
       return routeAuth(request, env, url, ctx);
+    }
+
+    // RFC 8628 pairing (U5). Two prefixes, one surface: the device half lives
+    // under /v1/device/pair/ and the browser's claim under /v1/pair/, because
+    // the claim is not something a device may ever call.
+    if (url.pathname.startsWith("/v1/device/pair/") || url.pathname.startsWith("/v1/pair/")) {
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (
+        rateLimited(ip, Date.now(), pairRateBuckets, PAIR_RATE_CAPACITY, PAIR_RATE_REFILL_PER_SEC)
+      ) {
+        return Response.json({ error: "rate limited" }, { status: 429 });
+      }
+      return routePair(request, env, url);
     }
 
     if (

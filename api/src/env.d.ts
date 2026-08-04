@@ -71,6 +71,29 @@ declare global {
      */
     AUTH_PUBLIC_ORIGIN?: string;
     /**
+     * Pairing starts one IP may request per UTC day (R7, default 20). Bounds
+     * an unauthenticated INSERT, so `0` disables device pairing outright — it
+     * is a kill switch, not a fall back to the default.
+     */
+    PAIR_START_BUDGET_IP?: string;
+    /**
+     * Pairing starts the whole deployment will accept per UTC day (default
+     * 500). Read before the per-IP counter is written, so this is what stops
+     * an attacker rotating addresses from growing `auth_budgets` without
+     * bound; `0` disables device pairing outright.
+     */
+    PAIR_START_BUDGET_GLOBAL?: string;
+    /**
+     * Claim attempts one signed-in account may make per UTC day (R7, default
+     * 10), counting attempts against codes that do not exist. This is the
+     * anti-spray control; `0` disables claiming.
+     */
+    PAIR_CLAIM_BUDGET_CLAIMER?: string;
+    /** Claim attempts one IP may make per UTC day (default 20; 0 disables claiming). */
+    PAIR_CLAIM_BUDGET_IP?: string;
+    /** Claim attempts deployment-wide per UTC day (default 500; 0 disables claiming). */
+    PAIR_CLAIM_BUDGET_GLOBAL?: string;
+    /**
      * Retention tier one (R20): days after which `locate_log` raw coordinates
      * are nulled and `device_fixes` rows are deleted (default 14). The derived
      * metrics survive to LOCATE_LOG_RETENTION_DAYS.
