@@ -25,7 +25,7 @@
  */
 
 import { SEND_FAILURE_SCOPE, budgetDay } from "./email";
-import { intVar } from "./locate";
+import { intVar } from "./vars";
 import { purgeFixesOlderThan } from "./relay";
 import { PAIR_CLAIM_REFUSED_SCOPE, PAIR_START_REFUSED_SCOPE } from "./routes/pair";
 

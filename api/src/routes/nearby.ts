@@ -7,8 +7,10 @@
  * different fact from empty-but-located systems (200 with empty stops).
  */
 
+import { resolveCredential } from "../auth";
 import { readWifiScanBody, resolveLocation } from "../locate";
 import { type FeedInfo, MODES, composeNearby } from "../nearby";
+import type { FixQuality } from "../relay";
 
 export async function routeNearby(
   request: Request,
@@ -19,6 +21,16 @@ export async function routeNearby(
   let lat: number;
   let lon: number;
   let accuracy: number | null = null;
+  /**
+   * Only a relayed phone fix carries these (R13). They are appended after
+   * `accuracy` and only when present, so a GET, an anonymous POST, or any
+   * WiFi-resolved POST serializes byte-identically to the shipped contract
+   * (R10/AE9). Surfacing them is not optional decoration: this endpoint sorts
+   * stops and computes walk times from the position, and a last-known fix shown
+   * without its age is exactly the silently-stale number the staleness contract
+   * forbids.
+   */
+  let relayed: { provider: string; captured_at?: number; quality: FixQuality } | null = null;
 
   if (request.method === "GET") {
     const latRaw = url.searchParams.get("lat");
@@ -32,7 +44,16 @@ export async function routeNearby(
   } else if (request.method === "POST") {
     const parsed = await readWifiScanBody(request);
     if (parsed instanceof Response) return parsed;
-    const located = await resolveLocation(parsed.wifiAccessPoints, env);
+    // Same seam, same credential, same resolution as /v1/locate — a device must
+    // never get a phone position from one endpoint and a WiFi one from the
+    // other in the same minute, with this endpoint's distance sort and walk
+    // heuristic running on the worse of the two.
+    const credential = await resolveCredential(request, env);
+    const located = await resolveLocation({
+      bssids: parsed.wifiAccessPoints,
+      env,
+      credential,
+    });
     if (!located.known) {
       // The device's designed "can't find you" state — not an empty board.
       return Response.json({ error: "location unknown" }, { status: 422 });
@@ -40,6 +61,13 @@ export async function routeNearby(
     lat = located.lat;
     lon = located.lon;
     accuracy = located.accuracy;
+    if (located.quality !== undefined) {
+      relayed = {
+        provider: located.provider,
+        captured_at: located.captured_at,
+        quality: located.quality,
+      };
+    }
   } else {
     return Response.json({ error: "not found" }, { status: 404 });
   }
@@ -50,7 +78,7 @@ export async function routeNearby(
   }
   const feeds = await loadFeedInfo(env, curatedFeeds);
   const body = await composeNearby(env, feeds, { lat, lon, modes });
-  return Response.json({ location: { lat, lon, accuracy }, ...body });
+  return Response.json({ location: { lat, lon, accuracy, ...(relayed ?? {}) }, ...body });
 }
 
 /** Shared with routes/departures.ts's origin validation. */

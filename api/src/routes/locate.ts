@@ -9,6 +9,7 @@
  * cap so a rotating device_id cannot grow locate_log unbounded.
  */
 
+import { resolveCredential } from "../auth";
 import { haversineM, readWifiScanBody, resolveLocation } from "../locate";
 
 const DAILY_LOG_CAP = 500;
@@ -64,7 +65,13 @@ async function handleLocate(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  const result = await resolveLocation(wifiAccessPoints, env);
+  // `resolveCredential` rather than `authorize`: this route is anonymous-capable
+  // (R10) and must stay byte-identical for a board that presents nothing, and a
+  // device that has *not* been granted `read:fix` must still get a WiFi answer
+  // rather than a 403 — the grant enables a provider, it does not gate the
+  // route. An anonymous multi-user request resolves to null without a query.
+  const credential = await resolveCredential(request, env);
+  const result = await resolveLocation({ bssids: wifiAccessPoints, env, credential });
 
   if (wantsLog && deviceId) {
     const label = typeof body.label === "string" ? body.label : null;

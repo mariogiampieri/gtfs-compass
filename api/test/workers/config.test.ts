@@ -11,6 +11,8 @@ import {
 } from "../../src/auth";
 import { clearFix } from "../../src/relay";
 import { routeConfig } from "../../src/routes/config";
+import { routeLocate } from "../../src/routes/locate";
+import { routeNearby } from "../../src/routes/nearby";
 import { DEFAULT_DEVICE_SCOPES, normalizeUserCode, routePair } from "../../src/routes/pair";
 import { resetSchema } from "./schema";
 
@@ -24,9 +26,12 @@ import { resetSchema } from "./schema";
  *
  * The device-side assertions go through `authorize()` — the same chokepoint
  * every device request goes through — because that is where a scope grant or a
- * revocation actually takes effect. No route names a scope yet (U8/U13 are the
- * first that will), so asserting against a route would be asserting against
- * nothing.
+ * revocation actually takes effect. No route names a scope to `authorize()`
+ * yet (U13 will be the first): `read:fix` is read *inside* the locate chain,
+ * since a board that lacks the grant must still get a WiFi answer rather than a
+ * 403. AE6d's read-side half is therefore asserted against the real
+ * `/v1/locate` and `/v1/nearby` handlers below, and everything else here
+ * against the chokepoint.
  */
 
 const ORIGIN = "https://api.example";
@@ -182,6 +187,22 @@ async function seedFix(deviceId: string): Promise<void> {
   )
     .bind(deviceId, 40.6923, -73.9873, 8, now)
     .run();
+}
+
+/** What this board's own `/v1/locate` makes of its credential right now. */
+async function locateAs(token: string): Promise<Record<string, unknown>> {
+  const body = { wifiAccessPoints: [] };
+  const request = req("/v1/locate", { method: "POST", bearer: token, body });
+  const res = await routeLocate(request, e(), new URL(request.url));
+  expect(res.status).toBe(200);
+  return res.json<Record<string, unknown>>();
+}
+
+/** The same question at the other endpoint that shares the locate seam. */
+function nearbyAs(token: string): Promise<Response> {
+  const body = { wifiAccessPoints: [] };
+  const request = req("/v1/nearby", { method: "POST", bearer: token, body });
+  return routeNearby(request, e(), new URL(request.url), new Set());
 }
 
 async function fixCount(deviceId: string): Promise<number> {
@@ -657,15 +678,38 @@ describe("revoking read:fix clears the position already delivered", () => {
   });
 
   /**
-   * AE6d's read-side half, and it is **not implemented here**: "the device's
-   * next /v1/locate and /v1/nearby resolve without the phone provider" needs a
-   * phone provider in the chain, which is U8 (`locate.ts` today resolves WiFi →
-   * unknown and has no per-credential context at all). Writing a passing test
-   * for it now would mean asserting that a provider which does not exist did
-   * not run — vacuously green, and green again on the day U8 wires it in
-   * wrongly. Tracked in beads as the U8 acceptance for AE6d.
+   * AE6d's read-side half (U8). The stored-state half above proves the row is
+   * deleted; this proves the *chain* refuses to read one, which is the control
+   * that survives a fix written between the revocation and the delete — or by a
+   * fan-out that raced it. Both endpoints, because both go through the same
+   * seam and a device must not be able to pick the one that still answers.
+   *
+   * The scan is deliberately empty: with no access points there is nothing
+   * below the phone provider, so `{known: false}` can only mean the relay was
+   * not consulted, and no outbound geolocation call is involved either way.
    */
-  it.todo("AE6d read side: the locate chain skips the phone provider once the grant is gone (U8)");
+  it("AE6d read side: the chain skips the phone provider once the grant is gone", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId, token } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    expect(await locateAs(token)).toMatchObject({ known: true, provider: "phone" });
+    const granted = await nearbyAs(token);
+    expect(granted.status).toBe(200);
+    expect((await granted.json<{ location: { provider?: string } }>()).location.provider).toBe(
+      "phone",
+    );
+
+    await grant(cookie, deviceId, "read:fix", false);
+    // The row a fan-out racing the revocation could have written back, or that
+    // a half-completed clear left behind. The read side must not care.
+    await seedFix(deviceId);
+
+    expect(await locateAs(token)).toEqual({ known: false });
+    expect((await nearbyAs(token)).status).toBe(422);
+    expect(await fixCount(deviceId)).toBe(1); // still there, still never read
+  });
 });
 
 /* -------------------------------------------------------------------------- */

@@ -225,6 +225,34 @@ curl -X POST "https://<worker-host>/v1/locate" -H 'content-type: application/jso
   -d '{"wifiAccessPoints": [{"macAddress": "aa:bb:cc:dd:ee:ff", "signalStrength": -60}, ...]}'
 ```
 
+It answers `{"known": true, "lat": …, "lon": …, "accuracy": …, "provider": …}`
+or `{"known": false}` — never a position the API cannot vouch for. Providers
+are tried in order and each answer is checked against `LOCATE_MAX_ACCURACY_M`
+on its own: a fix too coarse to trust is *skipped* and the next provider is
+consulted, not turned into a failure.
+
+A board that sends its device token and holds the `read:fix` grant is resolved
+from the phone position its owner last relayed **before** WiFi is consulted,
+and that answer carries two extra fields:
+
+```json
+{"known": true, "lat": 40.6923, "lon": -73.9873, "accuracy": 12,
+ "provider": "phone", "captured_at": 1785000000, "quality": "current"}
+```
+
+`captured_at` is when the *phone* fixed the position (epoch seconds, not when
+the Worker heard about it) and `quality` is `"current"` inside a 120-second
+horizon, `"last_known"` past it. A last-known fix is a distinct state, not a
+position with an old timestamp: the chain prefers anything a live provider can
+resolve and returns it only when nothing else does, labelled so the device
+renders "via phone, 3 min ago" instead of a silently stale number. Anonymous
+requests, boards that were never granted `read:fix`, and boards whose grant was
+revoked get exactly the WiFi response above — the grant governs the read as
+well as the relay, so a revocation takes effect on the board's very next call.
+`/v1/nearby` resolves through the same chain and echoes the same fields in its
+`location` object; both fields are absent whenever the position did not come
+from a phone.
+
 `POST /v1/locate/ref` and `GET /v1/locate/log` support the accuracy walk
 described in the spec. They — and `log: true` on `/v1/locate` — require the
 `DIAG_TOKEN` secret as a Bearer header (query-param tokens are rejected):
@@ -250,7 +278,10 @@ Submitted BSSIDs (WiFi MAC addresses) are **forwarded to
 service, to resolve a position — that is their only use. This project never
 stores BSSIDs: only a one-way hash of the scanned set lives in a 10-minute
 in-memory cache, and only a *count* of access points appears in diagnostic
-rows. Operator-initiated diagnostic logging (`log: true`, `DIAG_TOKEN`
+rows. That cache is keyed on the access points alone, so two boards in one
+household share its entries — which is why nothing derived from a credential
+is ever stored in it, and why a relayed phone position (looked up per device)
+sits above it rather than inside it. Operator-initiated diagnostic logging (`log: true`, `DIAG_TOKEN`
 required) stores the resolved position estimate; those rows are aged out on
 a schedule — see [Data retention](#data-retention). BeaconDB is explicitly
 experimental (no SLA) — an unavailable provider degrades to

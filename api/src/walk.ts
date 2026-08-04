@@ -16,7 +16,7 @@
  * above the request-param manual without changing this interface.
  */
 
-import { DEFAULT_MAX_ACCURACY_M, intVar } from "./locate";
+import { DEFAULT_MAX_ACCURACY_M, maxAccuracyM } from "./locate";
 import { haversineM } from "./stops";
 
 export { DEFAULT_MAX_ACCURACY_M } from "./locate";
@@ -59,9 +59,13 @@ export function entryBufferS(routeTypes: number[]): number {
   return routeTypes.some((t) => RAIL_ROUTE_TYPES.has(t)) ? RAIL_ENTRY_BUFFER_S : 0;
 }
 
-/** The locate chain's accuracy gate value, reused for the walk heuristic. */
+/**
+ * The locate chain's accuracy gate value, reused for the walk heuristic —
+ * delegated rather than re-read, so the origin test and the provider gate can
+ * never drift onto different env vars or different defaults.
+ */
 export function walkMaxAccuracyM(env: Env): number {
-  return intVar(env.LOCATE_MAX_ACCURACY_M, DEFAULT_MAX_ACCURACY_M);
+  return maxAccuracyM(env);
 }
 
 /**

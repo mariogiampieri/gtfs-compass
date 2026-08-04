@@ -4,7 +4,41 @@
  * The device never calls a geolocation provider directly: providers stay
  * swappable without reflashing, and the accuracy gate lives in exactly one
  * place (constraint #5: coarse location is gated, never trusted silently).
+ *
+ * **Two layers, deliberately** (Phase 5 plan, U8; R12, R13, R15):
+ *
+ *   `resolveFromWifi(bssids, env)`  the WiFi sub-chain — normalization, the
+ *                                   10-minute BSSID-hash cache, negative
+ *                                   caching — returning an **ungated** fix.
+ *   `resolveLocation(ctx)`          the ordered composer: phone → wifi →
+ *                                   unknown, gating **each** outcome as it
+ *                                   comes back and continuing on rejection.
+ *
+ * The split is what makes a per-device provider expressible at all. Three
+ * properties depend on the layering rather than on anyone remembering them:
+ *
+ *  1. **The gate runs inside the loop, per candidate, and rejection continues**
+ *     (R12). A 900 m phone fix is skipped *and BeaconDB is then consulted*
+ *     (AE7); the old shape broke out of the loop on the first fix and gated
+ *     afterwards, which would have turned a coarse phone fix into `{known:
+ *     false}` with the rest of the chain never run.
+ *  2. **Nothing per-device may be cached above the BSSID-hash cache** (R15).
+ *     That cache is keyed on the access points alone, so two boards in one
+ *     household share its entries by construction — which is fine for a WiFi
+ *     answer and would be a cross-device position leak for a phone one (AE8).
+ *     The composer therefore caches nothing; only the WiFi layer does.
+ *  3. **The empty-BSSID short circuit belongs to the WiFi layer**, not to the
+ *     chain. A board that skipped its radio scan still has a phone provider to
+ *     consult; returning `{known: false}` before the loop made that
+ *     unreachable.
+ *
+ * The 10-minute cache now stores *ungated* positions, so a cache hit is still
+ * gated by the composer — the gate is above the cache, not below it.
  */
+
+import { type Credential, hasScope } from "./auth";
+import { intVar } from "./vars";
+import { type FixQuality, QUALITY_LAST_KNOWN, getFix } from "./relay";
 
 /** A submitted access point, Ichnaea-style (BeaconDB accepts it unchanged). */
 export interface WifiAccessPoint {
@@ -31,8 +65,42 @@ export type LocateProvider = (
   env: Env,
 ) => Promise<ProviderOutcome>;
 
+/**
+ * What one source in the ordered chain produced, **before the gate**.
+ *
+ * `accuracy` is nullable because a relayed fix may carry none (the phone's
+ * source could not state one) and "unknown accuracy" must be a gate decision
+ * in the one place gate decisions are made, not a shape a source silently
+ * drops on the floor.
+ */
+interface LocateCandidate {
+  lat: number;
+  lon: number;
+  accuracy: number | null;
+  provider: string;
+  /** Relayed fixes only: when the *phone* fixed the position (R13). */
+  capturedAt?: number;
+  /** Relayed fixes only: `current` inside the 120 s horizon, else `last_known`. */
+  quality?: FixQuality;
+}
+
+/**
+ * The wire shape. `captured_at` and `quality` are present **only** for a
+ * relayed phone fix (R13): a WiFi fix has no capture time of its own to report
+ * and is current by construction, and AE9 requires that a chain resolving
+ * without the relay produce byte-identical JSON to the shipped contract. The
+ * device therefore reads "absent `quality`" as "a position, now".
+ */
 export type ResolvedLocation =
-  | { known: true; lat: number; lon: number; accuracy: number; provider: string }
+  | {
+      known: true;
+      lat: number;
+      lon: number;
+      accuracy: number;
+      provider: string;
+      captured_at?: number;
+      quality?: FixQuality;
+    }
   | { known: false };
 
 const BEACONDB_URL = "https://api.beacondb.net/v1/geolocate";
@@ -45,11 +113,6 @@ export const MAX_BSSIDS = 50;
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
-/** Positive-integer env var with fallback (shared with walk.ts's gate). */
-export function intVar(raw: string | undefined, fallback: number): number {
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
 
 /**
  * BeaconDB — free, no key, experimental (no SLA). `considerIp: false` +
@@ -114,12 +177,15 @@ const providers: LocateProvider[] = [
 ];
 
 /**
- * Run the chain: first provider fix wins, then the accuracy gate is applied
- * AFTER the providers (the gate lives in the chain, not in any provider).
- * `definitive` is false only when a transient provider failure means the
- * negative says nothing about this BSSID set.
+ * Run the WiFi providers: first fix wins, **ungated**. `definitive` is false
+ * only when a transient provider failure means the negative says nothing about
+ * this BSSID set.
+ *
+ * The gate deliberately does not live here (R12). It is applied by the composer
+ * to every candidate from every source, which is what lets a rejected fix fall
+ * through to the next provider instead of ending resolution.
  */
-async function runChain(
+async function runWifiChain(
   bssids: WifiAccessPoint[],
   env: Env,
 ): Promise<{ fix: LocateFix | null; definitive: boolean }> {
@@ -135,12 +201,34 @@ async function runChain(
     fix = outcome;
     break;
   }
-  if (!fix) return { fix: null, definitive: !sawTransient };
-  const maxAccuracy = intVar(env.LOCATE_MAX_ACCURACY_M, DEFAULT_MAX_ACCURACY_M);
-  if (fix.accuracy > maxAccuracy) {
-    return { fix: null, definitive: true }; // never pass a too-coarse fix through
-  }
-  return { fix, definitive: true };
+  return { fix, definitive: fix !== null || !sawTransient };
+}
+
+/* -------------------------------------------------------------------------- */
+/* The accuracy gate — one implementation, one env var (constraint #5, R12)    */
+/* -------------------------------------------------------------------------- */
+
+/** The configured gate value. `walk.ts` reads the same one for its origin test. */
+export function maxAccuracyM(env: Env): number {
+  return intVar(env.LOCATE_MAX_ACCURACY_M, DEFAULT_MAX_ACCURACY_M);
+}
+
+/**
+ * **The** accuracy gate. Every provider outcome in the chain passes through
+ * this and nothing else, so "coarse location is gated, never trusted silently"
+ * has exactly one implementation and exactly one env var behind it.
+ *
+ * An accuracy the source could not state fails closed: a position that cannot
+ * show it is inside the gate is not shown to be inside the gate. It falls
+ * through to the next provider like any other rejection, so the cost of failing
+ * closed is a WiFi lookup, not a `{known: false}`.
+ */
+export function withinAccuracyGate(
+  accuracy: number | null | undefined,
+  env: Env,
+): accuracy is number {
+  if (typeof accuracy !== "number" || !Number.isFinite(accuracy)) return false;
+  return accuracy <= maxAccuracyM(env);
 }
 
 /** Lowercase, drop malformed entries, dedupe by MAC (first observation wins). */
@@ -170,17 +258,32 @@ async function cacheKey(macs: string[]): Promise<string> {
 }
 
 // In-isolate, best-effort (reset on isolate recycle) — same posture as the
-// router's caches. Values are resolved outcomes; raw BSSIDs are never stored.
-const locateCache = new Map<string, { expiresMs: number; value: ResolvedLocation }>();
+// router's caches. Values are **ungated** WiFi outcomes; raw BSSIDs are never
+// stored, and neither is anything derived from a credential (R15).
+const locateCache = new Map<string, { expiresMs: number; value: LocateFix | null }>();
 
 /**
- * Resolve a submitted BSSID set to a gated position, or `{known: false}`.
+ * The WiFi sub-chain: normalize → 10-minute BSSID-hash cache → ordered
+ * providers, returning an **ungated** fix or `null`.
+ *
  * Route handlers 400 oversized arrays before calling this; the slice here is
  * defense in depth so no oversized set ever reaches a provider.
+ *
+ * **This cache is device-agnostic and must stay that way** (R15). Its key is a
+ * hash of the sorted MAC set and nothing else, so two boards in one household
+ * that see the same access points share entries — correct for an answer derived
+ * from those access points, and a cross-device leak for an answer derived from
+ * a credential. That is the whole reason the phone provider sits *above* this
+ * function rather than inside it.
+ *
+ * An empty or entirely malformed set short-circuits **here**, without a
+ * provider call and without a cache entry. It used to short-circuit the whole
+ * chain, which made a phone fix unreachable for any board that skipped its
+ * radio scan.
  */
-export async function resolveLocation(bssids: unknown[], env: Env): Promise<ResolvedLocation> {
+export async function resolveFromWifi(bssids: unknown[], env: Env): Promise<LocateFix | null> {
   const normalized = normalizeBssids(bssids).slice(0, MAX_BSSIDS);
-  if (normalized.length === 0) return { known: false };
+  if (normalized.length === 0) return null;
 
   const key = await cacheKey(normalized.map((ap) => ap.macAddress));
   const now = Date.now();
@@ -191,18 +294,127 @@ export async function resolveLocation(bssids: unknown[], env: Env): Promise<Reso
   }
   console.log("[locate-cache] miss");
 
-  const { fix, definitive } = await runChain(normalized, env);
-  const value: ResolvedLocation = fix
-    ? { known: true, lat: fix.lat, lon: fix.lon, accuracy: fix.accuracy, provider: fix.provider }
-    : { known: false };
+  const { fix, definitive } = await runWifiChain(normalized, env);
 
-  // A provider outage must not pin {known:false} for the TTL — the next scan
+  // A provider outage must not pin a negative for the TTL — the next scan
   // should retry the chain the moment the provider recovers.
-  if (fix || definitive) {
+  if (definitive) {
     if (locateCache.size > 5000) locateCache.clear(); // crude bound, mirrors rateBuckets
-    locateCache.set(key, { expiresMs: now + CACHE_TTL_MS, value });
+    locateCache.set(key, { expiresMs: now + CACHE_TTL_MS, value: fix });
   }
-  return value;
+  return fix;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The ordered chain: phone → wifi → unknown                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What the chain needs to resolve one request. `credential` is optional and
+ * `null` is a normal value: `/v1/locate` and `/v1/nearby` are anonymous-capable
+ * (R10), and an anonymous request simply has no phone provider to consult.
+ */
+export interface LocateContext {
+  /** Raw request-supplied access points; normalized by the WiFi sub-chain. */
+  bssids: unknown[];
+  env: Env;
+  credential?: Credential | null;
+}
+
+type LocateSource = (ctx: LocateContext) => Promise<LocateCandidate | null>;
+
+/**
+ * The relay (R12, R13). **Device credentials only, and only while the
+ * credential currently carries `read:fix`** (R9, AE6d).
+ *
+ * The grant governs the read, not just the fan-out. `clearFix` already deletes
+ * the delivered row on revocation, but that closes only the stored-state half:
+ * a fix written between the revocation and the delete, or by a fan-out that
+ * raced it, would otherwise keep being served to a board whose owner was told
+ * the grant was off. Testing the *live* scopes on the credential the board just
+ * presented is what makes revocation effective on the very next call.
+ *
+ * A session is not a source of device position: `hasScope` answers true for
+ * sessions by design (a session is the account, not a delegation), so the
+ * `kind` test is what keeps this device-only — and it is also simply required,
+ * since there is no device id on a session to look a fix up by. The device id
+ * comes from the credential and never from the request body: `/v1/locate`'s
+ * `device_id` field is a diagnostic label anyone may send, and reading a fix by
+ * it would let any caller name any board.
+ */
+const phoneSource: LocateSource = async (ctx) => {
+  const credential = ctx.credential;
+  if (!credential || credential.kind !== "device") return null;
+  if (!hasScope(credential, "read:fix")) return null;
+
+  const stored = await getFix(ctx.env, credential.deviceId);
+  if (!stored) return null;
+  return {
+    lat: stored.lat,
+    lon: stored.lon,
+    accuracy: stored.accuracyM,
+    provider: "phone",
+    capturedAt: stored.capturedAt,
+    quality: stored.quality,
+  };
+};
+
+const wifiSource: LocateSource = async (ctx) => await resolveFromWifi(ctx.bssids, ctx.env);
+
+/**
+ * Ordered sources. Self-hosters get WiFi + `{known: false}` and that must work
+ * fine; a deployment with no phone posting anything gets exactly today's chain.
+ */
+const sources: LocateSource[] = [phoneSource, wifiSource];
+
+/**
+ * Resolve a request to a gated position, or `{known: false}`.
+ *
+ * The loop is the whole point: every candidate is gated as it arrives and a
+ * rejection **continues to the next source** rather than ending resolution
+ * (R12/AE7). Nothing here is cached — see `resolveFromWifi`.
+ *
+ * A last-known fix (past the relay's 120 s horizon) is held rather than
+ * returned: it is still a real place the user was, but anything a *live*
+ * provider can resolve outranks it, so it surfaces only when the rest of the
+ * chain comes back empty (R13). It carries its `captured_at` and its
+ * `quality` so the device renders an age instead of a silent stale number.
+ */
+export async function resolveLocation(ctx: LocateContext): Promise<ResolvedLocation> {
+  let lastKnown: ResolvedLocation | null = null;
+
+  for (const source of sources) {
+    const candidate = await source(ctx);
+    if (!candidate) continue;
+    const accuracy = candidate.accuracy;
+    if (!withinAccuracyGate(accuracy, ctx.env)) continue; // reject and keep going
+    const resolved = toResolved(candidate, accuracy);
+    if (candidate.quality === QUALITY_LAST_KNOWN) {
+      lastKnown ??= resolved;
+      continue;
+    }
+    return resolved;
+  }
+
+  return lastKnown ?? { known: false };
+}
+
+/**
+ * Key order is the wire contract: `known, lat, lon, accuracy, provider` is what
+ * shipped, and the two relay fields are appended after it and only when the
+ * candidate has them (AE9).
+ */
+function toResolved(candidate: LocateCandidate, accuracy: number): ResolvedLocation {
+  return {
+    known: true,
+    lat: candidate.lat,
+    lon: candidate.lon,
+    accuracy,
+    provider: candidate.provider,
+    ...(candidate.quality !== undefined
+      ? { captured_at: candidate.capturedAt, quality: candidate.quality }
+      : {}),
+  };
 }
 
 /**

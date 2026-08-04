@@ -1,7 +1,8 @@
 import { SELF, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { haversineM, resolveLocation } from "../../src/locate";
+import { type Credential, DEVICE_TOKEN_PREFIX, hashToken, parseScopes } from "../../src/auth";
+import { haversineM, resolveFromWifi, resolveLocation } from "../../src/locate";
 import { resetSchema } from "./schema";
 
 const BEACON_URL = "https://api.beacondb.net/v1/geolocate";
@@ -105,7 +106,7 @@ afterEach(() => {
 describe("provider chain", () => {
   it("BeaconDB 200 within the gate passes through with the provider name", async () => {
     beaconOk(40.6931, -73.9871, 42);
-    const result = await resolveLocation(uniqueAps(), env);
+    const result = await resolveLocation({ bssids: uniqueAps(), env });
     expect(result).toEqual({
       known: true,
       lat: 40.6931,
@@ -117,7 +118,7 @@ describe("provider chain", () => {
 
   it("sends the mandatory headers and the ipf-suppressing body", async () => {
     beaconOk(40, -73, 30);
-    await resolveLocation(
+    await resolveFromWifi(
       [
         { macAddress: "AA:BB:CC:DD:EE:F0", signalStrength: -40 },
         { macAddress: "aa:bb:cc:dd:ee:f1", signalStrength: -60 },
@@ -141,43 +142,43 @@ describe("provider chain", () => {
 
   it("accuracy beyond the default 500 m gate is never passed through", async () => {
     beaconOk(40, -73, 25_000); // cell/IP-grade fix
-    expect(await resolveLocation(uniqueAps(), env)).toEqual({ known: false });
+    expect(await resolveLocation({ bssids: uniqueAps(), env })).toEqual({ known: false });
   });
 
   it("respects a LOCATE_MAX_ACCURACY_M env override", async () => {
     beaconOk(40, -73, 300);
-    const tight = await resolveLocation(uniqueAps(), {
-      ...env,
-      LOCATE_MAX_ACCURACY_M: "100",
-    } as Env);
+    const tight = await resolveLocation({
+      bssids: uniqueAps(),
+      env: { ...env, LOCATE_MAX_ACCURACY_M: "100" } as Env,
+    });
     expect(tight).toEqual({ known: false });
 
     beaconOk(40, -73, 300);
-    const loose = await resolveLocation(uniqueAps(), env); // default 500
+    const loose = await resolveLocation({ bssids: uniqueAps(), env }); // default 500
     expect(loose).toMatchObject({ known: true, accuracy: 300 });
   });
 
   it("404 notFound → {known:false}", async () => {
     beaconNotFound();
-    expect(await resolveLocation(uniqueAps(), env)).toEqual({ known: false });
+    expect(await resolveLocation({ bssids: uniqueAps(), env })).toEqual({ known: false });
   });
 
   it("non-200 → {known:false}", async () => {
     beaconHandler = () => new Response("upstream sad", { status: 500 });
-    expect(await resolveLocation(uniqueAps(), env)).toEqual({ known: false });
+    expect(await resolveLocation({ bssids: uniqueAps(), env })).toEqual({ known: false });
   });
 
   it("a fallback-marked body is treated as unknown, never a position", async () => {
     beaconHandler = () =>
       Response.json({ location: { lat: 40, lng: -73 }, accuracy: 50, fallback: "ipf" });
-    expect(await resolveLocation(uniqueAps(), env)).toEqual({ known: false });
+    expect(await resolveLocation({ bssids: uniqueAps(), env })).toEqual({ known: false });
   });
 
   it("network error → {known:false}, never a throw to the caller", async () => {
     beaconHandler = () => {
       throw new TypeError("connection refused");
     };
-    await expect(resolveLocation(uniqueAps(), env)).resolves.toEqual({ known: false });
+    await expect(resolveLocation({ bssids: uniqueAps(), env })).resolves.toEqual({ known: false });
   });
 
   it("a hung provider is aborted at LOCATE_TIMEOUT_MS and the caller unblocked", async () => {
@@ -189,14 +190,21 @@ describe("provider chain", () => {
         );
       });
     const t0 = Date.now();
-    const result = await resolveLocation(uniqueAps(), { ...env, LOCATE_TIMEOUT_MS: "50" } as Env);
+    const result = await resolveLocation({
+      bssids: uniqueAps(),
+      env: { ...env, LOCATE_TIMEOUT_MS: "50" } as Env,
+    });
     expect(result).toEqual({ known: false });
     expect(Date.now() - t0).toBeLessThan(1500); // unblocked well inside the device budget
   });
 
   it("empty/malformed BSSID list resolves {known:false} without a provider call", async () => {
-    expect(await resolveLocation([], env)).toEqual({ known: false });
-    expect(await resolveLocation([{ notAMac: true }], env)).toEqual({ known: false });
+    expect(await resolveLocation({ bssids: [], env })).toEqual({ known: false });
+    expect(await resolveLocation({ bssids: [{ notAMac: true }], env })).toEqual({ known: false });
+    expect(beaconCalls).toBe(0);
+    // The short circuit lives in the WiFi sub-chain, not in the chain: a board
+    // that skipped its radio scan still has a phone provider above this.
+    expect(await resolveFromWifi([], env)).toBeNull();
     expect(beaconCalls).toBe(0);
   });
 });
@@ -207,22 +215,22 @@ describe("locate cache", () => {
     const aps = uniqueAps(3);
     beaconOk(40.1, -73.1, 60);
 
-    const first = await resolveLocation(aps, env);
-    expect(first).toMatchObject({ known: true, lat: 40.1 });
+    const first = await resolveFromWifi(aps, env);
+    expect(first).toMatchObject({ lat: 40.1, accuracy: 60, provider: "beacondb" });
     expect(beaconCalls).toBe(1);
     expect(spy.mock.calls.flat()).toContain("[locate-cache] miss");
 
     const reordered = [...aps]
       .reverse()
       .map((ap) => ({ ...ap, macAddress: ap.macAddress.toUpperCase() }));
-    const second = await resolveLocation(reordered, env);
+    const second = await resolveFromWifi(reordered, env);
     expect(second).toEqual(first);
     expect(beaconCalls).toBe(1); // served from cache, no second provider call
     expect(spy.mock.calls.flat()).toContain("[locate-cache] hit");
 
     beaconOk(41.2, -72.2, 70);
-    const other = await resolveLocation(uniqueAps(3), env);
-    expect(other).toMatchObject({ known: true, lat: 41.2 });
+    const other = await resolveFromWifi(uniqueAps(3), env);
+    expect(other).toMatchObject({ lat: 41.2 });
     expect(beaconCalls).toBe(2); // different set → miss → fresh lookup
     expect(spy.mock.calls.flat().filter((m) => m === "[locate-cache] miss")).toHaveLength(2);
   });
@@ -497,34 +505,339 @@ describe("negative caching (transient vs definitive)", () => {
   it("does not cache a transient provider failure as {known:false}", async () => {
     const aps = uniqueAps();
     beaconHandler = () => new Response("", { status: 500 });
-    expect(await resolveLocation(aps, env)).toEqual({ known: false });
+    expect(await resolveFromWifi(aps, env)).toBeNull();
 
     // Provider recovers: the SAME set must re-consult the chain immediately.
     const callsBefore = beaconCalls;
     beaconOk(40.6923, -73.9873, 40);
-    const second = await resolveLocation(aps, env);
+    const second = await resolveFromWifi(aps, env);
     expect(beaconCalls).toBe(callsBefore + 1);
-    expect(second.known).toBe(true);
+    expect(second).toMatchObject({ lat: 40.6923 });
   });
 
   it("caches the authoritative notFound negative for the TTL", async () => {
     const aps = uniqueAps();
     beaconNotFound();
-    expect(await resolveLocation(aps, env)).toEqual({ known: false });
+    expect(await resolveFromWifi(aps, env)).toBeNull();
 
     const callsBefore = beaconCalls;
-    expect(await resolveLocation(aps, env)).toEqual({ known: false });
+    expect(await resolveFromWifi(aps, env)).toBeNull();
     expect(beaconCalls).toBe(callsBefore); // served from cache, no provider call
   });
 
   it("drops oversized macAddress strings during normalization", async () => {
     const aps = [{ macAddress: "aa".repeat(100) }, ...uniqueAps()];
     beaconOk(40.6923, -73.9873, 40);
-    const result = await resolveLocation(aps, env);
-    expect(result.known).toBe(true);
+    const result = await resolveFromWifi(aps, env);
+    expect(result).toMatchObject({ lat: 40.6923 });
     const sent = JSON.parse(String(lastBeaconInit?.body)) as {
       wifiAccessPoints: unknown[];
     };
     expect(sent.wifiAccessPoints).toHaveLength(2); // junk entry never forwarded
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The phone provider (U8; R9, R12, R13, R15; AE6d, AE7, AE8, AE9)             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Devices are seeded with SQL here rather than driven through the pairing
+ * routes. What is under test is the *chain's* behavior given a credential, and
+ * half these cases need a shape pairing will not produce on demand — a board
+ * whose grant was never given, a fix belonging to a second account, a stored
+ * position with no accuracy at all. `config.test.ts` owns the end-to-end
+ * pairing-and-revocation path and drives the real routes for it (AE6d).
+ */
+let deviceSeq = 0;
+
+async function seedUser(userId: string): Promise<void> {
+  await env.DB.prepare("INSERT OR IGNORE INTO users (id, email, created_at) VALUES (?1, ?2, ?3)")
+    .bind(userId, `${userId}@example.test`, nowSec())
+    .run();
+}
+
+async function seedDevice(
+  opts: { userId?: string; scopes?: string } = {},
+): Promise<{ deviceId: string; token: string; credential: Credential }> {
+  deviceSeq++;
+  const userId = opts.userId ?? "usr_owner";
+  await seedUser(userId);
+  const deviceId = `dev_${deviceSeq}`;
+  const token = `${DEVICE_TOKEN_PREFIX}test${deviceSeq}`;
+  const scopes = opts.scopes ?? "read:departures,read:config,read:fix";
+  await env.DB.prepare(
+    `INSERT INTO devices (id, user_id, token_hash, name, paired_at, scopes)
+     VALUES (?1, ?2, ?3, 'Board', ?4, ?5)`,
+  )
+    .bind(deviceId, userId, await hashToken(token), nowSec(), scopes)
+    .run();
+  return {
+    deviceId,
+    token,
+    credential: { kind: "device", deviceId, userId, scopes: parseScopes(scopes) },
+  };
+}
+
+/** `POST /v1/locate` as this board (or as nobody), parsed. */
+async function locateJson(aps: unknown[], token?: string): Promise<Record<string, unknown>> {
+  const res = await post("/v1/locate", { wifiAccessPoints: aps }, token ? { token } : {});
+  expect(res.status).toBe(200);
+  return res.json<Record<string, unknown>>();
+}
+
+/** The row a phone's fan-out would have written for this board. */
+async function seedFix(
+  deviceId: string,
+  fix: { lat?: number; lon?: number; accuracyM?: number | null; ageS?: number } = {},
+): Promise<{ lat: number; lon: number; capturedAt: number }> {
+  const lat = fix.lat ?? 40.7052;
+  const lon = fix.lon ?? -74.0136;
+  const capturedAt = nowSec() - (fix.ageS ?? 20);
+  await env.DB.prepare(
+    `INSERT INTO device_fixes (device_id, lat, lon, accuracy_m, captured_at, received_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?5)`,
+  )
+    .bind(deviceId, lat, lon, fix.accuracyM === undefined ? 12 : fix.accuracyM, capturedAt)
+    .run();
+  return { lat, lon, capturedAt };
+}
+
+describe("the phone provider", () => {
+  it("a fresh accurate fix wins, carrying its provider, capture time and quality", async () => {
+    const { deviceId, token } = await seedDevice();
+    const posted = await seedFix(deviceId, { ageS: 20, accuracyM: 12 });
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      known: true,
+      lat: posted.lat,
+      lon: posted.lon,
+      accuracy: 12,
+      provider: "phone",
+      captured_at: posted.capturedAt,
+      quality: "current",
+    });
+    // The chain stopped at the first accepted candidate — no upstream call.
+    expect(beaconCalls).toBe(0);
+  });
+
+  it("AE7: a 900 m fix is skipped AND BeaconDB is consulted", async () => {
+    const { deviceId, token } = await seedDevice();
+    await seedFix(deviceId, { ageS: 10, accuracyM: 900 });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    // Not `{known:false}`: the gated fix falls *through*, it does not end the
+    // chain. This is the assertion the pre-split control flow would fail.
+    expect(await res.json()).toEqual({
+      known: true,
+      lat: 40.6931,
+      lon: -73.9871,
+      accuracy: 42,
+      provider: "beacondb",
+    });
+    expect(beaconCalls).toBe(1);
+  });
+
+  it("a stored fix with no accuracy at all fails closed and falls through", async () => {
+    const { deviceId, token } = await seedDevice();
+    await seedFix(deviceId, { ageS: 10, accuracyM: null });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(await res.json()).toMatchObject({ known: true, provider: "beacondb" });
+  });
+
+  it("the gate value comes from the same env var as every other provider", async () => {
+    const { deviceId, credential } = await seedDevice();
+    await seedFix(deviceId, { ageS: 10, accuracyM: 900 });
+
+    // Default gate (500 m): rejected, and with no BSSIDs there is nothing below.
+    expect(await resolveLocation({ bssids: [], env, credential })).toEqual({ known: false });
+
+    // The one knob, widened: the same fix is now inside the gate.
+    const loose = await resolveLocation({
+      bssids: [],
+      env: { ...env, LOCATE_MAX_ACCURACY_M: "1000" } as Env,
+      credential,
+    });
+    expect(loose).toMatchObject({ known: true, accuracy: 900, provider: "phone" });
+    expect(beaconCalls).toBe(0);
+  });
+
+  it("a zero-BSSID request still reaches the phone provider", async () => {
+    // The board skipped its radio scan. The old short circuit answered
+    // {known:false} here before any provider ran.
+    const { deviceId, token } = await seedDevice();
+    await seedFix(deviceId);
+
+    const res = await post("/v1/locate", { wifiAccessPoints: [] }, { token });
+
+    expect(await res.json()).toMatchObject({ known: true, provider: "phone" });
+    expect(beaconCalls).toBe(0);
+  });
+
+  it("R13: a fix past the 120 s horizon yields to a live provider", async () => {
+    const { deviceId, token } = await seedDevice();
+    await seedFix(deviceId, { ageS: 400, accuracyM: 12 });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(await res.json()).toEqual({
+      known: true,
+      lat: 40.6931,
+      lon: -73.9871,
+      accuracy: 42,
+      provider: "beacondb",
+    });
+  });
+
+  it("R13: ...and is last_known with its capture time when nothing fresher is", async () => {
+    const { deviceId, token } = await seedDevice();
+    const posted = await seedFix(deviceId, { ageS: 400, accuracyM: 12 });
+    beaconNotFound();
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(await res.json()).toEqual({
+      known: true,
+      lat: posted.lat,
+      lon: posted.lon,
+      accuracy: 12,
+      provider: "phone",
+      captured_at: posted.capturedAt,
+      quality: "last_known",
+    });
+    expect(beaconCalls).toBe(1); // the chain was run out before falling back
+  });
+
+  it("a device that was never granted read:fix never consults the relay", async () => {
+    const { deviceId, token } = await seedDevice({ scopes: "read:departures,read:config" });
+    await seedFix(deviceId, { ageS: 5, accuracyM: 5 });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+
+    // A better fix sits in the table and is not read: the grant governs the
+    // read, not just the fan-out (R9).
+    expect(await res.json()).toMatchObject({ known: true, provider: "beacondb" });
+  });
+
+  it("a body-supplied device_id never selects a fix", async () => {
+    const { deviceId } = await seedDevice();
+    await seedFix(deviceId);
+    beaconOk(40.6931, -73.9871, 42);
+
+    // No credential; `device_id` is a diagnostic label anyone may send.
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps(), device_id: deviceId });
+
+    expect(await res.json()).toMatchObject({ known: true, provider: "beacondb" });
+  });
+
+  it("AE8: two boards seeing identical access points never share a phone position", async () => {
+    const mine = await seedDevice({ userId: "usr_owner" });
+    const neighbor = await seedDevice({ userId: "usr_neighbor" });
+    const posted = await seedFix(mine.deviceId, { ageS: 10, accuracyM: 9 });
+    const shared = uniqueAps(3); // one household, one set of access points
+    beaconOk(40.6931, -73.9871, 42);
+
+    const ours = await locateJson(shared, mine.token);
+    const theirs = await locateJson(shared, neighbor.token);
+    const anyone = await locateJson(shared);
+
+    expect(ours).toMatchObject({ lat: posted.lat, provider: "phone" });
+    // The neighbor's board and an anonymous caller get the WiFi answer for
+    // those access points — never the position that belongs to one device.
+    expect(theirs).toEqual({
+      known: true,
+      lat: 40.6931,
+      lon: -73.9871,
+      accuracy: 42,
+      provider: "beacondb",
+    });
+    expect(anyone).toEqual(theirs);
+    // And the shared BSSID-hash cache was never taught the phone's position:
+    // one upstream call served all three (R15).
+    expect(beaconCalls).toBe(1);
+  });
+
+  it("AE9: with no fix ever posted, the response is byte-identical to the contract", async () => {
+    const { token } = await seedDevice(); // granted read:fix, and no phone has posted
+    beaconOk(40.6931, -73.9871, 42);
+    const SHIPPED = '{"known":true,"lat":40.6931,"lon":-73.9871,"accuracy":42,"provider":"beacondb"}';
+
+    const granted = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+    const anonymous = await post("/v1/locate", { wifiAccessPoints: uniqueAps() });
+
+    // Bytes, not shape: shipped firmware parses this and a new key is a wire
+    // change. `captured_at`/`quality` appear only for a relayed fix.
+    expect(await granted.text()).toBe(SHIPPED);
+    expect(await anonymous.text()).toBe(SHIPPED);
+  });
+
+  it("AE9: an unresolvable chain is still exactly {\"known\":false}", async () => {
+    const { token } = await seedDevice();
+    beaconNotFound();
+    const res = await post("/v1/locate", { wifiAccessPoints: uniqueAps() }, { token });
+    expect(await res.text()).toBe('{"known":false}');
+  });
+
+  it("a cached coarse WiFi fix is still rejected on a cache hit", async () => {
+    // The gate moved *above* the cache, so what the cache holds for ten minutes
+    // is the position, not the first caller's verdict on it. Both directions
+    // matter: a rejected fix must not be cached as a negative, and a cached
+    // coarse fix must be rejected again on every hit.
+    const aps = uniqueAps(3);
+    beaconOk(40.5, -73.5, 900);
+
+    const first = await resolveLocation({ bssids: aps, env }); // default 500 m
+    expect(first).toEqual({ known: false });
+    expect(beaconCalls).toBe(1);
+
+    // Same cache entry, wider gate: the position survived the rejection.
+    const loose = await resolveLocation({
+      bssids: aps,
+      env: { ...env, LOCATE_MAX_ACCURACY_M: "1000" } as Env,
+    });
+    expect(loose).toMatchObject({ known: true, accuracy: 900 });
+
+    // ...and it is still rejected on the next hit under the real gate.
+    expect(await resolveLocation({ bssids: aps, env })).toEqual({ known: false });
+    expect(beaconCalls).toBe(1); // one upstream call served all three
+  });
+
+  it("/v1/nearby resolves the same device the same way /v1/locate does", async () => {
+    const { deviceId, token } = await seedDevice();
+    const posted = await seedFix(deviceId, { ageS: 30, accuracyM: 11 });
+
+    const located = await locateJson([], token);
+    const nearby = await post("/v1/nearby", { wifiAccessPoints: [] }, { token });
+
+    expect(nearby.status).toBe(200);
+    const body = await nearby.json<{ location: Record<string, unknown> }>();
+    expect(body.location).toEqual({
+      lat: posted.lat,
+      lon: posted.lon,
+      accuracy: 11,
+      provider: "phone",
+      captured_at: posted.capturedAt,
+      quality: "current",
+    });
+    expect(body.location.lat).toBe(located.lat);
+    expect(beaconCalls).toBe(0);
+  });
+
+  it("/v1/nearby stays byte-identical for an anonymous WiFi resolution", async () => {
+    beaconOk(40.6931, -73.9871, 42);
+    const res = await post("/v1/nearby", { wifiAccessPoints: uniqueAps() });
+    expect(res.status).toBe(200);
+    const body = await res.json<{ location: unknown }>();
+    expect(body.location).toEqual({ lat: 40.6931, lon: -73.9871, accuracy: 42 });
   });
 });

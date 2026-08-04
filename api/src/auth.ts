@@ -39,7 +39,7 @@
  * blanket rule would 403 the whole pairing flow while protecting nothing.
  */
 
-import { intVar } from "./locate";
+import { intVar } from "./vars";
 
 /**
  * The fixed synthetic user `AUTH_MODE=single` binds to. Seeded by migration
