@@ -500,6 +500,13 @@ function pollError(code: "authorization_pending" | "expired_token" | "invalid_re
  * Unknown, expired, and already-collected codes are one answer (`expired_token`
  * — AE4's "replay returns not found"): distinguishing them would tell a
  * device-code guesser which of their guesses had once been real.
+ *
+ * **Token rotation is specified here and not implemented** (R9, U6). Firmware
+ * should treat `DEVICE_TOKEN_ROTATION_HEADER` (`X-GC-Device-Token`) on *any*
+ * device-token response as "persist this value and use it from now on"; no
+ * route emits it today, and a device that ignores it keeps working. Writing the
+ * handling into the firmware now is what makes switching rotation on later a
+ * non-breaking change rather than a fleet-wide reflash.
  */
 async function handlePoll(request: Request, env: Env, url: URL): Promise<Response> {
   if (url.searchParams.has("device_code")) return pollError("invalid_request");
@@ -572,9 +579,11 @@ function noSuchCode(): Response {
  * Session-only (R8): `authorize()` supplies the 401 and, for a session
  * credential, the CSRF gate's 403 — a cross-site page must not be able to
  * attach an attacker's board to whoever's browser it can reach. A *device*
- * credential is refused explicitly rather than by omission: once U6 makes
- * device tokens resolve, a token extracted from one board would otherwise be
- * able to pair a second board onto the owner's account.
+ * credential is refused by `authorize()` itself, because this route names no
+ * scope and U6 made that the fail-closed rule: a token extracted from one board
+ * cannot pair a second board onto the owner's account. The explicit check below
+ * is the backstop that keeps that true if this route ever gains a scope for
+ * some other reason.
  *
  * Two steps, and the two-step shape is a security control, not a UI nicety
  * (RFC 8628 §5.4): the first call returns the device's self-reported metadata

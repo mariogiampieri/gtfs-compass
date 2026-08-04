@@ -20,6 +20,16 @@
  *     "forget" the tenancy check the way today's unscoped `SELECT * FROM
  *     locate_log` did. Routes never invent their own `user_id = ?` clause.
  *
+ *  3. **A route that does not name a scope does not accept device tokens at
+ *     all** (U6, R9). Scope is enforced *here*, never by route convention: a
+ *     device credential reaches a handler only when that handler declared
+ *     `scope`, so every account surface added later — the email, the device
+ *     list, config writes, the pair claim — is device-proof the moment it is
+ *     written, without anyone remembering to add a guard. The framing that
+ *     matters is not "a device token cannot hurt the account": once the relay
+ *     lands this token reads its owner's live position, so `read:fix` is
+ *     separately grantable, separately revocable, and never implied.
+ *
  * CSRF (R3) is deliberately scoped to **ambient** credentials — the session
  * cookie and the pre-session redeem nonce cookie — because ambient credentials
  * are the entirety of CSRF's threat model. `POST /v1/device/pair/start`,
@@ -52,6 +62,39 @@ export const CSRF_HEADER = "X-GC-CSRF";
 
 /** Device tokens are prefixed so they are recognizable in logs and in code (R9). */
 export const DEVICE_TOKEN_PREFIX = "gtfsc_dev_";
+
+/**
+ * **Specified and deliberately unimplemented** (R9). No route emits this header
+ * today; the constant exists so that the name is fixed and testable before
+ * anything depends on it.
+ *
+ * The contract firmware may implement now, so that turning rotation on later is
+ * not a breaking change: any response to a device-token request *may* carry
+ * `X-GC-Device-Token: <new token>`. A device that sees it must persist the new
+ * value and use it for every subsequent request; the token it presented stays
+ * valid only until the rotation is observed. A device that ignores the header
+ * keeps working exactly as it does today — which is what makes shipping the
+ * header later safe, and what makes writing it into the firmware now free.
+ *
+ * It is a *response* header and never a request header: nothing a client sends
+ * under this name is read, so a client cannot ask for a rotation.
+ */
+export const DEVICE_TOKEN_ROTATION_HEADER = "X-GC-Device-Token";
+
+/**
+ * How stale `devices.last_used_at` may get before a device request refreshes
+ * it — five minutes.
+ *
+ * The column exists so the device list (U10) can show a stolen board still
+ * calling home, which needs minutes of resolution, not seconds. Stamping it on
+ * every request would put a D1 write on the hot path of a board that polls
+ * every 20 s (180 writes/hour/device against the same single-primary database
+ * that serves session validation); a five-minute floor caps that at 12, and the
+ * displayed value is never more than five minutes behind the truth. Same shape
+ * as `validateSession`'s half-life renewal, and for the same reason: a read
+ * stays a read.
+ */
+export const DEVICE_LAST_USED_SLIDE_S = 300;
 
 const DAY_S = 86_400;
 /** Sliding session window (R3: 30 days), renewed at its half-life. */
@@ -373,9 +416,38 @@ export function formatScopes(scopes: readonly Scope[]): string {
 /**
  * Scope test. A session is the account itself and is not scope-limited; only
  * device credentials carry scopes, which is exactly R9's asymmetry.
+ *
+ * That asymmetry survives U6 deliberately. Scopes are a *delegation* boundary —
+ * what the owner has lent to a board sitting on a shelf — not an authorization
+ * matrix over the account. The user reading their own position in the config UI
+ * is not exercising a grant, so `hasScope(session, "read:fix")` is true; the
+ * board only gets it when the owner says so. Route-level access is therefore
+ * expressed as "which credential kinds may call this", which is what
+ * `authorize()`'s fail-closed device rule below encodes.
  */
 export function hasScope(credential: Credential, scope: Scope): boolean {
   return credential.kind === "session" || credential.scopes.includes(scope);
+}
+
+/**
+ * The other half of a device credential's authority: **which device it may
+ * speak about.** Scopes say what kind of thing a token may read; this says that
+ * a token may only ever read *its own* row.
+ *
+ * It exists because `GET /v1/config/:device_id` (U15) is the one surface where
+ * a client-supplied device id survived the relay redesign, and the ownership
+ * predicate alone does not cover it: two boards paired to the same account pass
+ * `user_id = ?` identically, so without this a token pulled from one board
+ * addresses the other. A session is the account and may name any of its own
+ * devices — the tenancy check for that case is `owner`, applied in SQL.
+ *
+ * Returns a ready 403 on denial and `null` on pass, like `checkAmbientCsrf`.
+ * `authorize({ deviceId })` is the way routes should reach it.
+ */
+export function checkDeviceTarget(credential: Credential, deviceId: string): Response | null {
+  if (credential.kind !== "device") return null;
+  if (credential.deviceId !== deviceId) return forbidden("device id is not this device's");
+  return null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -455,14 +527,60 @@ function bearerToken(request: Request): string | null {
 }
 
 /**
- * Device-token resolution lands in U6 (milestone 2): hash lookup on
- * `idx_devices_token_hash`, `revoked_at` check, scope parse, and a slid
- * `last_used_at`. Until then a device token authenticates nothing — and
- * crucially, it resolves on *this* branch, so it can only ever produce
+ * Resolve a device token (U6, R9): one indexed lookup on
+ * `idx_devices_token_hash`, `revoked_at` honored, scopes parsed from the
+ * column, `last_used_at` slid rather than stamped.
+ *
+ * It resolves on *this* branch only, so it can only ever produce
  * `kind:"device"` or `null`, never a session.
+ *
+ * **Revoked and never-existed are the same answer.** Both return null and the
+ * caller turns both into the same 401 with the same body; the two paths run the
+ * same single indexed SELECT and neither writes, so nothing distinguishes them
+ * by content or by shape. Telling a token holder "this one used to be real"
+ * would confirm a board's token to whoever pulled a candidate out of flash.
+ *
+ * A row with a NULL `user_id` is treated as no credential at all: `user_id` is
+ * what `ownerPredicate` binds, and a credential that cannot name an owner must
+ * not be handed to a route that is about to scope a query by it. Pairing never
+ * writes such a row (the insert selects a non-NULL `claimed_by`); this is the
+ * structural guarantee that it could not be used if one appeared.
  */
-async function resolveDeviceToken(_token: string, _env: Env): Promise<Credential | null> {
-  return null;
+async function resolveDeviceToken(token: string, env: Env): Promise<Credential | null> {
+  const row = await env.DB.prepare(
+    "SELECT id, user_id, scopes, revoked_at, last_used_at FROM devices WHERE token_hash = ?1",
+  )
+    .bind(await hashToken(token))
+    .first<{
+      id: string;
+      user_id: string | null;
+      scopes: string | null;
+      revoked_at: number | null;
+      last_used_at: number | null;
+    }>();
+  if (!row) return null;
+  if (row.revoked_at !== null) return null;
+  if (!row.user_id) return null;
+
+  const now = nowS();
+  // Past the floor, or never used at all. A `last_used_at` somehow ahead of now
+  // (clock skew) fails this test and writes nothing, which is the safe way
+  // round: the worst case is a stale display, not a write per request.
+  if (row.last_used_at === null || row.last_used_at <= now - DEVICE_LAST_USED_SLIDE_S) {
+    // Unconditional on the row rather than a compare-and-set: two concurrent
+    // requests past the floor write the same second to the same column, which
+    // is idempotent, and a CAS here would buy nothing but a longer statement.
+    await env.DB.prepare("UPDATE devices SET last_used_at = ?1 WHERE id = ?2")
+      .bind(now, row.id)
+      .run();
+  }
+
+  return {
+    kind: "device",
+    deviceId: row.id,
+    userId: row.user_id,
+    scopes: parseScopes(row.scopes),
+  };
 }
 
 /**
@@ -489,16 +607,28 @@ export async function resolveCredential(request: Request, env: Env): Promise<Cre
 
 /**
  * The chokepoint routes call. Resolves the credential, applies the ambient
- * CSRF gate to state-changing requests, enforces a required device scope, and
- * hands back the ownership predicate the route must apply to its SQL.
+ * CSRF gate to state-changing requests, enforces device scope and device
+ * targeting, and hands back the ownership predicate the route must apply to
+ * its SQL.
  *
- * `stateChanging` defaults to "anything that is not a GET or HEAD", which
- * fails safe: a new write route is gated without anyone remembering to say so.
+ * Two defaults, both failing safe so a route added later is protected by
+ * omission rather than by memory:
+ *
+ *  * `stateChanging` defaults to "anything that is not a GET or HEAD", so a new
+ *    write route is CSRF-gated without anyone saying so.
+ *  * **`scope` absent means device tokens are refused outright** (R9). Naming a
+ *    scope is how a route opts into being callable by a board; the account
+ *    surfaces — the email, the device list, config writes, `/v1/pair/claim` —
+ *    name none and are therefore session-only by construction. This is the
+ *    denial AE6 asks for, and it is one rule rather than one guard per route.
+ *
+ * `deviceId` is for routes that take a device id in the path: it holds a device
+ * credential to its own row (see `checkDeviceTarget`).
  */
 export async function authorize(
   request: Request,
   env: Env,
-  opts: { stateChanging?: boolean; scope?: Scope } = {},
+  opts: { stateChanging?: boolean; scope?: Scope; deviceId?: string } = {},
 ): Promise<Authorized | Response> {
   const credential = await resolveCredential(request, env);
   if (!credential) return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -513,8 +643,17 @@ export async function authorize(
     if (denial) return denial;
   }
 
+  if (credential.kind === "device" && !opts.scope) {
+    // The fail-closed rule. A route that named no scope is an account surface,
+    // and an account surface is not something a board may call.
+    return forbidden("device tokens are not accepted on this route");
+  }
   if (opts.scope && !hasScope(credential, opts.scope)) {
-    return Response.json({ error: `forbidden: missing scope ${opts.scope}` }, { status: 403 });
+    return forbidden(`missing scope ${opts.scope}`);
+  }
+  if (opts.deviceId !== undefined) {
+    const denial = checkDeviceTarget(credential, opts.deviceId);
+    if (denial) return denial;
   }
 
   return {

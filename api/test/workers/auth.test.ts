@@ -3,10 +3,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   CSRF_HEADER,
+  DEVICE_LAST_USED_SLIDE_S,
+  DEVICE_TOKEN_PREFIX,
+  DEVICE_TOKEN_ROTATION_HEADER,
   NONCE_COOKIE,
   SESSION_COOKIE,
   SINGLE_USER_ID,
   authorize,
+  checkDeviceTarget,
   clearedNonceCookie,
   clearedSessionCookie,
   hasScope,
@@ -16,6 +20,7 @@ import {
   nonceCookie,
   ownerPredicate,
   parseScopes,
+  randomToken,
   readNonceCookie,
   resolveCredential,
   revokeSession,
@@ -94,6 +99,77 @@ async function backdate(
     )
     .run();
 }
+
+/* -------------------------------------------------------------------------- */
+/* U6 helpers: a device row exactly as pairing writes one                      */
+/* -------------------------------------------------------------------------- */
+
+interface PairedDevice {
+  id: string;
+  token: string;
+}
+
+/**
+ * A `devices` row shaped exactly like the one `/v1/device/pair/poll` inserts —
+ * same `gtfsc_dev_` prefix, same `hashToken`, same default scopes — with the
+ * columns U6 has to answer for (`scopes`, `revoked_at`, `last_used_at`,
+ * `user_id`) made settable. Written through the migrated schema, never
+ * hand-rolled DDL.
+ */
+async function pairDevice(
+  opts: {
+    id?: string;
+    user?: string | null;
+    scopes?: string;
+    revokedAt?: number | null;
+    lastUsedAt?: number | null;
+  } = {},
+): Promise<PairedDevice> {
+  const token = `${DEVICE_TOKEN_PREFIX}${randomToken(32)}`;
+  const id = opts.id ?? `dev_${randomToken(9)}`;
+  await env.DB.prepare(
+    `INSERT INTO devices
+       (id, user_id, token_hash, name, paired_at, fw_version, scopes, revoked_at, last_used_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  )
+    .bind(
+      id,
+      opts.user === undefined ? USER : opts.user,
+      await hashToken(token),
+      "Kitchen board",
+      nowSec(),
+      "1.4.0",
+      opts.scopes ?? "read:departures,read:config",
+      opts.revokedAt ?? null,
+      opts.lastUsedAt ?? null,
+    )
+    .run();
+  return { id, token };
+}
+
+async function deviceRow(id: string) {
+  return env.DB.prepare("SELECT last_used_at, revoked_at FROM devices WHERE id = ?1")
+    .bind(id)
+    .first<{ last_used_at: number | null; revoked_at: number | null }>();
+}
+
+/**
+ * An `Env` whose D1 binding records every statement it prepares. "Slides
+ * `last_used_at` without writing per request" is a claim about *writes*, and a
+ * test that only re-reads the column cannot tell a skipped UPDATE from an
+ * UPDATE that rewrote the same second.
+ */
+function recordingEnv(statements: string[]): Env {
+  const db = {
+    prepare: (sql: string) => {
+      statements.push(sql);
+      return env.DB.prepare(sql);
+    },
+  };
+  return { ...env, DB: db } as unknown as Env;
+}
+
+const isUpdate = (sql: string) => /^\s*UPDATE/i.test(sql);
 
 beforeEach(async () => {
   await resetSchema();
@@ -488,6 +564,85 @@ describe("device credentials", () => {
     expect(parseScopes("read:departures,read:config")).not.toContain("read:fix");
   });
 
+  it("resolves a paired token to its device, its owner, and its granted scopes", async () => {
+    const device = await pairDevice({ scopes: "read:departures,read:config" });
+    const cred = await resolveCredential(req("/v1/departures", { bearer: device.token }), env);
+    expect(cred).toEqual({
+      kind: "device",
+      deviceId: device.id,
+      userId: USER,
+      scopes: ["read:departures", "read:config"],
+    });
+  });
+
+  it("carries read:fix only when the column does — it is never implied", async () => {
+    const plain = await pairDevice();
+    const granted = await pairDevice({ scopes: "read:departures,read:config,read:fix" });
+    const of = async (d: PairedDevice) =>
+      (await resolveCredential(req("/v1/locate", { bearer: d.token }), env)) as {
+        scopes: readonly string[];
+      };
+    expect((await of(plain)).scopes).not.toContain("read:fix");
+    expect((await of(granted)).scopes).toContain("read:fix");
+  });
+
+  it("a revoked token and a token that never existed are one answer, byte for byte", async () => {
+    const revoked = await pairDevice({ revokedAt: nowSec() - 60 });
+    const unknown = `${DEVICE_TOKEN_PREFIX}${randomToken(32)}`;
+
+    expect(await resolveCredential(req("/v1/departures", { bearer: revoked.token }), env)).toBeNull();
+    expect(await resolveCredential(req("/v1/departures", { bearer: unknown }), env)).toBeNull();
+
+    const answers = await Promise.all(
+      [revoked.token, unknown].map(async (bearer) => {
+        const res = (await authorize(req("/v1/departures", { bearer }), env, {
+          scope: "read:departures",
+        })) as Response;
+        return { status: res.status, body: await res.text() };
+      }),
+    );
+    // 401 for both — "revoked" must not be distinguishable from "never real",
+    // or a token pulled out of flash tells its holder the board was once paired.
+    expect(answers[0]).toEqual({ status: 401, body: '{"error":"unauthorized"}' });
+    expect(answers[1]).toEqual(answers[0]);
+  });
+
+  it("does not slide last_used_at for a revoked token", async () => {
+    const revoked = await pairDevice({ revokedAt: nowSec() - 60, lastUsedAt: null });
+    const statements: string[] = [];
+    await resolveCredential(
+      req("/v1/departures", { bearer: revoked.token }),
+      recordingEnv(statements),
+    );
+    expect(statements.filter(isUpdate)).toEqual([]);
+    expect((await deviceRow(revoked.id))!.last_used_at).toBeNull();
+  });
+
+  it("refuses a row with no owner — a credential that cannot name a user is no credential", async () => {
+    // devices.user_id is nullable (a Phase 1 row can exist before pairing) and
+    // ownerPredicate binds it; resolving one would scope a query by NULL.
+    const orphan = await pairDevice({ user: null });
+    expect(await resolveCredential(req("/v1/departures", { bearer: orphan.token }), env)).toBeNull();
+  });
+
+  it("reads the token from the Authorization header only — never a query param", async () => {
+    const device = await pairDevice();
+    for (const query of [`?token=${device.token}`, `?access_token=${device.token}`]) {
+      expect(await resolveCredential(req(`/v1/departures${query}`), env)).toBeNull();
+    }
+    // And the same token in the header does resolve, so the assertion above is
+    // about where the token was, not about the token.
+    expect(
+      (await resolveCredential(req("/v1/departures", { bearer: device.token }), env))?.kind,
+    ).toBe("device");
+  });
+
+  it("only the prefixed form reaches the device branch", async () => {
+    const device = await pairDevice();
+    const unprefixed = device.token.slice(DEVICE_TOKEN_PREFIX.length);
+    expect(await resolveCredential(req("/v1/departures", { bearer: unprefixed }), env)).toBeNull();
+  });
+
   it("hasScope is false for every scope on a session credential's device scopes", () => {
     const device = {
       kind: "device" as const,
@@ -499,6 +654,302 @@ describe("device credentials", () => {
     expect(hasScope(device, "read:fix")).toBe(false);
     // A session is the account itself: it is not scope-limited.
     expect(hasScope({ kind: "session", userId: USER, sessionId: null }, "read:fix")).toBe(true);
+  });
+});
+
+describe("last_used_at slides, it is not stamped", () => {
+  it("stamps a device that has never been seen", async () => {
+    const device = await pairDevice({ lastUsedAt: null });
+    const before = nowSec();
+    await resolveCredential(req("/v1/departures", { bearer: device.token }), env);
+    const row = await deviceRow(device.id);
+    expect(row!.last_used_at).toBeGreaterThanOrEqual(before);
+  });
+
+  it("a burst of requests inside the window prepares no UPDATE at all", async () => {
+    const device = await pairDevice({ lastUsedAt: nowSec() });
+    const statements: string[] = [];
+    const spied = recordingEnv(statements);
+    for (let i = 0; i < 10; i++) {
+      const cred = await resolveCredential(req("/v1/departures", { bearer: device.token }), spied);
+      expect(cred?.kind).toBe("device"); // still authenticating, just not writing
+    }
+    // The M1 review's P2 shape — a renewal that writes on every request once it
+    // is near the boundary — would show up right here.
+    expect(statements.filter(isUpdate)).toEqual([]);
+    expect(statements).toHaveLength(10); // exactly one SELECT per request
+  });
+
+  it("writes once past the floor, then goes quiet again", async () => {
+    const stale = nowSec() - DEVICE_LAST_USED_SLIDE_S - 1;
+    const device = await pairDevice({ lastUsedAt: stale });
+    const statements: string[] = [];
+    const spied = recordingEnv(statements);
+
+    await resolveCredential(req("/v1/departures", { bearer: device.token }), spied);
+    expect(statements.filter(isUpdate)).toHaveLength(1);
+    const slid = (await deviceRow(device.id))!.last_used_at!;
+    expect(slid).toBeGreaterThan(stale);
+
+    statements.length = 0;
+    for (let i = 0; i < 5; i++) {
+      await resolveCredential(req("/v1/departures", { bearer: device.token }), spied);
+    }
+    expect(statements.filter(isUpdate)).toEqual([]);
+    expect((await deviceRow(device.id))!.last_used_at).toBe(slid);
+  });
+
+  it("does not write when last_used_at sits inside the floor", async () => {
+    const fresh = nowSec() - DEVICE_LAST_USED_SLIDE_S + 5;
+    const device = await pairDevice({ lastUsedAt: fresh });
+    const statements: string[] = [];
+    await resolveCredential(req("/v1/departures", { bearer: device.token }), recordingEnv(statements));
+    expect(statements.filter(isUpdate)).toEqual([]);
+    expect((await deviceRow(device.id))!.last_used_at).toBe(fresh);
+  });
+});
+
+describe("a device token on an account surface → 403 (AE6)", () => {
+  /**
+   * The rule, not a guard per route: `authorize()` with no `scope` refuses a
+   * device credential outright, so every account surface is device-proof the
+   * moment it is written. The routes AE6 names split three ways here.
+   *
+   *  * **Live routes** get a real request: `/v1/pair/claim` and
+   *    `/v1/auth/signout` are the two account surfaces that exist today.
+   *  * **The rule itself** is exercised directly with a real paired token
+   *    against `authorize()`'s default options — which is precisely the call
+   *    the account email (U11), the device list (U10) and config writes (U15)
+   *    will make. Writing `expect(404)` against a route that does not exist
+   *    would assert nothing.
+   *  * **`/v1/config/:device_id`** (U15) is the one route that takes a
+   *    client-supplied device id, so its check lives in `checkDeviceTarget` and
+   *    is tested below against real sibling devices rather than against a
+   *    missing route.
+   */
+  it("the rule: a route that names no scope refuses a device token, and 403 not 401", async () => {
+    const device = await pairDevice();
+    const denial = (await authorize(req("/v1/devices", { bearer: device.token }), env)) as Response;
+    expect(denial.status).toBe(403);
+    expect(await denial.json()).toEqual({
+      error: "forbidden: device tokens are not accepted on this route",
+    });
+
+    // Same request, same options, a session cookie instead: allowed. The 403
+    // is about the credential kind, not about the route being closed.
+    const minted = await mintSession(env, USER);
+    expect(await authorize(req("/v1/devices", { cookies: jar(minted.token) }), env)).not.toBeInstanceOf(
+      Response,
+    );
+  });
+
+  it("a POST is refused the same way — the denial is not a CSRF accident", async () => {
+    const device = await pairDevice();
+    const denial = (await authorize(
+      req("/v1/config", { method: "POST", bearer: device.token }),
+      env,
+    )) as Response;
+    expect(denial.status).toBe(403);
+    expect(await denial.json()).toEqual({
+      error: "forbidden: device tokens are not accepted on this route",
+    });
+  });
+
+  it("POST /v1/pair/claim: a board cannot pair another board onto its owner", async () => {
+    const device = await pairDevice();
+    const res = await SELF.fetch(`${ORIGIN}/v1/pair/claim`, {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": "198.18.9.11",
+        "Content-Type": "application/json",
+        Origin: ORIGIN,
+        [CSRF_HEADER]: "1",
+        Authorization: `Bearer ${device.token}`,
+      },
+      body: JSON.stringify({ user_code: "BCDF-GHJK", confirm: true }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("POST /v1/auth/signout: a board cannot end its owner's session", async () => {
+    const device = await pairDevice();
+    const minted = await mintSession(env, USER);
+    const res = await SELF.fetch(`${ORIGIN}/v1/auth/signout`, {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": "198.18.9.12",
+        Origin: ORIGIN,
+        [CSRF_HEADER]: "1",
+        // The cookie is present *and* the device token wins the branch — this
+        // is the laundering attempt the branch order exists to stop.
+        Cookie: `${SESSION_COOKIE}=${minted.token}`,
+        Authorization: `Bearer ${device.token}`,
+      },
+    });
+    expect(res.status).toBe(403);
+    // The property, not just the status code: the session is still alive.
+    expect(await validateSession(env, minted.token)).toMatchObject({ userId: USER });
+  });
+
+  it("a revoked token is 401 on those routes, not 403 — revocation comes first", async () => {
+    const revoked = await pairDevice({ revokedAt: nowSec() - 1 });
+    const res = await SELF.fetch(`${ORIGIN}/v1/pair/claim`, {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": "198.18.9.13",
+        "Content-Type": "application/json",
+        Origin: ORIGIN,
+        [CSRF_HEADER]: "1",
+        Authorization: `Bearer ${revoked.token}`,
+      },
+      body: JSON.stringify({ user_code: "BCDF-GHJK" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("the diagnostics surfaces are not a device's to read", async () => {
+    const device = await pairDevice();
+    const res = await SELF.fetch(`${ORIGIN}/v1/locate/log`, {
+      headers: { "CF-Connecting-IP": "198.18.9.14", Authorization: `Bearer ${device.token}` },
+    });
+    expect(res.status).toBe(401); // DIAG_TOKEN is a different credential entirely
+  });
+
+  it("the anonymous transit reads are byte-identical with and without a token (R10)", async () => {
+    const device = await pairDevice();
+    const read = (bearer?: string) =>
+      SELF.fetch(`${ORIGIN}/v1/nearby?lat=40.6923&lon=-73.9873`, {
+        headers: {
+          "CF-Connecting-IP": "198.18.9.15",
+          ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+        },
+      });
+    const anonymous = await read();
+    const withToken = await read(device.token);
+    expect(anonymous.status).toBe(200); // a real read, not two matching errors
+    expect(withToken.status).toBe(anonymous.status);
+    expect(await withToken.text()).toBe(await anonymous.text());
+  });
+});
+
+describe("scope enforcement lives in the resolver (R9, AE6)", () => {
+  it("a freshly paired device reading a fix → 403", async () => {
+    const device = await pairDevice(); // pairing's defaults: no read:fix
+    const denial = (await authorize(req("/v1/locate", { bearer: device.token }), env, {
+      scope: "read:fix",
+    })) as Response;
+    expect(denial.status).toBe(403);
+    expect(await denial.json()).toEqual({ error: "forbidden: missing scope read:fix" });
+
+    // And a token narrowed to departures alone is refused the same way.
+    const narrow = await pairDevice({ scopes: "read:departures" });
+    expect(
+      ((await authorize(req("/v1/locate", { bearer: narrow.token }), env, {
+        scope: "read:fix",
+      })) as Response).status,
+    ).toBe(403);
+  });
+
+  it("the same token passes the scope it does hold, and carries its device id through", async () => {
+    const device = await pairDevice();
+    const ok = (await authorize(req("/v1/departures", { bearer: device.token }), env, {
+      scope: "read:departures",
+    })) as { credential: { deviceId: string }; owner: { sql: string; binds: string[] }; refresh: null };
+    expect(ok.credential).toMatchObject({ kind: "device", deviceId: device.id, userId: USER });
+    expect(ok.owner).toEqual({ sql: "user_id = ?1", binds: [USER] });
+    expect(ok.refresh).toBeNull(); // a device has no cookie to slide
+  });
+
+  it("granting read:fix on the row is what opens the fix read", async () => {
+    const granted = await pairDevice({ scopes: "read:departures,read:config,read:fix" });
+    expect(
+      await authorize(req("/v1/locate", { bearer: granted.token }), env, { scope: "read:fix" }),
+    ).not.toBeInstanceOf(Response);
+  });
+
+  it("a device with an empty scopes column can read nothing", async () => {
+    const device = await pairDevice({ scopes: "" });
+    for (const scope of ["read:departures", "read:config", "read:fix"] as const) {
+      const denial = (await authorize(req("/v1/departures", { bearer: device.token }), env, {
+        scope,
+      })) as Response;
+      expect(denial.status).toBe(403);
+    }
+  });
+
+  it("a Bearer credential is still exempt from the ambient CSRF gate", async () => {
+    const device = await pairDevice({ scopes: "read:departures,read:config,read:fix" });
+    // No Origin, no CSRF header — firmware sends neither, and R3's gate is for
+    // ambient credentials only.
+    const result = await authorize(
+      req("/v1/locate", { method: "POST", bearer: device.token, origin: null, csrf: null }),
+      env,
+      { scope: "read:fix" },
+    );
+    expect(result).not.toBeInstanceOf(Response);
+  });
+});
+
+describe("device targeting — the /v1/config/:device_id check (U15)", () => {
+  it("a device token may not name a sibling board on the same account", async () => {
+    const mine = await pairDevice();
+    const sibling = await pairDevice(); // same owner: the owner predicate cannot tell them apart
+    const denial = (await authorize(req("/v1/config", { bearer: mine.token }), env, {
+      scope: "read:config",
+      deviceId: sibling.id,
+    })) as Response;
+    expect(denial.status).toBe(403);
+    expect(await denial.json()).toEqual({ error: "forbidden: device id is not this device's" });
+  });
+
+  it("and passes for its own id", async () => {
+    const mine = await pairDevice();
+    expect(
+      await authorize(req("/v1/config", { bearer: mine.token }), env, {
+        scope: "read:config",
+        deviceId: mine.id,
+      }),
+    ).not.toBeInstanceOf(Response);
+  });
+
+  it("checkDeviceTarget: a session may name any id (its tenancy is the SQL predicate)", () => {
+    const session = { kind: "session" as const, userId: USER, sessionId: null };
+    expect(checkDeviceTarget(session, "dev_anything")).toBeNull();
+    const device = {
+      kind: "device" as const,
+      deviceId: "dev_mine",
+      userId: USER,
+      scopes: ["read:config"] as const,
+    };
+    expect(checkDeviceTarget(device, "dev_mine")).toBeNull();
+    expect(checkDeviceTarget(device, "dev_theirs")?.status).toBe(403);
+  });
+});
+
+describe("the token rotation header (R9: specified, unimplemented)", () => {
+  it("names the header firmware should code against", () => {
+    // Pinned: firmware adopting it now is what makes turning rotation on later
+    // a non-breaking change, and a rename after that ships is the breakage.
+    expect(DEVICE_TOKEN_ROTATION_HEADER).toBe("X-GC-Device-Token");
+  });
+
+  it("is emitted by nothing today", async () => {
+    const device = await pairDevice();
+    const responses = [
+      await SELF.fetch(`${ORIGIN}/v1/nearby?lat=40.69&lon=-73.98`, {
+        headers: {
+          "CF-Connecting-IP": "198.18.9.16",
+          Authorization: `Bearer ${device.token}`,
+        },
+      }),
+      await SELF.fetch(`${ORIGIN}/v1/device/pair/start`, {
+        method: "POST",
+        headers: { "CF-Connecting-IP": "198.18.9.16", Origin: ORIGIN },
+      }),
+    ];
+    for (const res of responses) {
+      expect(res.headers.get(DEVICE_TOKEN_ROTATION_HEADER)).toBeNull();
+    }
   });
 });
 

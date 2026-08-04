@@ -154,11 +154,12 @@ older than 90 s as stale. A feed whose upstream freezes (HTTP 200 but a
 non-advancing header timestamp) goes visibly stale rather than being
 re-stamped fresh.
 
-**The transit routes are still unauthenticated.** `/internal/*` and the
-transit `/v1/*` routes stay public until the device-token model lands; they
-are limited to the curated feed allowlist (`vars.CURATED_FEEDS` in
-`api/wrangler.jsonc`) and per-IP rate limiting, and expose only
-already-public transit data. The locate diagnostics surfaces are gated by a
+**The transit routes are unauthenticated, and stay that way.** `/internal/*`
+and the transit `/v1/*` routes serve already-public transit data and answer
+identically whether or not a credential is presented — a paired device changes
+nothing about them. They are limited to the curated feed allowlist
+(`vars.CURATED_FEEDS` in `api/wrangler.jsonc`) and per-IP rate
+limiting. The locate diagnostics surfaces are gated by a
 `DIAG_TOKEN` Worker secret (see `.env.example`). Accounts exist on
 `/v1/auth/*` — see [Signing in](#signing-in) — devices get their own scoped
 credentials through [pairing](#pairing-a-device), and everything user-owned
@@ -597,6 +598,38 @@ Five properties are load-bearing:
   `read:departures` and `read:config` only. `read:fix` — the scope that lets a
   board receive your phone's live position — is never implied by pairing and
   is granted separately, per device.
+
+#### What the device token can do
+
+The board sends its token as `Authorization: Bearer gtfsc_dev_…` — never a
+query parameter, which the API refuses. The token is stored as a SHA-256 hash
+under a unique index and resolves in one indexed lookup.
+
+- **It is not a login.** A device token can never come back as a session: the
+  Bearer branch and the cookie branch are separate by construction, so a token
+  extracted from a board cannot be exchanged for account access even in a
+  browser that is already signed in.
+- **It reaches only what its scopes name.** A route that does not declare a
+  scope refuses device tokens outright, so the account email, the device list,
+  configuration writes and `POST /v1/pair/claim` answer `403` to a board — one
+  rule in the resolver rather than a guard each route has to remember. A
+  request for a scope the device was not granted is also a `403`; a device
+  token holding `read:config` may read *its own* device's configuration and no
+  other board's, including boards on the same account.
+- **Revocation is immediate.** Unpairing sets `revoked_at` and the very next
+  request is a `401` — the same `401`, byte for byte, that a token which never
+  existed gets, so a token found in flash tells its holder nothing.
+- **Theft is visible.** Every device request refreshes `last_used_at` (at most
+  once every five minutes, so a board polling every 20 s does not put a
+  database write on each poll). The device list shows it: a board you are
+  holding that is still calling home is a board whose token somebody else has.
+
+**Token rotation is specified and not implemented.** Any response to a
+device-token request *may* one day carry `X-GC-Device-Token: <new token>`,
+meaning "persist this and use it from now on". Nothing emits it today, and a
+device that ignores it keeps working — firmware that handles it now is what
+makes switching rotation on later a non-breaking change instead of a
+fleet-wide reflash.
 
 ### The location check
 
