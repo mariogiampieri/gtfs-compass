@@ -52,6 +52,22 @@ target_compile_definitions(test_nav PRIVATE
   CJSON_NESTING_LIMIT=48
 )
 
+# RFC 8628 pairing client (pairing plan U2): pair_fsm.c is platform-free by
+# design — protocol timing, the 120 s delivery grace, and wire-body parsing
+# are host facts, tested against verbatim shapes from api/src/routes/pair.ts.
+add_executable(test_pair_fsm
+  test_pair_fsm.c
+  unity/unity.c
+  ${FW}/components/model/pair_fsm.c
+  ${FW}/third_party/cjson/cJSON.c
+)
+target_include_directories(test_pair_fsm PRIVATE
+  unity
+  ${FW}/components/model/include
+  ${FW}/third_party/cjson
+)
+target_compile_definitions(test_pair_fsm PRIVATE CJSON_NESTING_LIMIT=48)
+
 # Bike screen layout math (plan U5): ui_bike_layout.c is LVGL-free by
 # design — hero strings and bar proportions under the R5 degraded
 # permutations are host facts.
@@ -69,4 +85,5 @@ target_include_directories(test_bike_layout PRIVATE
 enable_testing()
 add_test(NAME model COMMAND test_model)
 add_test(NAME nav COMMAND test_nav)
+add_test(NAME pair_fsm COMMAND test_pair_fsm)
 add_test(NAME bike_layout COMMAND test_bike_layout)
