@@ -68,12 +68,19 @@ static int64_t g_last_minute_ms;
 static int64_t g_last_touch_ms; /* 0 at boot: a never-touched device drifts */
 static bool g_dimmed;
 
-/* Staged net message (by value, latest-wins — R6 deferral contract). */
+/* Staged net message (by value, latest-wins — R6 deferral contract). The
+ * pairing snapshot rides on every message (full-snapshot queue contract),
+ * so a displaced message loses nothing. */
 static bool g_staged_have_model;    /* staged model copy awaits apply */
 static gc_net_status_t g_staged_status;
 static bool g_staged_have_status;   /* any message awaits apply */
 static int64_t g_staged_recv_ms;    /* when the staged model was received */
 static bool g_render_pending;       /* deferred render-only request */
+static pair_state_t g_staged_pair_phase;
+static char g_staged_pair_code[PAIR_USER_CODE_LEN];
+static int32_t g_staged_pair_seconds;
+static uint8_t g_staged_pair_epoch;
+static bool g_staged_unpaired;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -131,6 +138,10 @@ static void gc_apply_staged(void) {
       g_state.flash_now = true;
       g_flash_until_ms = now_ms() + FLASH_MS;
       break;
+    case GC_NET_KEEP:
+      /* pairing-only publish: no fetch outcome rides along — the conn
+       * state (and its staleness accounting) is left exactly as-is */
+      break;
     case GC_NET_NO_LOCATION:
     case GC_NET_NO_CREDS:
       /* honest un-provisioned/unlocatable state; with a prior model the
@@ -144,6 +155,10 @@ static void gc_apply_staged(void) {
       if (g_state.conn != UI_CONN_NO_LOCATION) g_state.conn = UI_CONN_OFFLINE;
       break;
   }
+  /* Pairing snapshot → UI state; an active session forces the pairing view
+   * and completion/dismissal restores the prior one (ui_state.c rules). */
+  ui_pairing_update(&g_state, g_staged_pair_phase, g_staged_pair_code, g_staged_pair_seconds,
+                    g_staged_unpaired, g_staged_pair_epoch);
   g_staged_have_model = false;
   g_staged_have_status = false;
   g_state.battery_pct = (int8_t)gc_battery_pct();
@@ -156,7 +171,7 @@ static void consume_cb(lv_timer_t *t) {
   (void)t;
   gc_net_msg_t msg;
   if (xQueueReceive(g_net_queue, &msg, 0) == pdTRUE) {
-    if (msg.status == GC_NET_OK) {
+    if (msg.status == GC_NET_OK && msg.model != NULL) {
       memcpy(g_staged_model, msg.model, sizeof(*g_staged_model)); /* copy before net reuses */
       g_staged_have_model = true;
       g_staged_recv_ms = now_ms();
@@ -167,6 +182,12 @@ static void consume_cb(lv_timer_t *t) {
     g_staged_status = msg.status; /* latest-wins; stash is by-value so the
                                      displaced message needs no freeing */
     g_staged_have_status = true;
+    /* Pairing snapshot: by value, every message (full-snapshot contract). */
+    g_staged_pair_phase = msg.pair_phase;
+    memcpy(g_staged_pair_code, msg.pair_code, sizeof(g_staged_pair_code));
+    g_staged_pair_seconds = msg.pair_seconds_left;
+    g_staged_pair_epoch = msg.pair_epoch;
+    g_staged_unpaired = msg.unpaired;
   }
   /* Deferral ceiling (review): a sustained accidental press — pocket, palm,
    * object resting on the glass — would otherwise defer applies and board
@@ -241,6 +262,12 @@ static void tick_cb(lv_timer_t *t) {
     if (!ui_input_busy() && now_ms() - g_last_touch_ms > 5 * 60 * 1000) {
       ui_jitter_nudge();
     }
+  }
+
+  /* Pairing countdown: local 1 Hz decrement from the published value (the
+   * departures minutes convention) — ui_tick rewrites the label in place. */
+  if (g_state.pair_phase == PAIR_CODE_ACTIVE && g_state.pair_seconds > 0) {
+    g_state.pair_seconds--;
   }
 
   /* M1 brightness placeholder: dim after long no-data — boot time counts as
@@ -358,16 +385,32 @@ static void gc_input_press(int32_t x, int32_t y, void *user) {
   ESP_LOGD(TAG, "input: press %ld,%ld", (long)x, (long)y);
 }
 
+/* Leaving a terminal EXPIRED/FAILED pairing screen also resets the net
+ * task's FSM to IDLE (a live CODE_ACTIVE session is deliberately left
+ * running — dismissing the view never cancels the session). */
+static void pair_terminal_dismissed(ui_view_t view_before, pair_state_t phase_before) {
+  if (view_before == UI_VIEW_PAIRING && g_state.view != UI_VIEW_PAIRING &&
+      (phase_before == PAIR_EXPIRED || phase_before == PAIR_FAILED)) {
+    gc_net_pair_dismiss();
+  }
+}
+
 static void gc_input_tap(int32_t x, int32_t y, void *user) {
   (void)user;
+  ui_view_t view_before = g_state.view;
+  pair_state_t phase_before = g_state.pair_phase;
   if (ui_views_on_tap(x, y, g_have_model ? g_ui_model : NULL, &g_state)) {
+    pair_terminal_dismissed(view_before, phase_before);
     full_render();
   }
 }
 
 static void gc_input_swipe(ui_swipe_t dir, void *user) {
   (void)user;
+  ui_view_t view_before = g_state.view;
+  pair_state_t phase_before = g_state.pair_phase;
   if (ui_views_on_swipe(dir, g_have_model ? g_ui_model : NULL, &g_state)) {
+    pair_terminal_dismissed(view_before, phase_before);
     full_render();
   }
 }

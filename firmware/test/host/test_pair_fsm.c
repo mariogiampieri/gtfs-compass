@@ -226,8 +226,16 @@ static void test_oversized_fields_truncate_not_overflow(void) {
   TEST_ASSERT_EQUAL(PAIR_USER_CODE_LEN - 1, (int)strlen(f.user_code));
 }
 
+static void test_request_plan_token_beats_override(void) {
+  TEST_ASSERT_EQUAL(PAIR_PLAN_POST_AUTH, pair_request_plan(true, true));
+  TEST_ASSERT_EQUAL(PAIR_PLAN_POST_AUTH, pair_request_plan(true, false));
+  TEST_ASSERT_EQUAL(PAIR_PLAN_GET_FIXED, pair_request_plan(false, true));
+  TEST_ASSERT_EQUAL(PAIR_PLAN_POST_ANON, pair_request_plan(false, false));
+}
+
 int main(void) {
   UNITY_BEGIN();
+  RUN_TEST(test_request_plan_token_beats_override);
   RUN_TEST(test_happy_path_with_interval_floor);
   RUN_TEST(test_persist_emitted_exactly_once);
   RUN_TEST(test_expired_token_ends_session_and_restart_is_fresh);

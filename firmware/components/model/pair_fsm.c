@@ -189,3 +189,9 @@ int32_t pair_fsm_seconds_left(const pair_fsm_t *f, int64_t now) {
   int64_t left = f->deadline - now;
   return left > 0 ? (int32_t)left : 0;
 }
+
+pair_request_plan_t pair_request_plan(bool token_present, bool override_set) {
+  if (token_present) return PAIR_PLAN_POST_AUTH; /* token beats override (R9) */
+  if (override_set) return PAIR_PLAN_GET_FIXED;
+  return PAIR_PLAN_POST_ANON;
+}

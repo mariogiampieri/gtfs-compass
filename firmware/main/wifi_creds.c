@@ -1,5 +1,6 @@
 #include "wifi_creds.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -68,6 +69,57 @@ void gc_loc_clear(void) {
   nvs_commit(h);
   nvs_close(h);
   ESP_LOGI(TAG, "location override cleared");
+}
+
+bool gc_token_get(char token[GC_TOKEN_LEN]) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t len = GC_TOKEN_LEN;
+  bool ok = nvs_get_str(h, "token", token, &len) == ESP_OK && token[0] != '\0';
+  nvs_close(h);
+  return ok;
+}
+
+bool gc_token_set(const char *token) {
+  if (token == NULL || token[0] == '\0') return false;
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
+  bool ok = nvs_set_str(h, "token", token) == ESP_OK;
+  nvs_erase_key(h, "revoked"); /* a successful pair ends the unpaired state */
+  ok = ok && nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  /* Presence only — the token value never reaches a log (plan R4). */
+  ESP_LOGI(TAG, "device token %s", ok ? "stored" : "store FAILED");
+  return ok;
+}
+
+void gc_token_clear(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_key(h, "token");
+  nvs_erase_key(h, "revoked");
+  nvs_commit(h);
+  nvs_close(h);
+  ESP_LOGI(TAG, "device token cleared");
+}
+
+void gc_token_revoke(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_key(h, "token");
+  nvs_set_u8(h, "revoked", 1);
+  nvs_commit(h);
+  nvs_close(h);
+  ESP_LOGW(TAG, "device token revoked by the server — board is unpaired");
+}
+
+bool gc_revoked_get(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+  uint8_t v = 0;
+  bool set = nvs_get_u8(h, "revoked", &v) == ESP_OK && v != 0;
+  nvs_close(h);
+  return set;
 }
 
 void gc_creds_seed_from_config(void) {

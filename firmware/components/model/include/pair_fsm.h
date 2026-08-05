@@ -111,6 +111,19 @@ int64_t pair_fsm_next_deadline(const pair_fsm_t *f);
 /* Seconds of code validity left to render, clamped at 0. */
 int32_t pair_fsm_seconds_left(const pair_fsm_t *f, int64_t now);
 
+/*
+ * The request-path decision for a nearby fetch (plan U4, R9): a stored token
+ * expresses intent to use server-side resolution, so it beats the dev
+ * fixed-location override; the override applies only to unpaired boards.
+ */
+typedef enum {
+  PAIR_PLAN_POST_AUTH = 0, /* POST scan body + Authorization: Bearer */
+  PAIR_PLAN_GET_FIXED,     /* GET ?lat=&lon= — unpaired dev override */
+  PAIR_PLAN_POST_ANON,     /* POST scan body, no credential */
+} pair_request_plan_t;
+
+pair_request_plan_t pair_request_plan(bool token_present, bool override_set);
+
 #ifdef __cplusplus
 }
 #endif
