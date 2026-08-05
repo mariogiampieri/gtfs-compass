@@ -11,6 +11,8 @@ import {
 } from "../../src/auth";
 import { clearFix } from "../../src/relay";
 import { routeConfig } from "../../src/routes/config";
+import { routeLocate } from "../../src/routes/locate";
+import { routeNearby } from "../../src/routes/nearby";
 import { DEFAULT_DEVICE_SCOPES, normalizeUserCode, routePair } from "../../src/routes/pair";
 import { resetSchema } from "./schema";
 
@@ -24,9 +26,12 @@ import { resetSchema } from "./schema";
  *
  * The device-side assertions go through `authorize()` — the same chokepoint
  * every device request goes through — because that is where a scope grant or a
- * revocation actually takes effect. No route names a scope yet (U8/U13 are the
- * first that will), so asserting against a route would be asserting against
- * nothing.
+ * revocation actually takes effect. No route names a scope to `authorize()`
+ * yet (U13 will be the first): `read:fix` is read *inside* the locate chain,
+ * since a board that lacks the grant must still get a WiFi answer rather than a
+ * 403. AE6d's read-side half is therefore asserted against the real
+ * `/v1/locate` and `/v1/nearby` handlers below, and everything else here
+ * against the chokepoint.
  */
 
 const ORIGIN = "https://api.example";
@@ -161,10 +166,18 @@ async function storedScopes(deviceId: string): Promise<string[]> {
 /**
  * Seed the relay row a phone would have posted.
  *
- * Direct SQL because the write half of the seam (`putFixForUser`) is U7 and
- * does not exist yet — this is a *test* reaching for it, never product code
- * (the Definition of Done's "no SQL touches `device_fixes` outside the relay
- * seam" is about `src/`). U7 replaces this helper's body with the real call.
+ * Direct SQL, and it stays that way now that U7 has landed `putFixForUser`.
+ * Half the cases below need a fix on a board that does *not* currently hold
+ * `read:fix` — another account's default-scoped device, or the row a
+ * half-completed revocation left behind — and the fan-out write refuses
+ * exactly those by design (R11's predicate is the grant *and* `revoked_at IS
+ * NULL`). Routing this helper through the seam would make those tests seed
+ * nothing and pass vacuously against a `fixCount` of 0.
+ *
+ * This is a *test* reaching past the seam, never product code: the Definition
+ * of Done's "no SQL touches `device_fixes` outside the relay seam" is about
+ * `src/`. The relay suite (`relay.test.ts`) exercises the seam's own round
+ * trip.
  */
 async function seedFix(deviceId: string): Promise<void> {
   const now = nowSec();
@@ -174,6 +187,22 @@ async function seedFix(deviceId: string): Promise<void> {
   )
     .bind(deviceId, 40.6923, -73.9873, 8, now)
     .run();
+}
+
+/** What this board's own `/v1/locate` makes of its credential right now. */
+async function locateAs(token: string): Promise<Record<string, unknown>> {
+  const body = { wifiAccessPoints: [] };
+  const request = req("/v1/locate", { method: "POST", bearer: token, body });
+  const res = await routeLocate(request, e(), new URL(request.url));
+  expect(res.status).toBe(200);
+  return res.json<Record<string, unknown>>();
+}
+
+/** The same question at the other endpoint that shares the locate seam. */
+function nearbyAs(token: string): Promise<Response> {
+  const body = { wifiAccessPoints: [] };
+  const request = req("/v1/nearby", { method: "POST", bearer: token, body });
+  return routeNearby(request, e(), new URL(request.url), new Set());
 }
 
 async function fixCount(deviceId: string): Promise<number> {
@@ -639,6 +668,46 @@ describe("revoking read:fix clears the position already delivered", () => {
     expect(await fixCount(deviceId)).toBe(0);
   });
 
+  /**
+   * The orphan a fan-out racing a revocation leaves behind, and the reason a
+   * *grant* clears too.
+   *
+   * The fan-out's recipient SELECT and its batched upsert are separate round
+   * trips: a post that read this board as a recipient, then lost the race to
+   * the revocation, re-creates the row `clearFix` had just deleted. The read
+   * gate (AE6d above) correctly refuses to serve it while the grant is off —
+   * and would hand it straight over the moment the owner turned the permission
+   * back on, which is the one thing the toggle promises it will not do.
+   */
+  it("turning the permission back on never serves a position captured while it was off", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId, token } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await grant(cookie, deviceId, "read:fix", false);
+    // The row the racing fan-out wrote back, after the revocation's delete.
+    await seedFix(deviceId);
+
+    await grant(cookie, deviceId, "read:fix", true);
+
+    expect(await fixCount(deviceId)).toBe(0);
+    // ...and the board, whose grant is now live again, is told nothing rather
+    // than where its owner was while the relay was supposed to be off.
+    expect(await locateAs(token)).toEqual({ known: false });
+  });
+
+  it("a grant does not disturb a fix that arrives after it", async () => {
+    // The clear sits on the side of the write where the grant is off — before
+    // a grant, after a revoke — so an honest post landing once the permission
+    // is live is not swept up by the toggle that enabled it.
+    const cookie = await session(OWNER);
+    const { deviceId, token } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    expect(await fixCount(deviceId)).toBe(1);
+    expect(await locateAs(token)).toMatchObject({ known: true, provider: "phone" });
+  });
+
   it("does not clear the fix when a different scope is revoked", async () => {
     const cookie = await session(OWNER);
     const { deviceId } = await pairDevice(cookie);
@@ -649,15 +718,38 @@ describe("revoking read:fix clears the position already delivered", () => {
   });
 
   /**
-   * AE6d's read-side half, and it is **not implemented here**: "the device's
-   * next /v1/locate and /v1/nearby resolve without the phone provider" needs a
-   * phone provider in the chain, which is U8 (`locate.ts` today resolves WiFi →
-   * unknown and has no per-credential context at all). Writing a passing test
-   * for it now would mean asserting that a provider which does not exist did
-   * not run — vacuously green, and green again on the day U8 wires it in
-   * wrongly. Tracked in beads as the U8 acceptance for AE6d.
+   * AE6d's read-side half (U8). The stored-state half above proves the row is
+   * deleted; this proves the *chain* refuses to read one, which is the control
+   * that survives a fix written between the revocation and the delete — or by a
+   * fan-out that raced it. Both endpoints, because both go through the same
+   * seam and a device must not be able to pick the one that still answers.
+   *
+   * The scan is deliberately empty: with no access points there is nothing
+   * below the phone provider, so `{known: false}` can only mean the relay was
+   * not consulted, and no outbound geolocation call is involved either way.
    */
-  it.todo("AE6d read side: the locate chain skips the phone provider once the grant is gone (U8)");
+  it("AE6d read side: the chain skips the phone provider once the grant is gone", async () => {
+    const cookie = await session(OWNER);
+    const { deviceId, token } = await pairDevice(cookie);
+    await grant(cookie, deviceId, "read:fix", true);
+    await seedFix(deviceId);
+
+    expect(await locateAs(token)).toMatchObject({ known: true, provider: "phone" });
+    const granted = await nearbyAs(token);
+    expect(granted.status).toBe(200);
+    expect((await granted.json<{ location: { provider?: string } }>()).location.provider).toBe(
+      "phone",
+    );
+
+    await grant(cookie, deviceId, "read:fix", false);
+    // The row a fan-out racing the revocation could have written back, or that
+    // a half-completed clear left behind. The read side must not care.
+    await seedFix(deviceId);
+
+    expect(await locateAs(token)).toEqual({ known: false });
+    expect((await nearbyAs(token)).status).toBe(422);
+    expect(await fixCount(deviceId)).toBe(1); // still there, still never read
+  });
 });
 
 /* -------------------------------------------------------------------------- */

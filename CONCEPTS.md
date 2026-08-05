@@ -65,6 +65,12 @@ The two ages the Retention Purge acts on (14 and 90 days by default). Inside the
 ### Purge Run Record
 The single `maintenance_runs` row the Retention Purge upserts on every completed run, including a run that found nothing to do. A stale `last_run_at` is the alert condition — a silently failing cron is indistinguishable from a quiet one without it — and a failed run deliberately leaves the timestamp untouched.
 
+### Locate Chain
+The ordered sequence of position providers behind one interface (`api/src/locate.ts`): the relayed phone fix first, then WiFi trilateration, then `{"known": false}`. Every provider's answer is checked against the one accuracy gate as it arrives, and a rejected answer falls through to the next provider rather than ending resolution — a fix too coarse to trust costs a WiFi lookup, not a failure. The WiFi sub-chain owns the BSSID-hash cache; nothing derived from a credential may be cached above it, because that cache is device-agnostic by construction.
+
+### Fix Quality
+Whether a relayed phone position is still *where the user is* (`current`) or only *where they were* (`last_known`), split at a 120-second horizon. Modelled on Garmin's `Position.Quality`: a last-known fix is a distinct state rather than a position with an old timestamp, so the chain prefers anything a live provider resolves and surfaces it only as a labelled fallback carrying its capture time. The device renders the age; it never shows a stale number as current.
+
 ## Accounts and auth
 
 ### Session
@@ -89,7 +95,13 @@ A separately grantable, separately revocable permission on a paired device's Bea
 Revoking a paired board from the device list: `devices.revoked_at` is stamped, its scope list is emptied, and its stored fix is cleared. The row itself survives, so the board's token keeps resolving to the same `401` a token that never existed gets, and the account's diagnostic attribution is not orphaned. Turning the `read:fix` scope off on its own performs the second and third of those steps — revocation is a property of the grant, not of the unpair button.
 
 ### Relay Seam
-The three functions that are allowed to touch `device_fixes` (`api/src/relay.ts`): `putFixForUser` writes the account's latest phone position to every device holding `read:fix`, `getFix` reads one device's row for the locate chain, and `clearFix` deletes it. No SQL against that table exists anywhere else — that is what keeps moving the relay off D1 a three-function change rather than a data migration. Only `clearFix` exists today; the other two arrive with the relay itself.
+The three functions that are allowed to touch `device_fixes` (`api/src/relay.ts`): `putFixForUser` writes the account's latest phone position to every device holding `read:fix`, `getFix` reads one device's row for the locate chain, and `clearFix` deletes it. No SQL against that table exists anywhere else — that is what keeps moving the relay off D1 a three-function change rather than a data migration. A fourth name, `purgeFixesOlderThan`, exists only so the Retention Purge sweeps the table in bounded batches through the seam rather than with SQL of its own.
+
+### Relay Post
+The account-scoped write that puts a phone's position into the Relay Seam: `POST /v1/locate/ref` with `relay: true`, session-authenticated, **naming no device**. The session says whose position it is and the `read:fix` grant list says which boards receive it, so the request has no ownership parameter to validate and the config UI needs no device picker. It short-circuits the diagnostic pairing lookup — a phone posting its position has no device WiFi scan from the last 60 seconds in the normal case — and is budgeted per session and per client network, being the highest-frequency write in the system.
+
+### Locate Log Attribution
+Recording *who* an inserted `locate_log` row belongs to (`user_id`, plus `device_row_id` when a paired board wrote it), populated from the resolved credential and left NULL on the anonymous path. It exists so "delete all my location history" has rows to delete, and it splits the daily insert cap into two identity spaces that never merge: a client-chosen `device_id` for anonymous rows, a server-minted id for attributed ones. Merging them would let an anonymous caller who learns a board's id burn its cap and write into an identified user's history.
 
 ### Send Budget
 The sharded daily counter set (`auth_budgets`) gating magic-link delivery: a per-address cap charged first, then a global cap split into a `known` slice (addresses with an existing account) and a smaller `unknown` slice. The split exists so spraying unknown addresses cannot exhaust the shared daily cap and lock out real users — it costs only the attacker's own slice. A separate `send:failure` scope counts delivery failures rather than requests and is retained past the daily sweep that clears the others, because it is the only durable signal that a mail-provider outage happened.

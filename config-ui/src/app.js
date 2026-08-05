@@ -24,6 +24,7 @@ import {
 import { displayName, renderDevices, renderMetadata } from "./devices-view.js";
 import { GEO_OPTIONS, formatFix, geolocationErrorMessage, insecureContextMessage } from "./geo.js";
 import { bannerForMode, fetchAuthMode } from "./mode.js";
+import { RELAY_THROTTLED_MESSAGE, postFix, shouldPost } from "./relay.js";
 
 /** Where the device sends the human (`PAIR_VERIFICATION_PATH` in pair.ts). */
 const PAIR_PATH = "/pair";
@@ -82,9 +83,18 @@ function mountCapture() {
     verdict: document.getElementById("fix-verdict"),
   };
 
-  // Bound to a click, never called on load: browsers only prompt for location
-  // from a user gesture, and a prompt nobody asked for gets dismissed.
-  button.addEventListener("click", () => {
+  /**
+   * Ask the phone once, from a user gesture, and render what came back.
+   *
+   * Always triggered by a click and never called on load: browsers only prompt
+   * for location from a gesture, and a prompt nobody asked for gets dismissed.
+   * Both buttons share it so the "is this page even allowed to ask" explainer
+   * and the per-error copy cannot drift between them.
+   *
+   * @param {HTMLButtonElement} activeButton
+   * @param {(position: GeolocationPosition) => void} onFix
+   */
+  function requestFix(activeButton, onFix) {
     hide(result);
     const blocked = insecureContextMessage(
       window.location,
@@ -95,26 +105,72 @@ function mountCapture() {
       show(status, blocked);
       return;
     }
-    button.disabled = true;
+    activeButton.disabled = true;
     show(status, "Asking your phone where it is…");
     navigator.geolocation.getCurrentPosition(
       (position) => {
-        button.disabled = false;
+        activeButton.disabled = false;
         const fix = formatFix(position);
         if (fields.lat) fields.lat.textContent = fix.lat;
         if (fields.lon) fields.lon.textContent = fix.lon;
         if (fields.accuracy) fields.accuracy.textContent = fix.accuracy;
         if (fields.captured) fields.captured.textContent = fix.capturedAt;
         if (fields.verdict) fields.verdict.textContent = fix.verdict;
-        show(status, "Got a fix. Nothing was sent anywhere.");
         result.hidden = false;
+        onFix(position);
       },
       (error) => {
-        button.disabled = false;
+        activeButton.disabled = false;
         show(status, geolocationErrorMessage(error));
       },
       GEO_OPTIONS,
     );
+  }
+
+  button.addEventListener("click", () => {
+    requestFix(button, () => show(status, "Got a fix. Nothing was sent anywhere."));
+  });
+
+  mountRelay(requestFix);
+}
+
+/**
+ * The relay's write half (U14; R11). One gesture-triggered send, throttled to
+ * the wearable cadence.
+ *
+ * The throttle is checked **before** the phone is asked for a position rather
+ * than before the post: a button that reads the GPS and then declines to send
+ * has spent the battery for nothing, and "no more than about once a minute" is
+ * a statement about the whole action.
+ *
+ * @param {(activeButton: HTMLButtonElement, onFix: (position: GeolocationPosition) => void) => void} requestFix
+ */
+function mountRelay(requestFix) {
+  const button = /** @type {HTMLButtonElement|null} */ (document.getElementById("relay-button"));
+  const status = document.getElementById("relay-status");
+  const captureStatus = document.getElementById("capture-status");
+  if (!button || !status) return;
+
+  /** When the last *accepted* post went out; null until one has. */
+  let lastPostedAtMs = null;
+
+  button.addEventListener("click", () => {
+    if (!shouldPost(lastPostedAtMs)) {
+      show(status, RELAY_THROTTLED_MESSAGE);
+      return;
+    }
+    hide(status);
+    requestFix(button, async (position) => {
+      if (captureStatus) show(captureStatus, "Got a fix.");
+      button.disabled = true;
+      show(status, "Sending to your devices…");
+      const outcome = await postFix(position);
+      button.disabled = false;
+      // The clock starts on an accepted post only: a refusal the user can fix
+      // — signed out, offline — must not also lock the button for a minute.
+      if (outcome.state === "sent") lastPostedAtMs = Date.now();
+      show(status, outcome.message);
+    });
   });
 }
 

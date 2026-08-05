@@ -110,11 +110,26 @@
         <h2 id="capture-heading">Location check</h2>
         <p class="muted">
           Reads this phone's position once and shows the raw accuracy the
-          browser reports. Nothing is sent anywhere — this is a local check that
-          your phone can produce a fix good enough to pick a platform entrance.
+          browser reports. <strong>Check my location</strong> keeps the reading
+          on this phone — it is a local check that your phone can produce a fix
+          good enough to pick a platform entrance.
         </p>
         <button id="capture-button" type="button">Check my location</button>
         <p id="capture-status" class="status" role="status" hidden></p>
+        <!--
+          The relay's write half (U14, R11). The request names no device: the
+          session says whose position this is and the per-device "Your phone's
+          live position" permission above says which boards receive it, so
+          there is deliberately no device picker here.
+        -->
+        <p class="muted">
+          <strong>Send my position</strong> is the other half: it delivers this
+          reading to every board you have given “Your phone's live position” to,
+          and to nothing else. Each board keeps the latest position only, and
+          turning that permission off deletes it.
+        </p>
+        <button id="relay-button" type="button">Send my position to my devices</button>
+        <p id="relay-status" class="status" role="status" hidden></p>
         <dl id="capture-result" class="fix" hidden>
           <dt>Latitude</dt>
           <dd id="fix-lat"></dd>

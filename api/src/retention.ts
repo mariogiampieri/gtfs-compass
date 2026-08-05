@@ -25,7 +25,8 @@
  */
 
 import { SEND_FAILURE_SCOPE, budgetDay } from "./email";
-import { intVar } from "./locate";
+import { intVar } from "./vars";
+import { purgeFixesOlderThan } from "./relay";
 import { PAIR_CLAIM_REFUSED_SCOPE, PAIR_START_REFUSED_SCOPE } from "./routes/pair";
 
 /**
@@ -94,35 +95,55 @@ function retentionDays(env: Env): number {
 }
 
 /**
- * One phase: the same statement re-run until it comes back short (nothing left
- * to do) or the invocation's batch budget is spent.
+ * One phase: the same bounded batch re-run until it comes back short (nothing
+ * left to do) or the invocation's batch budget is spent.
  *
  * The bound exists because `locate_log` grows unbounded and D1 has statement
  * and wall-clock limits — a first run against a year of backlog must not be one
- * enormous DELETE. Every statement is written so a partial run is simply a
- * shorter run: the predicates are self-latching (a nulled row no longer matches
- * tier one, a deleted row no longer matches anything), so the next tick resumes
- * from wherever this one stopped with no cursor to persist.
+ * enormous DELETE. Every batch is written so a partial run is simply a shorter
+ * run: the predicates are self-latching (a nulled row no longer matches tier
+ * one, a deleted row no longer matches anything), so the next tick resumes from
+ * wherever this one stopped with no cursor to persist.
+ *
+ * It takes a *runner* rather than SQL so that a phase whose table is owned by
+ * another seam can still be batched here: `device_fixes` belongs to `relay.ts`
+ * (the Definition of Done's "no SQL outside the relay seam"), and this is how
+ * the sweep bounds a table whose statement it does not write.
  */
-async function purgeInBatches(
-  env: Env,
-  sql: string,
-  binds: unknown[],
+async function repeatBounded(
+  runBatch: () => Promise<number>,
   limit: number,
   maxBatches: number,
 ): Promise<{ rows: number; pending: boolean }> {
   let rows = 0;
   for (let i = 0; i < maxBatches; i++) {
-    const result = await env.DB.prepare(sql)
-      .bind(...binds, limit)
-      .run();
-    const changed = result.meta?.changes ?? 0;
+    const changed = await runBatch();
     rows += changed;
     if (changed < limit) return { rows, pending: false };
   }
   // A final batch that happened to drain the table exactly reports pending
   // anyway; the cost of that false positive is one no-op run.
   return { rows, pending: true };
+}
+
+/** `repeatBounded` over a statement this module owns; the limit binds last. */
+function purgeInBatches(
+  env: Env,
+  sql: string,
+  binds: unknown[],
+  limit: number,
+  maxBatches: number,
+): Promise<{ rows: number; pending: boolean }> {
+  return repeatBounded(
+    async () => {
+      const result = await env.DB.prepare(sql)
+        .bind(...binds, limit)
+        .run();
+      return result.meta?.changes ?? 0;
+    },
+    limit,
+    maxBatches,
+  );
 }
 
 /**
@@ -143,6 +164,12 @@ export async function runRetentionPurge(env: Env, nowMs: number = Date.now()): P
   let pending = false;
   const phase = async (sql: string, binds: unknown[]): Promise<number> => {
     const result = await purgeInBatches(env, sql, binds, limit, maxBatches);
+    pending = pending || result.pending;
+    return result.rows;
+  };
+  /** The same phase accounting for a table another seam owns the SQL for. */
+  const phaseVia = async (runBatch: () => Promise<number>): Promise<number> => {
+    const result = await repeatBounded(runBatch, limit, maxBatches);
     pending = pending || result.pending;
     return result.rows;
   };
@@ -191,15 +218,11 @@ export async function runRetentionPurge(env: Env, nowMs: number = Date.now()): P
     [preciseCutoff],
   );
 
-  // device_fixes carries no id column (device_id is the PK), so the bounded
-  // sub-select goes through rowid; idx_device_fixes_captured_at orders it.
-  const fixesDeleted = await phase(
-    `DELETE FROM device_fixes
-      WHERE rowid IN (SELECT rowid FROM device_fixes
-                       WHERE captured_at < ?1
-                       ORDER BY captured_at LIMIT ?2)`,
-    [preciseCutoff],
-  );
+  // Through the relay seam, never as SQL here: `device_fixes` is owned by
+  // `relay.ts` so the documented D1→Durable-Object swap stays a change to that
+  // one file. The batching and the bound are still this module's — the seam
+  // deletes one batch and says how many rows went.
+  const fixesDeleted = await phaseVia(() => purgeFixesOlderThan(env, preciseCutoff, limit));
 
   // Expired credentials. An expired magic token is already unredeemable and an
   // expired pairing code already unclaimable — this is storage hygiene, not an
