@@ -1717,3 +1717,41 @@ describe("nearby answers 401 for a presented-but-invalid device token (R6)", () 
     expect(await withBadToken.text()).toBe(await anon.text());
   });
 });
+
+describe("nearby 401 gate — review fixes (cookie slide, GET parity)", () => {
+  it("GET with an invalid device token is refused like POST", async () => {
+    const res = await SELF.fetch(
+      `${ORIGIN}/v1/nearby?lat=40.69&lon=-73.98`,
+      {
+        headers: {
+          "CF-Connecting-IP": freshIp(),
+          Authorization: `Bearer ${DEVICE_TOKEN_PREFIX}neverminted`,
+        },
+      },
+    );
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe('{"error":"invalid device token"}');
+  });
+
+  it("a 401 that slid the session still re-issues the cookie", async () => {
+    // resolveCredential slides an aged session in D1 as a side effect even
+    // when the request is then refused; the 401 must carry the Set-Cookie or
+    // the browser's Max-Age desyncs from D1 (refreshCookie's contract).
+    const { token: cookie } = await signIn("usr_slide_401");
+    await ageSession(cookie);
+    const res = await postNearby(
+      { wifiAccessPoints: uniqueAps() },
+      { cookie, token: "stray-header-value" },
+    );
+    expect(res.status).toBe(401);
+    expect(res.headers.get("Set-Cookie") ?? "").toContain(SESSION_COOKIE);
+  });
+
+  it("headerless GET stays byte-identical anonymous (no gate, no resolution)", async () => {
+    const res = await SELF.fetch(`${ORIGIN}/v1/nearby?lat=40.69&lon=-73.98`, {
+      headers: { "CF-Connecting-IP": freshIp() },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('"location":{"lat":40.69,"lon":-73.98,"accuracy":null}');
+  });
+});

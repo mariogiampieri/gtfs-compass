@@ -361,7 +361,13 @@ static void render_pairing(lv_obj_t *content, const ui_state_t *st) {
                     "for a fresh code.");
       return;
     case PAIR_FAILED:
-      ui_empty_mode(content, "Pairing failed", "Run `pair` on the console", "to try again.");
+      if (st->pair_rate_limited) {
+        /* An immediate retry feeds the rate limiter (review) — say so. */
+        ui_empty_mode(content, "Server busy", "Wait a minute, then run `pair`",
+                      "on the console again.");
+      } else {
+        ui_empty_mode(content, "Pairing failed", "Run `pair` on the console", "to try again.");
+      }
       return;
     default:
       /* IDLE/PAIRED never render here — ui_pairing_update restores the

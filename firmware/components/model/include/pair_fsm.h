@@ -62,6 +62,9 @@ typedef enum {
 
 typedef struct {
   pair_state_t state;
+  /* Set when a start was refused 429 — the FAILED screen says "server
+   * busy", not "try again now" (an immediate retry feeds the limiter). */
+  bool rate_limited;
   char user_code[PAIR_USER_CODE_LEN];     /* display-formatted, dash included */
   char device_code[PAIR_DEVICE_CODE_LEN]; /* secret: never displayed/logged */
   char token[PAIR_TOKEN_LEN];             /* valid once state == PAIR_PAIRED */
@@ -74,10 +77,11 @@ typedef struct {
 void pair_fsm_init(pair_fsm_t *f);
 
 /*
- * The console `pair` command. From IDLE/EXPIRED/FAILED begins a fresh
- * session and returns true. From CODE_ACTIVE returns false — the caller
- * re-displays the live code rather than burning it (plan: re-issuing `pair`
- * never starts a second session). From STARTING/PAIRED also a false no-op.
+ * The console `pair` command. From IDLE/EXPIRED/FAILED — and PAIRED, so a
+ * board whose token later died can re-pair without a power cycle (review
+ * P1) — begins a fresh session and returns true. From CODE_ACTIVE returns
+ * false: the caller re-displays the live code rather than burning it.
+ * From STARTING also a false no-op.
  */
 bool pair_fsm_start(pair_fsm_t *f, int64_t now);
 
@@ -103,6 +107,12 @@ void pair_fsm_on_poll_response(pair_fsm_t *f, int status, const char *body, size
 /* The request never reached the server (join lost, DNS, TLS). Transient
  * during CODE_ACTIVE; fatal for a start that never got its code. */
 void pair_fsm_on_transport_error(pair_fsm_t *f, int64_t now);
+
+/* The executor's answer to PAIR_ACT_PERSIST_TOKEN. A failed NVS write must
+ * not leave the board claiming PAIRED while it runs anonymous (review P2):
+ * ok keeps PAIRED; failure lands on FAILED so the screen says so and a
+ * fresh `pair` is the recovery. */
+void pair_fsm_on_persist_result(pair_fsm_t *f, bool ok);
 
 /* When net_task should next wake for this FSM (poll due / grace expiry),
  * or 0 when the FSM needs no wakeup (IDLE and terminal states). */

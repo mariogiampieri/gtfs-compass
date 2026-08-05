@@ -95,22 +95,36 @@ bool gc_token_set(const char *token) {
 
 void gc_token_clear(void) {
   nvs_handle_t h;
-  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) {
+    ESP_LOGE(TAG, "token clear: NVS open failed");
+    return;
+  }
+  /* erase_key returns NOT_FOUND for an absent key — that is a clear, not a
+   * failure; only a failed commit means the erase may not have persisted. */
   nvs_erase_key(h, "token");
   nvs_erase_key(h, "revoked");
-  nvs_commit(h);
+  bool ok = nvs_commit(h) == ESP_OK;
   nvs_close(h);
-  ESP_LOGI(TAG, "device token cleared");
+  ESP_LOGI(TAG, "device token %s", ok ? "cleared" : "clear FAILED (may reload on reboot)");
 }
 
 void gc_token_revoke(void) {
   nvs_handle_t h;
-  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) {
+    ESP_LOGE(TAG, "token revoke: NVS open failed — revocation is RAM-only until reboot");
+    return;
+  }
   nvs_erase_key(h, "token");
-  nvs_set_u8(h, "revoked", 1);
-  nvs_commit(h);
+  bool ok = nvs_set_u8(h, "revoked", 1) == ESP_OK;
+  ok = nvs_commit(h) == ESP_OK && ok;
   nvs_close(h);
-  ESP_LOGW(TAG, "device token revoked by the server — board is unpaired");
+  if (ok) {
+    ESP_LOGW(TAG, "device token revoked by the server — board is unpaired");
+  } else {
+    /* Honest failure (review): a stale token surviving in NVS means one
+     * extra 401-and-revoke on the next boot, not silent success. */
+    ESP_LOGE(TAG, "token revoke: NVS write failed — a stale token may retry once after reboot");
+  }
 }
 
 bool gc_revoked_get(void) {

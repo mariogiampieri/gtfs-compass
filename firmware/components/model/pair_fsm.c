@@ -12,13 +12,7 @@
 #include <string.h>
 
 #include "cJSON.h"
-
-static void copy_bounded(char *dst, size_t cap, const char *src) {
-  size_t n = strlen(src);
-  if (n >= cap) n = cap - 1;
-  memcpy(dst, src, n);
-  dst[n] = '\0';
-}
+#include "gc_str.h"
 
 void pair_fsm_init(pair_fsm_t *f) {
   memset(f, 0, sizeof(*f));
@@ -30,13 +24,14 @@ bool pair_fsm_start(pair_fsm_t *f, int64_t now) {
   switch (f->state) {
     case PAIR_IDLE:
     case PAIR_EXPIRED:
-    case PAIR_FAILED: {
+    case PAIR_FAILED:
+    case PAIR_PAIRED: { /* re-pair after a token died — no power cycle (P1) */
       pair_fsm_init(f);
       f->state = PAIR_STARTING;
       return true;
     }
     default:
-      /* CODE_ACTIVE: caller re-displays the live code. STARTING/PAIRED: no-op. */
+      /* CODE_ACTIVE: caller re-displays the live code. STARTING: no-op. */
       return false;
   }
 }
@@ -81,6 +76,7 @@ void pair_fsm_on_start_response(pair_fsm_t *f, int status, const char *body, siz
                                 int64_t now) {
   if (f->state != PAIR_STARTING) return;
   if (status != 200 || body == NULL) {
+    f->rate_limited = status == 429;
     f->state = PAIR_FAILED;
     return;
   }
@@ -94,8 +90,8 @@ void pair_fsm_on_start_response(pair_fsm_t *f, int status, const char *body, siz
     f->state = PAIR_FAILED;
     return;
   }
-  copy_bounded(f->user_code, sizeof(f->user_code), user->valuestring);
-  copy_bounded(f->device_code, sizeof(f->device_code), dev->valuestring);
+  gc_copy_bounded(f->user_code, sizeof(f->user_code), user->valuestring);
+  gc_copy_bounded(f->device_code, sizeof(f->device_code), dev->valuestring);
   f->interval_s = cJSON_IsNumber(itv) && itv->valueint > 0 ? itv->valueint
                                                            : PAIR_DEFAULT_INTERVAL_S;
   f->deadline = now + (int64_t)exp->valuedouble;
@@ -130,7 +126,7 @@ void pair_fsm_on_poll_response(pair_fsm_t *f, int status, const char *body, size
     cJSON *root = cJSON_ParseWithLength(body, len);
     const cJSON *tok = cJSON_GetObjectItemCaseSensitive(root, "access_token");
     if (cJSON_IsString(tok) && tok->valuestring[0] != '\0') {
-      copy_bounded(f->token, sizeof(f->token), tok->valuestring);
+      gc_copy_bounded(f->token, sizeof(f->token), tok->valuestring);
       f->state = PAIR_PAIRED;
     }
     /* 200 with a malformed or token-less body: a proxy hiccup, not a
@@ -154,6 +150,16 @@ void pair_fsm_on_poll_response(pair_fsm_t *f, int status, const char *body, size
     }
   }
   /* 429, 5xx, unparseable: transient — keep polling at the floor. */
+}
+
+void pair_fsm_on_persist_result(pair_fsm_t *f, bool ok) {
+  if (f->state != PAIR_PAIRED) return;
+  if (!ok) {
+    /* The token never landed in NVS: claiming PAIRED would be a lie the
+     * board tells itself until reboot. persist_emitted stays latched so a
+     * retry loop cannot form; a fresh `pair` mints a new session. */
+    f->state = PAIR_FAILED;
+  }
 }
 
 void pair_fsm_on_transport_error(pair_fsm_t *f, int64_t now) {

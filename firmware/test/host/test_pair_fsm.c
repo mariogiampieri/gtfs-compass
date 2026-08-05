@@ -233,8 +233,74 @@ static void test_request_plan_token_beats_override(void) {
   TEST_ASSERT_EQUAL(PAIR_PLAN_POST_ANON, pair_request_plan(false, false));
 }
 
+static void test_restart_allowed_after_paired(void) {
+  /* Review P1: a token can die after a same-boot pairing (401 revocation or
+   * token_clear); `pair` must mint a fresh session without a power cycle. */
+  int64_t now = 1000;
+  start_session(now);
+  TEST_ASSERT_EQUAL(PAIR_ACT_SEND_POLL, pair_fsm_take_action(&f, now + 5));
+  pair_fsm_on_poll_response(&f, 200, POLL_TOKEN, strlen(POLL_TOKEN), now + 5);
+  TEST_ASSERT_EQUAL(PAIR_PAIRED, f.state);
+
+  TEST_ASSERT_TRUE(pair_fsm_start(&f, now + 60));
+  TEST_ASSERT_EQUAL(PAIR_STARTING, f.state);
+  TEST_ASSERT_EQUAL_STRING("", f.token);
+}
+
+static void test_persist_failure_lands_failed_not_paired(void) {
+  /* Review P2: a failed NVS write must not leave the board claiming PAIRED
+   * while it runs anonymous; no persist-retry loop may form. */
+  int64_t now = 1000;
+  start_session(now);
+  TEST_ASSERT_EQUAL(PAIR_ACT_SEND_POLL, pair_fsm_take_action(&f, now + 5));
+  pair_fsm_on_poll_response(&f, 200, POLL_TOKEN, strlen(POLL_TOKEN), now + 5);
+  TEST_ASSERT_EQUAL(PAIR_ACT_PERSIST_TOKEN, pair_fsm_take_action(&f, now + 5));
+  pair_fsm_on_persist_result(&f, false);
+  TEST_ASSERT_EQUAL(PAIR_FAILED, f.state);
+  TEST_ASSERT_EQUAL(PAIR_ACT_NONE, pair_fsm_take_action(&f, now + 10)); /* no loop */
+  TEST_ASSERT_TRUE(pair_fsm_start(&f, now + 20)); /* recovery is a fresh pair */
+
+  /* The success path stays PAIRED. */
+  start_session(now + 100);
+  TEST_ASSERT_EQUAL(PAIR_ACT_SEND_POLL, pair_fsm_take_action(&f, now + 105));
+  pair_fsm_on_poll_response(&f, 200, POLL_TOKEN, strlen(POLL_TOKEN), now + 105);
+  TEST_ASSERT_EQUAL(PAIR_ACT_PERSIST_TOKEN, pair_fsm_take_action(&f, now + 105));
+  pair_fsm_on_persist_result(&f, true);
+  TEST_ASSERT_EQUAL(PAIR_PAIRED, f.state);
+}
+
+static void test_rate_limited_start_sets_the_flag(void) {
+  int64_t now = 1000;
+  pair_fsm_init(&f);
+  TEST_ASSERT_TRUE(pair_fsm_start(&f, now));
+  pair_fsm_on_start_response(&f, 429, "{\"error\":\"rate limited\"}", 24, now);
+  TEST_ASSERT_EQUAL(PAIR_FAILED, f.state);
+  TEST_ASSERT_TRUE(f.rate_limited);
+  /* a non-429 failure does not claim the server was busy */
+  pair_fsm_init(&f);
+  TEST_ASSERT_TRUE(pair_fsm_start(&f, now));
+  pair_fsm_on_start_response(&f, 500, "oops", 4, now);
+  TEST_ASSERT_EQUAL(PAIR_FAILED, f.state);
+  TEST_ASSERT_FALSE(f.rate_limited);
+}
+
+static void test_unknown_400_error_keeps_polling(void) {
+  /* RFC 8628 forward-compat: an unrecognized error string (e.g. slow_down
+   * if the server ever adds it) is not a verdict — keep polling. */
+  int64_t now = 1000;
+  start_session(now);
+  TEST_ASSERT_EQUAL(PAIR_ACT_SEND_POLL, pair_fsm_take_action(&f, now + 5));
+  pair_fsm_on_poll_response(&f, 400, "{\"error\":\"slow_down\"}", 22, now + 5);
+  TEST_ASSERT_EQUAL(PAIR_CODE_ACTIVE, f.state);
+  TEST_ASSERT_EQUAL(PAIR_ACT_SEND_POLL, pair_fsm_take_action(&f, now + 10));
+}
+
 int main(void) {
   UNITY_BEGIN();
+  RUN_TEST(test_restart_allowed_after_paired);
+  RUN_TEST(test_persist_failure_lands_failed_not_paired);
+  RUN_TEST(test_rate_limited_start_sets_the_flag);
+  RUN_TEST(test_unknown_400_error_keeps_polling);
   RUN_TEST(test_request_plan_token_beats_override);
   RUN_TEST(test_happy_path_with_interval_floor);
   RUN_TEST(test_persist_emitted_exactly_once);

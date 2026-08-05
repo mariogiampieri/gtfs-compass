@@ -96,10 +96,24 @@ typedef struct {
   int32_t pair_seconds;
   uint8_t pair_epoch;        /* bumps on every console `pair`; a bump undoes
                                 a dismissal so the live code re-displays */
+  bool pair_rate_limited;    /* FAILED because the server said 429 — the
+                                screen says "server busy", not "retry now" */
   bool pair_view_dismissed;
   bool unpaired;
   ui_view_t pair_prior_view; /* where dismissal/completion returns to */
 } ui_state_t;
+
+/* A published pairing snapshot, as ui_pairing_update consumes it. Mirrors
+ * the net task's pairing message without depending on its header (the ui
+ * component stays platform-free). */
+typedef struct {
+  pair_state_t phase;
+  const char *code; /* NUL-terminated; may be "" */
+  int32_t seconds;
+  uint8_t epoch;
+  bool rate_limited;
+  bool unpaired;
+} ui_pair_snapshot_t;
 
 /* Canonical initializer: zeroes the struct (memcmp-safe padding) and sets
  * the unknown sentinels (age_s = -1, battery_pct = -1). Plain zeroing would
@@ -136,8 +150,7 @@ void ui_reconcile_deferred(ui_state_t *state, const model_nearby_t *model, int32
  *   - model applies never touch the pairing view (reconcile leaves it be).
  * Returns true when the visible view changed (caller re-renders).
  */
-bool ui_pairing_update(ui_state_t *state, pair_state_t phase, const char *code,
-                       int32_t seconds, bool unpaired, uint8_t epoch);
+bool ui_pairing_update(ui_state_t *state, const ui_pair_snapshot_t *snap);
 
 /* A tap/swipe on the pairing screen: leave the view (session untouched —
  * dismissing the VIEW never cancels the session; the net task owns the FSM).

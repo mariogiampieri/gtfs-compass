@@ -17,6 +17,7 @@
 
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -41,7 +42,8 @@ static const char *TAG = "gc-net";
 /* Pairing responses are tiny JSON objects; 2 KB is generous. */
 #define PAIR_BODY_CAP 2048
 
-static QueueHandle_t g_queue; /* item: gc_net_msg_t */
+static QueueHandle_t g_queue;      /* item: gc_net_msg_t (fetch outcomes) */
+static QueueHandle_t g_pair_queue; /* item: gc_pair_msg_t (pairing snapshots) */
 static EventGroupHandle_t g_wifi_events;
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -159,20 +161,23 @@ static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
   return ESP_OK;
 }
 
-/* Full-snapshot publish (net_task.h contract): every message carries the
- * pairing snapshot and the unpaired marker; `model` only rides on a fresh
- * successful fetch. */
+/* One queue per dimension (net_task.h): a fetch publish can only displace
+ * an older fetch publish, a pairing publish only an older pairing one. */
 static void publish(gc_net_status_t status, model_nearby_t *model) {
-  gc_net_msg_t msg = {
-      .status = status,
-      .model = model,
-      .pair_phase = g_pair.state,
-      .pair_seconds_left = pair_fsm_seconds_left(&g_pair, now_s()),
-      .pair_epoch = g_pair_epoch,
+  gc_net_msg_t msg = {.status = status, .model = model};
+  xQueueOverwrite(g_queue, &msg);
+}
+
+static void publish_pairing(void) {
+  gc_pair_msg_t msg = {
+      .phase = g_pair.state,
+      .seconds_left = pair_fsm_seconds_left(&g_pair, now_s()),
+      .epoch = g_pair_epoch,
+      .rate_limited = g_pair.rate_limited,
       .unpaired = g_revoked,
   };
-  memcpy(msg.pair_code, g_pair.user_code, sizeof(msg.pair_code));
-  xQueueOverwrite(g_queue, &msg);
+  memcpy(msg.code, g_pair.user_code, sizeof(msg.code));
+  xQueueOverwrite(g_pair_queue, &msg);
 }
 
 /*
@@ -216,13 +221,22 @@ static int pair_http(const char *path, const char *bearer, const char *post_body
  * so steady-state polling publishes nothing). */
 static void drive_pairing(void) {
   static char body[PAIR_BODY_CAP];
-  pair_action_t act;
-  while ((act = pair_fsm_take_action(&g_pair, now_s())) != PAIR_ACT_NONE) {
+  /* The state can flip INSIDE take_action too (grace exhaustion transitions
+   * to EXPIRED while returning NONE — review fix: that transition must
+   * publish promptly, not ride the next 30 s fetch), so the change check
+   * wraps the whole call, not just the action handling. */
+  for (;;) {
     pair_state_t before = g_pair.state;
+    pair_action_t act = pair_fsm_take_action(&g_pair, now_s());
     switch (act) {
       case PAIR_ACT_SEND_START: {
-        int st = pair_http("/v1/device/pair/start", NULL,
-                           "{\"device_name\":\"gtfs-compass\"}", body, sizeof(body));
+        static char start_body[96];
+        /* fw_version fills the device list's column (review note); the app
+         * descriptor's version is the source the build already stamps. */
+        snprintf(start_body, sizeof(start_body),
+                 "{\"device_name\":\"gtfs-compass\",\"fw_version\":\"%.30s\"}",
+                 esp_app_get_description()->version);
+        int st = pair_http("/v1/device/pair/start", NULL, start_body, body, sizeof(body));
         if (st < 0) pair_fsm_on_transport_error(&g_pair, now_s());
         else pair_fsm_on_start_response(&g_pair, st, body, strlen(body), now_s());
         break;
@@ -234,21 +248,25 @@ static void drive_pairing(void) {
         break;
       }
       case PAIR_ACT_PERSIST_TOKEN: {
-        if (gc_token_set(g_pair.token)) {
+        bool ok = gc_token_set(g_pair.token);
+        if (ok) {
           strlcpy(g_token, g_pair.token, sizeof(g_token));
           g_revoked = false;
           ESP_LOGI(TAG, "paired — authenticated fetches from the next poll");
         } else {
           ESP_LOGE(TAG, "token NVS write failed — board stays anonymous");
         }
+        /* A failed persist lands the FSM on FAILED so the screen tells the
+         * truth instead of claiming PAIRED over an anonymous board (P2). */
+        pair_fsm_on_persist_result(&g_pair, ok);
         break;
       }
       default:
         break;
     }
-    if (g_pair.state != before || act == PAIR_ACT_PERSIST_TOKEN) {
-      publish(GC_NET_KEEP, NULL);
-    }
+    bool changed = g_pair.state != before || act == PAIR_ACT_PERSIST_TOKEN;
+    if (changed) publish_pairing();
+    if (act == PAIR_ACT_NONE) break;
   }
 }
 
@@ -296,10 +314,17 @@ static gc_net_status_t fetch_once(model_nearby_t *out) {
     esp_http_client_set_post_field(client, post_body, post_len);
   }
   if (plan == PAIR_PLAN_POST_AUTH) {
-    /* Bearer header only — the server rejects tokens in URLs by design. */
-    static char auth[GC_TOKEN_LEN + 8];
-    snprintf(auth, sizeof(auth), "Bearer %s", g_token);
-    esp_http_client_set_header(client, "Authorization", auth);
+    /* Bearer header only — the server rejects tokens in URLs by design. The
+     * credential never rides a cleartext link (review): a non-https base URL
+     * is a dev misconfiguration, and leaking the token to it would be worse
+     * than the fetch degrading to anonymous. */
+    if (strncmp(CONFIG_GC_API_BASE_URL, "https://", 8) == 0) {
+      static char auth[GC_TOKEN_LEN + 8];
+      snprintf(auth, sizeof(auth), "Bearer %s", g_token);
+      esp_http_client_set_header(client, "Authorization", auth);
+    } else {
+      ESP_LOGE(TAG, "API base URL is not https — refusing to send the device token");
+    }
   }
   esp_err_t err = esp_http_client_perform(client);
   int status = esp_http_client_get_status_code(client);
@@ -343,6 +368,8 @@ static void net_task(void *arg) {
   }
   g_revoked = gc_revoked_get();
   pair_fsm_init(&g_pair);
+  publish_pairing(); /* boot snapshot: the unpaired marker renders from the
+                        first frame, not the first pairing event */
 
   if (!wifi_start()) {
     publish(GC_NET_NO_CREDS, NULL);
@@ -366,24 +393,23 @@ static void net_task(void *arg) {
   int64_t next_fetch_ms = 0; /* first fetch immediately */
 
   while (1) {
-    /* Mid-run drop: report OFFLINE each poll rather than hanging on fetch. */
-    if (!(xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT)) {
-      publish(GC_NET_OFFLINE, NULL);
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
-      continue;
-    }
-
-    /* Console commands (flags set from other tasks; the notify woke us). */
+    /* Console commands come FIRST — before the connectivity gate (review):
+     * token_drop and dismiss are pure local state and need no network, and
+     * an offline `pair` must fail loudly via the transport-error path (the
+     * FAILED screen) instead of silently deferring until WiFi returns. */
     if (g_cmd_token_drop) {
       g_cmd_token_drop = false;
       g_token[0] = '\0';
       g_revoked = gc_revoked_get();
-      publish(GC_NET_KEEP, NULL);
+      /* A completed session's PAIRED state refers to a token that is now
+       * gone — reset so `pair` can mint a fresh session (P1). */
+      pair_fsm_init(&g_pair);
+      publish_pairing();
     }
     if (g_cmd_dismiss) {
       g_cmd_dismiss = false;
       pair_fsm_dismiss(&g_pair);
-      publish(GC_NET_KEEP, NULL);
+      publish_pairing();
     }
     if (g_cmd_pair) {
       g_cmd_pair = false;
@@ -391,7 +417,17 @@ static void net_task(void *arg) {
        * The epoch bump is what undoes a UI-side dismissal either way. */
       pair_fsm_start(&g_pair, now_s());
       g_pair_epoch++;
-      publish(GC_NET_KEEP, NULL);
+      publish_pairing();
+    }
+
+    /* Mid-run drop: report OFFLINE each poll rather than hanging on fetch.
+     * drive_pairing still runs so an in-flight session expires honestly on
+     * its own clock (and an offline start fails as a transport error). */
+    if (!(xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT)) {
+      drive_pairing();
+      publish(GC_NET_OFFLINE, NULL);
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
+      continue;
     }
 
     drive_pairing();
@@ -401,7 +437,12 @@ static void net_task(void *arg) {
       gc_net_status_t st = fetch_once(buf);
       if (st == GC_NET_AUTH_REVOKED) {
         /* Token already cleared: one immediate anonymous retry keeps the
-         * board seamless across a revocation (no token → no second 401). */
+         * board seamless across a revocation (no token → no second 401).
+         * The FSM resets too — a same-boot PAIRED state would otherwise
+         * refuse a re-pair until power cycle (P1) — and the unpaired
+         * marker publishes on the pairing channel. */
+        pair_fsm_init(&g_pair);
+        publish_pairing();
         st = fetch_once(buf);
       }
       if (st == GC_NET_OK) g_buf_idx ^= 1; /* hand off; write the other next */
@@ -443,13 +484,16 @@ void gc_net_token_dropped(void) {
   if (g_task) xTaskNotifyGive(g_task);
 }
 
+QueueHandle_t gc_net_pair_queue(void) { return g_pair_queue; }
+
 QueueHandle_t gc_net_start(void) {
   g_queue = xQueueCreate(1, sizeof(gc_net_msg_t));
+  g_pair_queue = xQueueCreate(1, sizeof(gc_pair_msg_t));
   g_wifi_events = xEventGroupCreate();
   g_buf[0] = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
   g_buf[1] = heap_caps_calloc(1, sizeof(model_nearby_t), MALLOC_CAP_SPIRAM);
   g_body = heap_caps_malloc(BODY_CAP, MALLOC_CAP_SPIRAM);
-  assert(g_buf[0] && g_buf[1] && g_body);
+  assert(g_buf[0] && g_buf[1] && g_body && g_queue && g_pair_queue);
   xTaskCreatePinnedToCore(net_task, "gc_net", 10240, NULL, 5, NULL, 0);
   return g_queue;
 }

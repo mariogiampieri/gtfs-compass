@@ -58,6 +58,7 @@ static const char *TAG = "gtfs-compass";
 #define DIM_PCT 40
 
 static QueueHandle_t g_net_queue;
+static QueueHandle_t g_pair_queue;
 static model_nearby_t *g_ui_model;     /* applied model (owns the rendered tree) */
 static model_nearby_t *g_staged_model; /* deferral stash (copy-at-receive) */
 static bool g_have_model;
@@ -76,11 +77,8 @@ static gc_net_status_t g_staged_status;
 static bool g_staged_have_status;   /* any message awaits apply */
 static int64_t g_staged_recv_ms;    /* when the staged model was received */
 static bool g_render_pending;       /* deferred render-only request */
-static pair_state_t g_staged_pair_phase;
-static char g_staged_pair_code[PAIR_USER_CODE_LEN];
-static int32_t g_staged_pair_seconds;
-static uint8_t g_staged_pair_epoch;
-static bool g_staged_unpaired;
+static gc_pair_msg_t g_staged_pair; /* by value, latest-wins */
+static bool g_staged_have_pair;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -111,6 +109,7 @@ static void gc_request_render(void) {
 /* Apply the staged message: swap the model in, reconcile by identity with
  * the defer time folded into the age seed, then the status treatment. */
 static void gc_apply_staged(void) {
+  bool have_status = g_staged_have_status;
   gc_net_status_t status = g_staged_status;
   if (g_staged_have_model) {
     model_nearby_t *tmp = g_ui_model;
@@ -130,17 +129,15 @@ static void gc_apply_staged(void) {
       g_dimmed = false;
     }
   }
-  switch (status) {
+  /* A pairing-only apply has no fetch outcome staged: the conn state (and
+   * its staleness accounting) is left exactly as-is. */
+  if (have_status) switch (status) {
     case GC_NET_OK:
       g_state.conn = UI_CONN_LIVE;
       /* chip evaluates per-system staleness before the flash, so a fetch
        * that lands already-old data never flashes green as live */
       g_state.flash_now = true;
       g_flash_until_ms = now_ms() + FLASH_MS;
-      break;
-    case GC_NET_KEEP:
-      /* pairing-only publish: no fetch outcome rides along — the conn
-       * state (and its staleness accounting) is left exactly as-is */
       break;
     case GC_NET_NO_LOCATION:
     case GC_NET_NO_CREDS:
@@ -157,8 +154,17 @@ static void gc_apply_staged(void) {
   }
   /* Pairing snapshot → UI state; an active session forces the pairing view
    * and completion/dismissal restores the prior one (ui_state.c rules). */
-  ui_pairing_update(&g_state, g_staged_pair_phase, g_staged_pair_code, g_staged_pair_seconds,
-                    g_staged_unpaired, g_staged_pair_epoch);
+  if (g_staged_have_pair) {
+    ui_pairing_update(&g_state, &(ui_pair_snapshot_t){
+                                    .phase = g_staged_pair.phase,
+                                    .code = g_staged_pair.code,
+                                    .seconds = g_staged_pair.seconds_left,
+                                    .epoch = g_staged_pair.epoch,
+                                    .rate_limited = g_staged_pair.rate_limited,
+                                    .unpaired = g_staged_pair.unpaired,
+                                });
+    g_staged_have_pair = false;
+  }
   g_staged_have_model = false;
   g_staged_have_status = false;
   g_state.battery_pct = (int8_t)gc_battery_pct();
@@ -182,12 +188,13 @@ static void consume_cb(lv_timer_t *t) {
     g_staged_status = msg.status; /* latest-wins; stash is by-value so the
                                      displaced message needs no freeing */
     g_staged_have_status = true;
-    /* Pairing snapshot: by value, every message (full-snapshot contract). */
-    g_staged_pair_phase = msg.pair_phase;
-    memcpy(g_staged_pair_code, msg.pair_code, sizeof(g_staged_pair_code));
-    g_staged_pair_seconds = msg.pair_seconds_left;
-    g_staged_pair_epoch = msg.pair_epoch;
-    g_staged_unpaired = msg.unpaired;
+  }
+  /* Separate channel (review): a pairing snapshot can never displace a
+   * fetch outcome, and vice versa. */
+  gc_pair_msg_t pmsg;
+  if (g_pair_queue != NULL && xQueueReceive(g_pair_queue, &pmsg, 0) == pdTRUE) {
+    g_staged_pair = pmsg;
+    g_staged_have_pair = true;
   }
   /* Deferral ceiling (review): a sustained accidental press — pocket, palm,
    * object resting on the glass — would otherwise defer applies and board
@@ -201,7 +208,7 @@ static void consume_cb(lv_timer_t *t) {
   } else {
     busy_since_ms = 0;
   }
-  if (g_staged_have_status) {
+  if (g_staged_have_status || g_staged_have_pair) {
     gc_apply_staged();
   } else if (g_render_pending) {
     full_render();
@@ -455,6 +462,7 @@ void app_main(void) {
   gc_console_start();
   gc_creds_seed_from_config();
   g_net_queue = gc_net_start();
+  g_pair_queue = gc_net_pair_queue();
 
   bsp_display_lock(0);
   lv_timer_create(consume_cb, 250, NULL);
