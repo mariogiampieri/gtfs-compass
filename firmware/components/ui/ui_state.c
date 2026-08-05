@@ -114,6 +114,40 @@ void ui_reconcile(ui_state_t *st, const model_nearby_t *model) {
   }
 }
 
+bool ui_pairing_update(ui_state_t *st, pair_state_t phase, const char *code,
+                       int32_t seconds, bool unpaired, uint8_t epoch) {
+  bool changed = false;
+  st->unpaired = unpaired;
+  if (code != NULL && code[0] != '\0') id_copy(st->pair_code, PAIR_USER_CODE_LEN, code);
+  if (phase == PAIR_CODE_ACTIVE) st->pair_seconds = seconds;
+  if (epoch != st->pair_epoch) {
+    st->pair_epoch = epoch;
+    st->pair_view_dismissed = false; /* `pair` re-issued: re-display the code */
+  }
+  st->pair_phase = phase;
+  bool visible = phase == PAIR_STARTING || phase == PAIR_CODE_ACTIVE ||
+                 phase == PAIR_EXPIRED || phase == PAIR_FAILED;
+  if (visible && !st->pair_view_dismissed) {
+    if (st->view != UI_VIEW_PAIRING) {
+      st->pair_prior_view = st->view;
+      st->view = UI_VIEW_PAIRING;
+      changed = true;
+    }
+  } else if (!visible && st->view == UI_VIEW_PAIRING) {
+    /* PAIRED or IDLE: the session is over — restore where the user was. */
+    st->view = st->pair_prior_view;
+    changed = true;
+  }
+  return changed;
+}
+
+bool ui_pairing_dismiss_view(ui_state_t *st) {
+  if (st->view != UI_VIEW_PAIRING) return false;
+  st->pair_view_dismissed = true;
+  st->view = st->pair_prior_view;
+  return true;
+}
+
 void ui_reconcile_deferred(ui_state_t *st, const model_nearby_t *model, int32_t defer_s) {
   ui_reconcile(st, model);
   if (defer_s <= 0) return;

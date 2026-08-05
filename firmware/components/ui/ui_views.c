@@ -96,6 +96,15 @@ static bool sys_partial(const ui_state_t *st, const model_nearby_t *model) {
 /* ---------- chrome ---------- */
 
 static void chip_text(char *buf, size_t cap, const ui_state_t *st) {
+  /* R11 precedence: on a failing transport, "unpaired" is the more durable
+   * user-facing fact and takes the single-valued chip; while LIVE, freshness
+   * keeps the chip (staleness honesty) and unpaired renders as the red
+   * marker dot beside it (build_chrome). */
+  if (st->unpaired &&
+      (st->conn == UI_CONN_OFFLINE || st->conn == UI_CONN_NO_LOCATION)) {
+    snprintf(buf, cap, "unpaired");
+    return;
+  }
   switch (st->conn) {
     case UI_CONN_LOADING: snprintf(buf, cap, "…"); break;
     case UI_CONN_NO_LOCATION: snprintf(buf, cap, "no location"); break;
@@ -161,6 +170,18 @@ static void build_chrome(const ui_state_t *st, bool partial) {
     lv_obj_set_style_radius(pd, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(pd, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(pd, hex(TK_ALERT), 0);
+  }
+
+  if (st->unpaired && st->conn == UI_CONN_LIVE) {
+    /* Unpaired-after-revocation while data still flows (pairing plan R11):
+     * freshness keeps the chip text; this red dot is the distinct marker
+     * (amber = partial, red = unpaired — never-paired boards show nothing). */
+    lv_obj_t *ud = lv_obj_create(fresh);
+    ui_style_plain(ud);
+    lv_obj_set_size(ud, TK_PARTIAL_DOT, TK_PARTIAL_DOT);
+    lv_obj_set_style_radius(ud, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ud, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(ud, hex(TK_OFFLINE), 0);
   }
 
   /* battery: outline glyph approximated as a bordered rect + fill bar */
@@ -300,6 +321,56 @@ static void build_degraded_banner(const ui_state_t *st) {
   lv_obj_align(banner, LV_ALIGN_BOTTOM_MID, 0, -40);
 }
 
+/* ---------- pairing screen (pairing plan U5) ---------- */
+
+static lv_obj_t *g_pair_secs_label; /* countdown, rewritten in place by ui_tick */
+
+static void pair_secs_text(char *buf, size_t cap, int32_t secs) {
+  if (secs < 0) secs = 0;
+  snprintf(buf, cap, "code expires in %ld:%02ld", (long)(secs / 60), (long)(secs % 60));
+}
+
+/* Shallow flat layout on purpose: the M1 crash class was an LVGL-task stack
+ * overflow on the first DEEP flex layout — this screen is absolute-positioned
+ * labels, no nesting (plan execution note). */
+static void render_pairing(lv_obj_t *content, const ui_state_t *st) {
+  switch (st->pair_phase) {
+    case PAIR_STARTING:
+      build_skeleton(); /* the shared loading treatment until the code lands */
+      return;
+    case PAIR_CODE_ACTIVE: {
+      lv_obj_t *t = ui_make_label(content, "Pair this board", TK_FONT_TITLE_SM, TK_EMPTY_TITLE);
+      lv_obj_align(t, LV_ALIGN_TOP_MID, 0, TK_HEADER_TOP + 40);
+      /* The 8-consonant code needs a full-alphabet face — the hero font is a
+       * digits-only subset and cannot render it (plan U5). */
+      lv_obj_t *code = ui_make_label(content, st->pair_code, TK_FONT_COUNTDOWN_XL,
+                                     TK_TEXT_PRIMARY);
+      lv_obj_align(code, LV_ALIGN_TOP_MID, 0, TK_HEADER_TOP + 110);
+      char buf[40];
+      pair_secs_text(buf, sizeof(buf), st->pair_seconds);
+      g_pair_secs_label = ui_make_label(content, buf, TK_FONT_BODY, TK_TEXT_MUTED);
+      lv_obj_align(g_pair_secs_label, LV_ALIGN_TOP_MID, 0, TK_HEADER_TOP + 190);
+      lv_obj_t *hint = ui_make_label(content, "Enter this code in the config UI.\nTap to hide.",
+                                     TK_FONT_BODY, TK_TEXT_MUTED);
+      lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+      lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, TK_HEADER_TOP + 240);
+      return;
+    }
+    case PAIR_EXPIRED:
+      ui_empty_mode(content, "Pairing code expired", "Run `pair` on the console",
+                    "for a fresh code.");
+      return;
+    case PAIR_FAILED:
+      ui_empty_mode(content, "Pairing failed", "Run `pair` on the console", "to try again.");
+      return;
+    default:
+      /* IDLE/PAIRED never render here — ui_pairing_update restores the
+       * prior view first; the skeleton is the safe fallback. */
+      build_skeleton();
+      return;
+  }
+}
+
 /* ---------- per-system board renderers (KTD-6 descriptor table) ---------- */
 
 static void render_rail_board(lv_obj_t *content, const model_nearby_t *model,
@@ -409,6 +480,7 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
   memset(&g_nearby_hits, 0, sizeof(g_nearby_hits));
   ui_detail_prepare(state); /* countdown labels are about to dangle (U4) */
   g_skeleton_shown = false;
+  g_pair_secs_label = NULL; /* about to dangle with the deleted tree */
 
   if (g_jitter) lv_obj_delete(g_jitter);
   g_jitter = lv_obj_create(g_root);
@@ -422,6 +494,13 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
   ui_style_plain(g_content);
   lv_obj_set_size(g_content, TK_SCREEN_W, TK_SCREEN_H);
 
+  if (state->view == UI_VIEW_PAIRING) {
+    /* Needs no model — a fresh unprovisioned board must still pair. Chrome
+     * (chip, battery) stays; content is the pairing screen. */
+    render_pairing(g_content, state);
+    build_mode_dots(state->sys);
+    return;
+  }
   if (state->conn == UI_CONN_NO_LOCATION && model == NULL) {
     /* R10 screen — only when there is no prior model to degrade in place */
     ui_empty_mode(g_content, "Can't find you", "No known WiFi networks nearby.",
@@ -447,6 +526,7 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
       ui_detail_render(g_content, model, state, degraded, &g_detail_hits);
       break;
     case UI_VIEW_BIKE_NEARBY: render_nearby(g_content, model, state); break;
+    case UI_VIEW_PAIRING: break; /* handled (with early return) above */
   }
   build_mode_dots(state->sys);
 
@@ -461,11 +541,19 @@ void ui_render(const model_nearby_t *model, const ui_state_t *state) {
 void ui_tick(const ui_state_t *state) {
   if (!g_chip_label) return;
   /* label-only: no re-layout, no jitter (R7) */
-  char buf[24];
+  char buf[40];
   chip_text(buf, sizeof(buf), state);
   lv_label_set_text(g_chip_label, buf);
   lv_obj_set_style_text_color(g_chip_label, hex(chip_color(state)), 0);
   if (g_chip_dot) lv_obj_set_style_bg_color(g_chip_dot, hex(chip_color(state)), 0);
+  /* Pairing countdown: rewritten in place, same convention as the detail
+   * minute tick — no rebuild, no layout (pairing plan U5). The caller
+   * decrements pair_seconds at 1 Hz from the published point-in-time value. */
+  if (g_pair_secs_label && state->view == UI_VIEW_PAIRING &&
+      state->pair_phase == PAIR_CODE_ACTIVE) {
+    pair_secs_text(buf, sizeof(buf), state->pair_seconds);
+    lv_label_set_text(g_pair_secs_label, buf);
+  }
 }
 
 /* ---------- input routing (R2) ---------- */
@@ -510,6 +598,10 @@ bool ui_views_on_tap(int32_t x, int32_t y, const model_nearby_t *model, ui_state
         }
       }
       return false;
+    case UI_VIEW_PAIRING:
+      /* Any tap hides the pairing screen; the session itself lives on in
+       * the net task (console `pair` re-displays a live code). */
+      return ui_pairing_dismiss_view(state);
   }
   return false;
 }

@@ -54,6 +54,11 @@ static bool stop_delta(ui_state_t *st, const model_nearby_t *model, int delta) {
 
 bool ui_nav_swipe(ui_state_t *st, const model_nearby_t *model, ui_nav_dir_t dir) {
   bool horizontal = dir == UI_NAV_LEFT || dir == UI_NAV_RIGHT;
+  if (st->view == UI_VIEW_PAIRING) {
+    /* A swipe leaves the code screen (session untouched); vertical swipes
+     * mean nothing here (pairing plan U5). */
+    return horizontal ? ui_pairing_dismiss_view(st) : false;
+  }
   if (st->view != UI_VIEW_BOARD) {
     /* In a detail view a horizontal swipe first pops to the board (R2);
      * vertical belongs to the scroll object (the tracker stands down when
