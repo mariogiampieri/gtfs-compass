@@ -69,8 +69,8 @@ bool gc_nets_add(const char *ssid, const char *pass) {
   return ok;
 }
 
-bool gc_nets_del(const char *ssid) {
-  if (ssid == NULL) return false;
+int gc_nets_del(const char *ssid) {
+  if (ssid == NULL) return 0;
   static char keep_ssid[GC_MAX_NETS][GC_SSID_LEN]; /* ~500 B — off the stack */
   static char keep_pass[GC_MAX_NETS][GC_PASS_LEN];
   int n = 0;
@@ -86,25 +86,38 @@ bool gc_nets_del(const char *ssid) {
     strlcpy(keep_pass[n], pbuf, GC_PASS_LEN);
     n++;
   }
-  if (!found) return false;
-  nvs_handle_t h;
-  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
-  bool ok = true;
-  for (int i = 0; i < GC_MAX_NETS; i++) {
-    char ks[SLOT_KEY_LEN], kp[SLOT_KEY_LEN];
-    slot_keys(i, ks, kp);
-    if (i < n) {
-      ok = nvs_set_str(h, ks, keep_ssid[i]) == ESP_OK &&
-           nvs_set_str(h, kp, keep_pass[i]) == ESP_OK && ok;
-    } else {
-      nvs_erase_key(h, ks);
-      nvs_erase_key(h, kp);
+  int result = -1;
+  nvs_handle_t h = 0;
+  if (!found) {
+    result = 0;
+  } else if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
+    /* Compaction stops at the first failed write (review): committing a
+     * half-rewritten list could silently LOSE a kept network; stopping
+     * leaves later slots holding consistent pre-compaction values. */
+    bool ok = true;
+    for (int i = 0; ok && i < GC_MAX_NETS; i++) {
+      char ks[SLOT_KEY_LEN], kp[SLOT_KEY_LEN];
+      slot_keys(i, ks, kp);
+      if (i < n) {
+        ok = nvs_set_str(h, ks, keep_ssid[i]) == ESP_OK &&
+             nvs_set_str(h, kp, keep_pass[i]) == ESP_OK;
+      } else {
+        /* NOT_FOUND is a fine erase; only other errors count. */
+        esp_err_t e1 = nvs_erase_key(h, ks);
+        esp_err_t e2 = nvs_erase_key(h, kp);
+        ok = (e1 == ESP_OK || e1 == ESP_ERR_NVS_NOT_FOUND) &&
+             (e2 == ESP_OK || e2 == ESP_ERR_NVS_NOT_FOUND);
+      }
     }
+    ok = ok && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    result = ok ? 1 : -1;
+    ESP_LOGI(TAG, "network %s (ssid=%s)", ok ? "removed" : "remove FAILED", ssid);
   }
-  ok = nvs_commit(h) == ESP_OK && ok;
-  nvs_close(h);
-  ESP_LOGI(TAG, "network %s (ssid=%s)", ok ? "removed" : "remove FAILED", ssid);
-  return ok;
+  /* The static stash held every stored password — scrub it (review SEC-1). */
+  memset(keep_ssid, 0, sizeof(keep_ssid));
+  memset(keep_pass, 0, sizeof(keep_pass));
+  return result;
 }
 
 void gc_nets_clear(void) {

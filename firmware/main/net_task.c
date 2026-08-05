@@ -47,6 +47,12 @@ static QueueHandle_t g_queue;      /* item: gc_net_msg_t (fetch outcomes) */
 static QueueHandle_t g_pair_queue; /* item: gc_pair_msg_t (pairing snapshots) */
 static EventGroupHandle_t g_wifi_events;
 #define WIFI_CONNECTED_BIT BIT0
+#define WIFI_JOIN_FAIL_BIT BIT1 /* set on disconnect while join_best owns the radio */
+
+/* wifi_select's value structs must stride identically to the creds store —
+ * divergence would corrupt the stored[][] walk (review MAINT-2). */
+_Static_assert(WIFI_SELECT_SSID_LEN == GC_SSID_LEN, "SSID length constants diverged");
+_Static_assert(WIFI_SELECT_MAX_STORED == GC_MAX_NETS, "network cap constants diverged");
 
 static model_nearby_t *g_buf[2]; /* PSRAM double buffer */
 static int g_buf_idx;
@@ -72,6 +78,8 @@ static char g_joined[GC_SSID_LEN]; /* SSID of the joined network ("" when down) 
 static int64_t now_s(void) { return esp_timer_get_time() / 1000000; }
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
+static uint16_t wifi_do_scan(wifi_ap_record_t recs[MAX_SCAN_APS]);
+
 static void reconnect_cb(void *arg) {
   (void)arg;
   esp_wifi_connect();
@@ -84,7 +92,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
    * explicitly after scan-based selection (multi-network plan gc-4ae). */
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
     xEventGroupClearBits(g_wifi_events, WIFI_CONNECTED_BIT);
-    if (g_joining) return; /* join_best owns the retry sequence right now */
+    if (g_joining) {
+      /* Fail fast (review): an auth reject answers in ~2 s — the join loop
+       * must not burn its full per-candidate wait on a dead network. */
+      xEventGroupSetBits(g_wifi_events, WIFI_JOIN_FAIL_BIT);
+      return;
+    }
     ESP_LOGW(TAG, "wifi disconnected; retry in 2s");
     /* Never block the shared event-loop task: defer via a one-shot timer.
      * Retries the SAME network; a sustained outage re-selects in the loop. */
@@ -115,9 +128,9 @@ static bool wifi_start(void) {
   return true;
 }
 
-/* Per-candidate bounded join wait: association + DHCP on a healthy AP is
- * seconds; 12 s keeps three candidates under the old single-network 20 s x2
- * worst case. */
+/* Per-candidate CEILING: auth rejects fail fast via WIFI_JOIN_FAIL_BIT
+ * (~2 s), so 12 s is only spent on a candidate that answers nothing at all.
+ * True worst case (5 stored, all silent) ≈ scan + 5 x 12 s. */
 #define JOIN_WAIT_MS 12000
 
 /*
@@ -132,58 +145,70 @@ static bool join_best(void) {
 
   wifi_scan_entry_t scan[WIFI_SELECT_MAX_SCAN];
   int scan_n = 0;
-  wifi_scan_config_t sc = {.show_hidden = true};
-  if (esp_wifi_scan_start(&sc, true) == ESP_OK) {
-    uint16_t n = MAX_SCAN_APS;
-    static wifi_ap_record_t recs[MAX_SCAN_APS];
-    if (esp_wifi_scan_get_ap_records(&n, recs) == ESP_OK) {
-      for (int i = 0; i < n && scan_n < WIFI_SELECT_MAX_SCAN; i++) {
-        strlcpy(scan[scan_n].ssid, (const char *)recs[i].ssid, WIFI_SELECT_SSID_LEN);
-        scan[scan_n].rssi = recs[i].rssi;
-        scan_n++;
-      }
-    }
+  static wifi_ap_record_t recs[MAX_SCAN_APS];
+  uint16_t n = wifi_do_scan(recs);
+  for (int i = 0; i < n && scan_n < WIFI_SELECT_MAX_SCAN; i++) {
+    strlcpy(scan[scan_n].ssid, (const char *)recs[i].ssid, WIFI_SELECT_SSID_LEN);
+    scan[scan_n].rssi = recs[i].rssi;
+    scan_n++;
   }
 
-  char stored[GC_MAX_NETS][GC_SSID_LEN];
-  char pass[GC_PASS_LEN];
+  /* Snapshot SSIDs AND passwords once: a console wifi_del compacting slots
+   * mid-join must not swap which network an order[] index refers to
+   * (review ADV-W2) — the attempt runs entirely off this snapshot. */
+  static char stored[GC_MAX_NETS][GC_SSID_LEN];
+  static char stored_pass[GC_MAX_NETS][GC_PASS_LEN];
   int count = 0;
-  while (count < GC_MAX_NETS && gc_nets_get(count, stored[count], NULL)) count++;
+  while (count < GC_MAX_NETS && gc_nets_get(count, stored[count], stored_pass[count])) count++;
   uint8_t order[WIFI_SELECT_MAX_STORED];
   int on = wifi_select_order(stored, count, scan, scan_n, order);
 
-  for (int i = 0; i < on; i++) {
-    char ssid[GC_SSID_LEN];
-    if (!gc_nets_get(order[i], ssid, pass)) continue;
+  bool joined = false;
+  for (int i = 0; i < on && !joined; i++) {
+    const char *ssid = stored[order[i]];
     ESP_LOGI(TAG, "joining %s (%d of %d)", ssid, i + 1, on);
     esp_wifi_disconnect();
+    /* Both bits cleared per candidate: a stale CONNECTED from a timer
+     * reconnect completing during the scan must not satisfy this wait
+     * (review), and FAIL is this candidate's own verdict. */
+    xEventGroupClearBits(g_wifi_events, WIFI_CONNECTED_BIT | WIFI_JOIN_FAIL_BIT);
     wifi_config_t wc = {0};
     strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
-    strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
+    strlcpy((char *)wc.sta.password, stored_pass[order[i]], sizeof(wc.sta.password));
     if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK) continue;
+    /* g_joined is written BEFORE connect: the accessor is gated on the
+     * CONNECTED bit, so it can never expose a torn/holdover name (review). */
+    strlcpy(g_joined, ssid, sizeof(g_joined));
     if (esp_wifi_connect() != ESP_OK) continue;
-    if (xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
-                            pdMS_TO_TICKS(JOIN_WAIT_MS)) &
-        WIFI_CONNECTED_BIT) {
-      strlcpy(g_joined, ssid, sizeof(g_joined));
-      g_joining = false;
-      return true;
-    }
+    EventBits_t bits = xEventGroupWaitBits(
+        g_wifi_events, WIFI_CONNECTED_BIT | WIFI_JOIN_FAIL_BIT, pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(JOIN_WAIT_MS));
+    joined = (bits & WIFI_CONNECTED_BIT) != 0; /* FAIL or timeout → next */
   }
-  ESP_LOGW(TAG, "no stored network joined (%d candidate%s)", on, on == 1 ? "" : "s");
+  memset(stored_pass, 0, sizeof(stored_pass)); /* scrub the snapshot */
+  xEventGroupClearBits(g_wifi_events, WIFI_JOIN_FAIL_BIT);
+  if (!joined) ESP_LOGW(TAG, "no stored network joined (%d candidate%s)", on, on == 1 ? "" : "s");
   g_joining = false;
-  return false;
+  return joined;
 }
 
-/* Collect BSSIDs into a JSON body. Returns body length, 0 on scan failure. */
-static int scan_to_json(char *out, size_t cap) {
+/* One blocking scan into recs; returns the record count (0 on failure).
+ * Shared by the locate body builder and join_best (review MAINT-3). */
+static uint16_t wifi_do_scan(wifi_ap_record_t recs[MAX_SCAN_APS]) {
   wifi_scan_config_t sc = {.show_hidden = true};
   int64_t t0 = esp_timer_get_time();
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) return 0;
   uint16_t n = MAX_SCAN_APS;
-  static wifi_ap_record_t recs[MAX_SCAN_APS];
-  if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK || n == 0) return 0;
+  if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK) return 0;
   ESP_LOGI(TAG, "scan: %u APs in %lld ms", n, (esp_timer_get_time() - t0) / 1000);
+  return n;
+}
+
+/* Collect BSSIDs into a JSON body. Returns body length, 0 on scan failure. */
+static int scan_to_json(char *out, size_t cap) {
+  static wifi_ap_record_t recs[MAX_SCAN_APS];
+  uint16_t n = wifi_do_scan(recs);
+  if (n == 0) return 0;
 
   /* Bounds-first accumulation: check remaining space BEFORE each write and
    * clamp snprintf's would-be length so `off` can never exceed cap (review
@@ -274,6 +299,34 @@ static int pair_http(const char *path, const char *bearer, const char *post_body
   if (err != ESP_OK) return -1;
   out[sink.len < cap ? sink.len : cap - 1] = '\0';
   return status;
+}
+
+/* Console command flags → pairing FSM. Runs from the main loop AND the
+ * boot join-retry loop (review ADV-W3: a `pair` typed while no network
+ * joins must fail loudly, not defer invisibly until WiFi appears). */
+static void process_console_cmds(void) {
+  if (g_cmd_token_drop) {
+    g_cmd_token_drop = false;
+    g_token[0] = '\0';
+    g_revoked = gc_revoked_get();
+    /* A completed session's PAIRED state refers to a token that is now
+     * gone — reset so `pair` can mint a fresh session (P1). */
+    pair_fsm_init(&g_pair);
+    publish_pairing();
+  }
+  if (g_cmd_dismiss) {
+    g_cmd_dismiss = false;
+    pair_fsm_dismiss(&g_pair);
+    publish_pairing();
+  }
+  if (g_cmd_pair) {
+    g_cmd_pair = false;
+    /* start() is false for an active session: re-display, never re-mint.
+     * The epoch bump is what undoes a UI-side dismissal either way. */
+    pair_fsm_start(&g_pair, now_s());
+    g_pair_epoch++;
+    publish_pairing();
+  }
 }
 
 /* Execute whatever the pairing FSM wants until it goes quiet. Publishes a
@@ -444,6 +497,10 @@ static void net_task(void *arg) {
    * (red chip), not an eternal loading skeleton. join_best tries every
    * stored network, best visible first (gc-4ae). */
   while (!join_best()) {
+    /* Console + pairing still serviced between attempts: a `pair` typed
+     * here fails loudly as a transport error (ADV-W3). */
+    process_console_cmds();
+    drive_pairing();
     publish(GC_NET_OFFLINE, NULL);
     ESP_LOGW(TAG, "no network joined; rescanning in 10s");
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
@@ -456,28 +513,7 @@ static void net_task(void *arg) {
      * token_drop and dismiss are pure local state and need no network, and
      * an offline `pair` must fail loudly via the transport-error path (the
      * FAILED screen) instead of silently deferring until WiFi returns. */
-    if (g_cmd_token_drop) {
-      g_cmd_token_drop = false;
-      g_token[0] = '\0';
-      g_revoked = gc_revoked_get();
-      /* A completed session's PAIRED state refers to a token that is now
-       * gone — reset so `pair` can mint a fresh session (P1). */
-      pair_fsm_init(&g_pair);
-      publish_pairing();
-    }
-    if (g_cmd_dismiss) {
-      g_cmd_dismiss = false;
-      pair_fsm_dismiss(&g_pair);
-      publish_pairing();
-    }
-    if (g_cmd_pair) {
-      g_cmd_pair = false;
-      /* start() is false for an active session: re-display, never re-mint.
-       * The epoch bump is what undoes a UI-side dismissal either way. */
-      pair_fsm_start(&g_pair, now_s());
-      g_pair_epoch++;
-      publish_pairing();
-    }
+    process_console_cmds();
 
     /* Mid-run drop: report OFFLINE each poll rather than hanging on fetch.
      * drive_pairing still runs so an in-flight session expires honestly on
@@ -490,8 +526,11 @@ static void net_task(void *arg) {
       drive_pairing();
       publish(GC_NET_OFFLINE, NULL);
       if (now_ms() - down_since_ms > 60000) {
-        down_since_ms = now_ms(); /* one re-select per minute of outage */
         join_best();
+        /* Reset AFTER the (blocking) attempt so the 60 s spacing is
+         * between attempts — resetting before it made a 5-candidate
+         * outage re-select back-to-back (review ADV-W1). */
+        down_since_ms = now_ms();
       }
       if (!(xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT)) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));

@@ -3,8 +3,10 @@
 
 #include <string.h>
 
-/* Best RSSI the scan saw for this SSID, or INT8_MIN when unseen. */
-#define UNSEEN (-128)
+/* Best RSSI the scan saw for this SSID; the unseen sentinel sits below any
+ * legal int8 RSSI so a real AP at exactly -128 dBm still ranks as visible
+ * (review TEST-1 — verified by execution). */
+#define UNSEEN (-1000)
 
 int wifi_select_order(const char stored[][WIFI_SELECT_SSID_LEN], int stored_count,
                       const wifi_scan_entry_t *scan, int scan_count,

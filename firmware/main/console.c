@@ -67,9 +67,11 @@ static int cmd_wifi_del(int argc, char **argv) {
     printf("usage: wifi_del <ssid>\n");
     return 1;
   }
-  bool ok = gc_nets_del(argv[1]);
-  printf(ok ? "removed %s\n" : "no stored network named %s\n", argv[1]);
-  return ok ? 0 : 1;
+  int r = gc_nets_del(argv[1]);
+  if (r > 0) printf("removed %s\n", argv[1]);
+  else if (r == 0) printf("no stored network named %s\n", argv[1]);
+  else printf("NVS write failed removing %s — run wifi_list to check state\n", argv[1]);
+  return r > 0 ? 0 : 1;
 }
 
 static int cmd_wifi_list(int argc, char **argv) {

@@ -25,8 +25,10 @@ int gc_nets_count(void);
 bool gc_nets_get(int idx, char ssid[GC_SSID_LEN], char pass[GC_PASS_LEN]);
 /* Upsert by SSID. False when the list is full or NVS fails. */
 bool gc_nets_add(const char *ssid, const char *pass);
-/* Remove by SSID, compacting slots. False when not found or NVS fails. */
-bool gc_nets_del(const char *ssid);
+/* Remove by SSID, compacting slots. 1 = removed, 0 = not found, -1 = NVS
+ * failure (the list may be partially rewritten; nothing is silently lost —
+ * compaction stops at the first failed write). */
+int gc_nets_del(const char *ssid);
 /* Erase every stored network. */
 void gc_nets_clear(void);
 
