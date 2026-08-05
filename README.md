@@ -493,16 +493,22 @@ idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
 ```
 
-WiFi credentials are stored in the device's NVS, never in the repo. Two
-ways to provision:
+WiFi credentials are stored in the device's NVS, never in the repo. The
+board holds up to **five networks** (home/work/hotspot) and auto-joins the
+strongest one visible at boot; after a minute offline it rescans and
+re-homes, so carrying the board between known networks needs no
+re-provisioning. Two ways to provision:
 
-- **Serial console** (works any time): in the monitor, type
-  `wifi_set <ssid> <password>` — the device stores the credentials and
-  restarts its network path. `wifi_clear` erases; `gc_status` shows state.
+- **Serial console** (works any time): `wifi_set <ssid> <password>` adds
+  or updates a network (the device restarts to apply); `wifi_del <ssid>`
+  removes one; `wifi_list` shows stored SSIDs (never passwords);
+  `wifi_clear` erases all; `gc_status` shows the count and the joined
+  network. Boards provisioned before the multi-network store migrate
+  their single credential automatically on first boot.
 - **Dev seed**: create a gitignored `firmware/sdkconfig.local` with
   `CONFIG_GC_WIFI_SSID`/`CONFIG_GC_WIFI_PASSWORD` and build with
   `SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.local"` — seeded into
-  NVS on first boot only.
+  NVS on first boot only, and only when the network list is empty.
 
 To pin the board to a fixed location (e.g. test a station you're not at,
 or work around thin BeaconDB coverage in your area), type
@@ -545,6 +551,7 @@ cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 ./build/test_model                   # model parser suite (ASAN)
 ./build/test_nav                     # navigation/reconciler/pairing-view transitions
 ./build/test_pair_fsm                # RFC 8628 pairing client state machine
+./build/test_wifi_select             # multi-network join-order selection
 ./build/test_bike_layout             # bike hero/capacity-bar math
 ```
 

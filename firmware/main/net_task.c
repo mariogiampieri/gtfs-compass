@@ -32,6 +32,7 @@
 #include "model.h"
 #include "sdkconfig.h"
 #include "wifi_creds.h"
+#include "wifi_select.h"
 
 static const char *TAG = "gc-net";
 
@@ -65,6 +66,8 @@ static volatile bool g_cmd_pair;
 static volatile bool g_cmd_dismiss;
 static volatile bool g_cmd_token_drop;
 static uint8_t g_pair_epoch; /* bumped per console `pair`; rides on publishes */
+static volatile bool g_joining;    /* join_best in progress: reconnect timer stands down */
+static char g_joined[GC_SSID_LEN]; /* SSID of the joined network ("" when down) */
 
 static int64_t now_s(void) { return esp_timer_get_time() / 1000000; }
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
@@ -77,12 +80,14 @@ static void reconnect_cb(void *arg) {
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
   (void)arg;
   (void)data;
-  if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
-  } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+  /* STA_START no longer auto-connects: net_task drives the first connect
+   * explicitly after scan-based selection (multi-network plan gc-4ae). */
+  if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
     xEventGroupClearBits(g_wifi_events, WIFI_CONNECTED_BIT);
+    if (g_joining) return; /* join_best owns the retry sequence right now */
     ESP_LOGW(TAG, "wifi disconnected; retry in 2s");
-    /* Never block the shared event-loop task: defer via a one-shot timer. */
+    /* Never block the shared event-loop task: defer via a one-shot timer.
+     * Retries the SAME network; a sustained outage re-selects in the loop. */
     esp_timer_stop(g_reconnect_timer);
     esp_timer_start_once(g_reconnect_timer, 2000 * 1000);
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -92,9 +97,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 }
 
 static bool wifi_start(void) {
-  char ssid[GC_SSID_LEN], pass[GC_PASS_LEN];
-  if (!gc_creds_get(ssid, pass)) {
-    return false; /* no credentials: caller reports OFFLINE with console hint */
+  if (gc_nets_count() == 0) {
+    return false; /* no networks: caller reports NO_CREDS with console hint */
   }
   const esp_timer_create_args_t rt = {.callback = reconnect_cb, .name = "gc_reconnect"};
   ESP_ERROR_CHECK(esp_timer_create(&rt, &g_reconnect_timer));
@@ -105,14 +109,70 @@ static bool wifi_start(void) {
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL);
   esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL);
-
-  wifi_config_t wc = {0};
-  strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
-  strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+  /* No config yet: join_best scans first, then connects (gc-4ae). */
   ESP_ERROR_CHECK(esp_wifi_start());
   return true;
+}
+
+/* Per-candidate bounded join wait: association + DHCP on a healthy AP is
+ * seconds; 12 s keeps three candidates under the old single-network 20 s x2
+ * worst case. */
+#define JOIN_WAIT_MS 12000
+
+/*
+ * Scan, order the stored networks (wifi_select), try each until one gets an
+ * IP. Owns the whole sequence: the disconnect handler's reconnect timer
+ * stands down while this runs (g_joining).
+ */
+static bool join_best(void) {
+  g_joining = true;
+  esp_timer_stop(g_reconnect_timer);
+  g_joined[0] = '\0';
+
+  wifi_scan_entry_t scan[WIFI_SELECT_MAX_SCAN];
+  int scan_n = 0;
+  wifi_scan_config_t sc = {.show_hidden = true};
+  if (esp_wifi_scan_start(&sc, true) == ESP_OK) {
+    uint16_t n = MAX_SCAN_APS;
+    static wifi_ap_record_t recs[MAX_SCAN_APS];
+    if (esp_wifi_scan_get_ap_records(&n, recs) == ESP_OK) {
+      for (int i = 0; i < n && scan_n < WIFI_SELECT_MAX_SCAN; i++) {
+        strlcpy(scan[scan_n].ssid, (const char *)recs[i].ssid, WIFI_SELECT_SSID_LEN);
+        scan[scan_n].rssi = recs[i].rssi;
+        scan_n++;
+      }
+    }
+  }
+
+  char stored[GC_MAX_NETS][GC_SSID_LEN];
+  char pass[GC_PASS_LEN];
+  int count = 0;
+  while (count < GC_MAX_NETS && gc_nets_get(count, stored[count], NULL)) count++;
+  uint8_t order[WIFI_SELECT_MAX_STORED];
+  int on = wifi_select_order(stored, count, scan, scan_n, order);
+
+  for (int i = 0; i < on; i++) {
+    char ssid[GC_SSID_LEN];
+    if (!gc_nets_get(order[i], ssid, pass)) continue;
+    ESP_LOGI(TAG, "joining %s (%d of %d)", ssid, i + 1, on);
+    esp_wifi_disconnect();
+    wifi_config_t wc = {0};
+    strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
+    if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK) continue;
+    if (esp_wifi_connect() != ESP_OK) continue;
+    if (xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                            pdMS_TO_TICKS(JOIN_WAIT_MS)) &
+        WIFI_CONNECTED_BIT) {
+      strlcpy(g_joined, ssid, sizeof(g_joined));
+      g_joining = false;
+      return true;
+    }
+  }
+  ESP_LOGW(TAG, "no stored network joined (%d candidate%s)", on, on == 1 ? "" : "s");
+  g_joining = false;
+  return false;
 }
 
 /* Collect BSSIDs into a JSON body. Returns body length, 0 on scan failure. */
@@ -373,21 +433,20 @@ static void net_task(void *arg) {
 
   if (!wifi_start()) {
     publish(GC_NET_NO_CREDS, NULL);
-    ESP_LOGW(TAG, "no wifi credentials — provision via console: wifi_set <ssid> <pass>");
+    ESP_LOGW(TAG, "no wifi networks — provision via console: wifi_set <ssid> <pass>");
     /* The console restarts the device on wifi_set; this poll is only the
      * backstop for a seed landing through some other path. */
-    char s[GC_SSID_LEN], p[GC_PASS_LEN];
-    while (!gc_creds_get(s, p)) vTaskDelay(pdMS_TO_TICKS(2000));
+    while (gc_nets_count() == 0) vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart(); /* simplest correct re-init path post-provisioning */
   }
 
-  /* Bounded join wait: wrong password or absent AP must surface as OFFLINE
-   * (red chip), not an eternal loading skeleton — the plan's own scenario. */
-  while (!(xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
-                               pdMS_TO_TICKS(20000)) &
-           WIFI_CONNECTED_BIT)) {
+  /* Bounded join: wrong passwords or absent APs must surface as OFFLINE
+   * (red chip), not an eternal loading skeleton. join_best tries every
+   * stored network, best visible first (gc-4ae). */
+  while (!join_best()) {
     publish(GC_NET_OFFLINE, NULL);
-    ESP_LOGW(TAG, "wifi join not established after 20s; still retrying");
+    ESP_LOGW(TAG, "no network joined; rescanning in 10s");
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
   }
   int64_t boot_first_fetch = esp_timer_get_time();
   int64_t next_fetch_ms = 0; /* first fetch immediately */
@@ -422,13 +481,24 @@ static void net_task(void *arg) {
 
     /* Mid-run drop: report OFFLINE each poll rather than hanging on fetch.
      * drive_pairing still runs so an in-flight session expires honestly on
-     * its own clock (and an offline start fails as a transport error). */
+     * its own clock (and an offline start fails as a transport error).
+     * After 60 s down, re-run scan + selection — a board carried from home
+     * to a hotspot re-homes without a reboot (gc-4ae R4). */
+    static int64_t down_since_ms;
     if (!(xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT)) {
+      if (down_since_ms == 0) down_since_ms = now_ms();
       drive_pairing();
       publish(GC_NET_OFFLINE, NULL);
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
-      continue;
+      if (now_ms() - down_since_ms > 60000) {
+        down_since_ms = now_ms(); /* one re-select per minute of outage */
+        join_best();
+      }
+      if (!(xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT)) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
+        continue;
+      }
     }
+    down_since_ms = 0;
 
     drive_pairing();
 
@@ -482,6 +552,12 @@ void gc_net_pair_dismiss(void) {
 void gc_net_token_dropped(void) {
   g_cmd_token_drop = true;
   if (g_task) xTaskNotifyGive(g_task);
+}
+
+const char *gc_net_joined_ssid(void) {
+  /* Console starts a beat before gc_net_start creates the event group. */
+  if (g_wifi_events == NULL) return "";
+  return (xEventGroupGetBits(g_wifi_events) & WIFI_CONNECTED_BIT) ? g_joined : "";
 }
 
 QueueHandle_t gc_net_pair_queue(void) { return g_pair_queue; }

@@ -1,6 +1,11 @@
 /* NVS-first WiFi credentials (plan KTD): the connect path reads ONLY NVS;
  * a dev build seeds NVS once from Kconfig; the serial console provisions
- * over USB. Phase 5 provisioning will replace the seeder, nothing else. */
+ * over USB.
+ *
+ * Multi-network store (plan gc-4ae): up to GC_MAX_NETS networks in indexed
+ * slots (n0_ssid/n0_pass ...), joined best-visible-first via wifi_select.
+ * The legacy single ssid/pass pair migrates into slot 0 on first boot and
+ * the legacy keys are erased — already-provisioned boards keep working. */
 #ifndef GC_WIFI_CREDS_H
 #define GC_WIFI_CREDS_H
 
@@ -8,18 +13,22 @@
 
 #define GC_SSID_LEN 33
 #define GC_PASS_LEN 65
+#define GC_MAX_NETS 5
 
-/* Seed NVS from CONFIG_GC_WIFI_* if NVS is empty and the seed is non-empty. */
+/* Legacy-pair migration + CONFIG_GC_WIFI_* dev seed (appends only when the
+ * list is empty — NVS wins, never overwrites). Idempotent; call at boot. */
 void gc_creds_seed_from_config(void);
 
-/* Read credentials from NVS. Returns false when none are stored. */
-bool gc_creds_get(char ssid[GC_SSID_LEN], char pass[GC_PASS_LEN]);
-
-/* Store credentials (console provisioning). Returns false on NVS error. */
-bool gc_creds_set(const char *ssid, const char *pass);
-
-/* Erase stored credentials. */
-void gc_creds_clear(void);
+/* Stored networks: count is derived from the first empty slot. */
+int gc_nets_count(void);
+/* pass may be NULL when only the SSID is wanted. */
+bool gc_nets_get(int idx, char ssid[GC_SSID_LEN], char pass[GC_PASS_LEN]);
+/* Upsert by SSID. False when the list is full or NVS fails. */
+bool gc_nets_add(const char *ssid, const char *pass);
+/* Remove by SSID, compacting slots. False when not found or NVS fails. */
+bool gc_nets_del(const char *ssid);
+/* Erase every stored network. */
+void gc_nets_clear(void);
 
 #define GC_COORD_LEN 16
 

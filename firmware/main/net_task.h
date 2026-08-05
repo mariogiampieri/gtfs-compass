@@ -65,4 +65,8 @@ void gc_net_pair_request(void);
 void gc_net_pair_dismiss(void);
 void gc_net_token_dropped(void);
 
+/* SSID of the currently joined network, or "" when disconnected (console
+ * gc_status display; multi-network plan gc-4ae). */
+const char *gc_net_joined_ssid(void);
+
 #endif
