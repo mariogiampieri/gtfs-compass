@@ -256,6 +256,115 @@ static void test_deferred_apply_seeds_age_with_defer_time(void) {
   TEST_ASSERT_EQUAL(120, g_state.age_s[UI_SYS_RAIL]);
 }
 
+/* ---------- pairing view rules (pairing plan U5) ---------- */
+
+static bool pair_update(pair_state_t phase, const char *code, int32_t secs, bool unpaired,
+                        uint8_t epoch) {
+  ui_pair_snapshot_t snap = {
+      .phase = phase, .code = code, .seconds = secs, .epoch = epoch,
+      .rate_limited = false, .unpaired = unpaired};
+  return ui_pairing_update(&g_state, &snap);
+}
+
+static void test_pairing_session_forces_view_and_restores_prior(void) {
+  fresh_board();
+  g_state.view = UI_VIEW_DETAIL;
+  /* STARTING steals the screen, saving the prior view. */
+  TEST_ASSERT_TRUE(pair_update(PAIR_STARTING, "", 0, false, 1));
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+  /* CODE_ACTIVE keeps it and carries the code + countdown. */
+  TEST_ASSERT_FALSE(pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 300, false, 1));
+  TEST_ASSERT_EQUAL_STRING("BCDF-GHJK", g_state.pair_code);
+  TEST_ASSERT_EQUAL(300, g_state.pair_seconds);
+  /* PAIRED restores exactly where the user was. */
+  TEST_ASSERT_TRUE(pair_update(PAIR_PAIRED, "", 0, false, 1));
+  TEST_ASSERT_EQUAL(UI_VIEW_DETAIL, g_state.view);
+}
+
+static void test_pairing_dismiss_keeps_session_and_epoch_redisplays(void) {
+  fresh_board();
+  pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 250, false, 1);
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+  /* A swipe/tap hides the view; the phase (session) is untouched. */
+  TEST_ASSERT_TRUE(ui_pairing_dismiss_view(&g_state));
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL(PAIR_CODE_ACTIVE, g_state.pair_phase);
+  /* Steady-state republish of the same phase does NOT steal the screen. */
+  TEST_ASSERT_FALSE(pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 240, false, 1));
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  /* Re-issued `pair` (epoch bump) re-displays the live code. */
+  TEST_ASSERT_TRUE(pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 230, false, 2));
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+}
+
+static void test_model_reconcile_leaves_pairing_view_alone(void) {
+  fresh_board();
+  pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 250, false, 1);
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+  /* A model apply mid-pairing reconciles data but never the pairing view. */
+  parse_ok(NAV_SHUFFLED);
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+}
+
+static void test_pairing_swipe_routing_dismisses_horizontal_only(void) {
+  fresh_board();
+  pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 250, false, 1);
+  TEST_ASSERT_FALSE(ui_nav_swipe(&g_state, &g_model, UI_NAV_UP));
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+  TEST_ASSERT_TRUE(ui_nav_swipe(&g_state, &g_model, UI_NAV_LEFT));
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL(PAIR_CODE_ACTIVE, g_state.pair_phase); /* session lives */
+}
+
+static void test_unpaired_marker_rides_every_update(void) {
+  fresh_board();
+  pair_update(PAIR_IDLE, "", 0, true, 0);
+  TEST_ASSERT_TRUE(g_state.unpaired);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view); /* IDLE never steals */
+  /* A successful pair clears it (the net task publishes unpaired=false). */
+  pair_update(PAIR_PAIRED, "", 0, false, 0);
+  TEST_ASSERT_FALSE(g_state.unpaired);
+}
+
+static void test_detail_behind_pairing_revalidates_trunk(void) {
+  /* Review fix: reconcile must re-find (or demote) a DETAIL prior view's
+   * trunk while the pairing screen hides it — restoring blind would render
+   * a clamped wrong trunk. */
+  fresh_board();
+  TEST_ASSERT_TRUE(ui_nav_open_detail(&g_state, &g_model, 1)); /* trunk k2 */
+  TEST_ASSERT_EQUAL_STRING("k2", g_state.trunk_key);
+  pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 250, false, 1);
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+
+  /* Shuffled model still has k2 (order changed): restore stays DETAIL with
+   * the corrected index. */
+  parse_ok(NAV_SHUFFLED);
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view);
+  pair_update(PAIR_PAIRED, "", 0, false, 1);
+  TEST_ASSERT_EQUAL(UI_VIEW_DETAIL, g_state.view);
+  TEST_ASSERT_EQUAL_STRING("k2", g_state.trunk_key);
+
+  /* Same scenario, but the trunk vanishes: prior view demotes to BOARD. */
+  fresh_board();
+  TEST_ASSERT_TRUE(ui_nav_open_detail(&g_state, &g_model, 1));
+  pair_update(PAIR_CODE_ACTIVE, "BCDF-GHJK", 250, false, 1);
+  g_state.trunk_key[0] = 'z'; /* a key no model carries */
+  parse_ok(NAV_SHUFFLED);
+  ui_reconcile(&g_state, &g_model);
+  TEST_ASSERT_EQUAL(UI_VIEW_PAIRING, g_state.view); /* screen not stolen */
+  pair_update(PAIR_PAIRED, "", 0, false, 1);
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+  TEST_ASSERT_EQUAL_STRING("", g_state.trunk_key);
+}
+
+static void test_pairing_dismiss_noop_off_pairing_view(void) {
+  fresh_board();
+  TEST_ASSERT_FALSE(ui_pairing_dismiss_view(&g_state)); /* BOARD: no-op */
+  TEST_ASSERT_EQUAL(UI_VIEW_BOARD, g_state.view);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_sys_swipe_clamps_no_wrap);
@@ -270,5 +379,12 @@ int main(void) {
   RUN_TEST(test_flip_in_detail_keeps_view_and_trunk);
   RUN_TEST(test_ages_seed_per_system);
   RUN_TEST(test_deferred_apply_seeds_age_with_defer_time);
+  RUN_TEST(test_pairing_session_forces_view_and_restores_prior);
+  RUN_TEST(test_pairing_dismiss_keeps_session_and_epoch_redisplays);
+  RUN_TEST(test_model_reconcile_leaves_pairing_view_alone);
+  RUN_TEST(test_pairing_swipe_routing_dismisses_horizontal_only);
+  RUN_TEST(test_unpaired_marker_rides_every_update);
+  RUN_TEST(test_detail_behind_pairing_revalidates_trunk);
+  RUN_TEST(test_pairing_dismiss_noop_off_pairing_view);
   return UNITY_END();
 }

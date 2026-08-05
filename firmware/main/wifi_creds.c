@@ -1,5 +1,6 @@
 #include "wifi_creds.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -68,6 +69,71 @@ void gc_loc_clear(void) {
   nvs_commit(h);
   nvs_close(h);
   ESP_LOGI(TAG, "location override cleared");
+}
+
+bool gc_token_get(char token[GC_TOKEN_LEN]) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t len = GC_TOKEN_LEN;
+  bool ok = nvs_get_str(h, "token", token, &len) == ESP_OK && token[0] != '\0';
+  nvs_close(h);
+  return ok;
+}
+
+bool gc_token_set(const char *token) {
+  if (token == NULL || token[0] == '\0') return false;
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
+  bool ok = nvs_set_str(h, "token", token) == ESP_OK;
+  nvs_erase_key(h, "revoked"); /* a successful pair ends the unpaired state */
+  ok = ok && nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  /* Presence only — the token value never reaches a log (plan R4). */
+  ESP_LOGI(TAG, "device token %s", ok ? "stored" : "store FAILED");
+  return ok;
+}
+
+void gc_token_clear(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) {
+    ESP_LOGE(TAG, "token clear: NVS open failed");
+    return;
+  }
+  /* erase_key returns NOT_FOUND for an absent key — that is a clear, not a
+   * failure; only a failed commit means the erase may not have persisted. */
+  nvs_erase_key(h, "token");
+  nvs_erase_key(h, "revoked");
+  bool ok = nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  ESP_LOGI(TAG, "device token %s", ok ? "cleared" : "clear FAILED (may reload on reboot)");
+}
+
+void gc_token_revoke(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) {
+    ESP_LOGE(TAG, "token revoke: NVS open failed — revocation is RAM-only until reboot");
+    return;
+  }
+  nvs_erase_key(h, "token");
+  bool ok = nvs_set_u8(h, "revoked", 1) == ESP_OK;
+  ok = nvs_commit(h) == ESP_OK && ok;
+  nvs_close(h);
+  if (ok) {
+    ESP_LOGW(TAG, "device token revoked by the server — board is unpaired");
+  } else {
+    /* Honest failure (review): a stale token surviving in NVS means one
+     * extra 401-and-revoke on the next boot, not silent success. */
+    ESP_LOGE(TAG, "token revoke: NVS write failed — a stale token may retry once after reboot");
+  }
+}
+
+bool gc_revoked_get(void) {
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+  uint8_t v = 0;
+  bool set = nvs_get_u8(h, "revoked", &v) == ESP_OK && v != 0;
+  nvs_close(h);
+  return set;
 }
 
 void gc_creds_seed_from_config(void) {

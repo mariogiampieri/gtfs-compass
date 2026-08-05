@@ -9,13 +9,7 @@
 
 #include <string.h>
 
-/* Bounded copy; src is a NUL-terminated model field (already under cap). */
-static void id_copy(char *dst, size_t cap, const char *src) {
-  size_t n = strlen(src);
-  if (n >= cap) n = cap - 1;
-  memcpy(dst, src, n);
-  dst[n] = '\0';
-}
+#include "gc_str.h"
 
 static bool sys_delta(ui_state_t *st, int delta) {
   int next = (int)st->sys + delta;
@@ -37,7 +31,7 @@ static bool stop_delta(ui_state_t *st, const model_nearby_t *model, int delta) {
     int n = rail->stop_count;
     int next = ((int)st->stop_idx[UI_SYS_RAIL] + delta + n) % n;
     st->stop_idx[UI_SYS_RAIL] = (uint8_t)next;
-    id_copy(st->stop_id[UI_SYS_RAIL], UI_STOP_ID_LEN, rail->stops[next].id);
+    gc_copy_bounded(st->stop_id[UI_SYS_RAIL], UI_STOP_ID_LEN, rail->stops[next].id);
     return true;
   }
   if (st->sys == UI_SYS_BIKE) {
@@ -46,7 +40,7 @@ static bool stop_delta(ui_state_t *st, const model_nearby_t *model, int delta) {
     int n = bike->station_count;
     int next = ((int)st->stop_idx[UI_SYS_BIKE] + delta + n) % n;
     st->stop_idx[UI_SYS_BIKE] = (uint8_t)next;
-    id_copy(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, bike->stations[next].id);
+    gc_copy_bounded(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, bike->stations[next].id);
     return true;
   }
   return false;
@@ -54,6 +48,11 @@ static bool stop_delta(ui_state_t *st, const model_nearby_t *model, int delta) {
 
 bool ui_nav_swipe(ui_state_t *st, const model_nearby_t *model, ui_nav_dir_t dir) {
   bool horizontal = dir == UI_NAV_LEFT || dir == UI_NAV_RIGHT;
+  if (st->view == UI_VIEW_PAIRING) {
+    /* A swipe leaves the code screen (session untouched); vertical swipes
+     * mean nothing here (pairing plan U5). */
+    return horizontal ? ui_pairing_dismiss_view(st) : false;
+  }
   if (st->view != UI_VIEW_BOARD) {
     /* In a detail view a horizontal swipe first pops to the board (R2);
      * vertical belongs to the scroll object (the tracker stands down when
@@ -78,7 +77,7 @@ bool ui_nav_open_detail(ui_state_t *st, const model_nearby_t *model, uint8_t tru
   if (trunk_idx >= stop->trunk_count) return false;
   st->view = UI_VIEW_DETAIL;
   st->trunk_idx = trunk_idx;
-  id_copy(st->trunk_key, MODEL_TRUNK_KEY_LEN, stop->trunks[trunk_idx].key);
+  gc_copy_bounded(st->trunk_key, MODEL_TRUNK_KEY_LEN, stop->trunks[trunk_idx].key);
   return true;
 }
 
@@ -94,7 +93,7 @@ bool ui_nav_select_station(ui_state_t *st, const model_nearby_t *model, uint8_t 
   const model_bike_system_t *bike = &model->bike;
   if (!bike->present || idx >= bike->station_count) return false;
   st->stop_idx[UI_SYS_BIKE] = idx;
-  id_copy(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, bike->stations[idx].id);
+  gc_copy_bounded(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, bike->stations[idx].id);
   st->view = UI_VIEW_BOARD; /* §4: tap a row → that station, back to board */
   return true;
 }

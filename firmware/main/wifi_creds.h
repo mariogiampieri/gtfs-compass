@@ -33,4 +33,24 @@ bool gc_loc_get(char lat[GC_COORD_LEN], char lon[GC_COORD_LEN]);
 bool gc_loc_set(const char *lat, const char *lon);
 void gc_loc_clear(void);
 
+/*
+ * Device token (pairing plan U3): "gtfsc_dev_" + 43-char base64url. Stored
+ * verbatim in NVS ("gc"/token). Never logged or printed in full — console
+ * surfaces report presence (the constant prefix at most), never the value.
+ * The revoked marker ("gc"/revoked) survives reboots: it is what lets a
+ * board render "unpaired after revocation" as a distinct fact from
+ * never-paired, even though the wire cannot tell the two apart.
+ */
+#define GC_TOKEN_LEN 64
+
+bool gc_token_get(char token[GC_TOKEN_LEN]);
+/* Persist a fresh token. Also clears the revoked marker: a successful pair
+ * ends the unpaired state (plan KTD/U2 persist semantics). */
+bool gc_token_set(const char *token);
+/* Voluntary local unpair (console token_clear): erase token AND marker. */
+void gc_token_clear(void);
+/* The 401 path: erase the token and set the revoked marker. */
+void gc_token_revoke(void);
+bool gc_revoked_get(void);
+
 #endif

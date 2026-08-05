@@ -1630,3 +1630,128 @@ describe("locate_log tenancy (the predicate the SELECT * used to lack)", () => {
     expect(rows[0].user_id).toBeNull();
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* R6 (firmware pairing plan): a presented-but-invalid device token is 401     */
+/* -------------------------------------------------------------------------- */
+
+describe("nearby answers 401 for a presented-but-invalid device token (R6)", () => {
+  it("revoked and never-minted tokens get the same 401, byte for byte", async () => {
+    const { deviceId, token } = await seedDevice();
+    await env.DB.prepare("UPDATE devices SET revoked_at = ?1 WHERE id = ?2")
+      .bind(nowSec(), deviceId)
+      .run();
+
+    const revoked = await postNearby({ wifiAccessPoints: uniqueAps() }, { token });
+    const never = await postNearby(
+      { wifiAccessPoints: uniqueAps() },
+      { token: `${DEVICE_TOKEN_PREFIX}neverminted` },
+    );
+
+    expect(revoked.status).toBe(401);
+    expect(never.status).toBe(401);
+    const body = await revoked.text();
+    // Revoked must not be distinguishable from never-real (Unpair concept).
+    expect(body).toBe(await never.text());
+    expect(body).toBe('{"error":"invalid device token"}');
+    // Refused before the locate chain runs — no provider spend for a dead token.
+    expect(beaconCalls).toBe(0);
+  });
+
+  it("a malformed Authorization header is refused, not silently anonymous", async () => {
+    for (const header of ["Basic Zm9vOmJhcg==", "Bearer ", "Bearer not-a-device-token"]) {
+      const res = await SELF.fetch(`${ORIGIN}/v1/nearby`, {
+        method: "POST",
+        headers: {
+          "CF-Connecting-IP": freshIp(),
+          "Content-Type": "application/json",
+          Authorization: header,
+        },
+        body: JSON.stringify({ wifiAccessPoints: uniqueAps() }),
+      });
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it("a valid default-scopes token is accepted and resolves via WiFi", async () => {
+    const { token } = await seedDevice({ scopes: "read:departures,read:config" });
+    beaconOk(40.6931, -73.9871, 42);
+
+    const res = await postNearby({ wifiAccessPoints: uniqueAps() }, { token });
+
+    expect(res.status).toBe(200);
+    // No read:fix, no relay consult — the anonymous wire shape, byte for byte.
+    expect(await res.text()).toContain(
+      '"location":{"lat":40.6931,"lon":-73.9871,"accuracy":42}',
+    );
+  });
+
+  it("a session cookie with a stray non-device Authorization header is 401", async () => {
+    // Pins the deliberate breadth of the gate: ANY presented Authorization
+    // header that does not resolve to a device credential is refused, even
+    // when a valid session rides alongside. Flagged for Mario as an open
+    // question (doc-review A6) — flip this pin if the gate is narrowed to
+    // gtfsc_dev_-prefixed bearers only.
+    const { token: cookie } = await signIn("usr_stray");
+    const res = await postNearby(
+      { wifiAccessPoints: uniqueAps() },
+      { cookie, token: "stray-header-value" },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("/v1/locate is unchanged: an invalid device token still resolves anonymously", async () => {
+    beaconOk(40.6931, -73.9871, 42);
+    const aps = uniqueAps();
+
+    const anon = await postLocate({ wifiAccessPoints: aps }, {});
+    const withBadToken = await postLocate(
+      { wifiAccessPoints: aps },
+      { token: `${DEVICE_TOKEN_PREFIX}neverminted` },
+    );
+
+    expect(anon.status).toBe(200);
+    expect(withBadToken.status).toBe(200);
+    // The shared resolveCredential seam did not change shape: locate's
+    // anonymous answer for a bad token is byte-identical to no token at all.
+    expect(await withBadToken.text()).toBe(await anon.text());
+  });
+});
+
+describe("nearby 401 gate — review fixes (cookie slide, GET parity)", () => {
+  it("GET with an invalid device token is refused like POST", async () => {
+    const res = await SELF.fetch(
+      `${ORIGIN}/v1/nearby?lat=40.69&lon=-73.98`,
+      {
+        headers: {
+          "CF-Connecting-IP": freshIp(),
+          Authorization: `Bearer ${DEVICE_TOKEN_PREFIX}neverminted`,
+        },
+      },
+    );
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe('{"error":"invalid device token"}');
+  });
+
+  it("a 401 that slid the session still re-issues the cookie", async () => {
+    // resolveCredential slides an aged session in D1 as a side effect even
+    // when the request is then refused; the 401 must carry the Set-Cookie or
+    // the browser's Max-Age desyncs from D1 (refreshCookie's contract).
+    const { token: cookie } = await signIn("usr_slide_401");
+    await ageSession(cookie);
+    const res = await postNearby(
+      { wifiAccessPoints: uniqueAps() },
+      { cookie, token: "stray-header-value" },
+    );
+    expect(res.status).toBe(401);
+    expect(res.headers.get("Set-Cookie") ?? "").toContain(SESSION_COOKIE);
+  });
+
+  it("headerless GET stays byte-identical anonymous (no gate, no resolution)", async () => {
+    const res = await SELF.fetch(`${ORIGIN}/v1/nearby?lat=40.69&lon=-73.98`, {
+      headers: { "CF-Connecting-IP": freshIp() },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('"location":{"lat":40.69,"lon":-73.98,"accuracy":null}');
+  });
+});

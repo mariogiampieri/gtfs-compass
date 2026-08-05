@@ -72,6 +72,30 @@ export async function routeNearby(
    */
   let refresh: string | null = null;
 
+  if (request.method !== "GET" && request.method !== "POST") {
+    return noStoreJson({ error: "not found" }, 404);
+  }
+
+  // A presented credential that does not resolve to a device is answered
+  // loudly (R6): a board whose token was revoked must learn that, not be
+  // silently served the composition it did not ask for. The gate sits above
+  // the method branch so GET and POST answer identically — a dead token is
+  // refused everywhere on this route. Headerless requests never resolve here
+  // on GET and never enter the 401 branch on POST, so the anonymous contract
+  // stays byte-identical; revoked and never-existed tokens get the same
+  // answer. `refresh` is computed BEFORE the gate: resolveCredential slides a
+  // session in D1 as a side effect, so even the 401 must re-issue the cookie
+  // or the browser's Max-Age desyncs from D1 (refreshCookie's own contract).
+  const authHeader = request.headers.get("Authorization");
+  let credential: Awaited<ReturnType<typeof resolveCredential>> = null;
+  if (request.method === "POST" || authHeader !== null) {
+    credential = await resolveCredential(request, env);
+    refresh = refreshCookie(request, credential);
+    if (authHeader !== null && credential?.kind !== "device") {
+      return withCookie(noStoreJson({ error: "invalid device token" }, 401), refresh);
+    }
+  }
+
   if (request.method === "GET") {
     const latRaw = url.searchParams.get("lat");
     const lonRaw = url.searchParams.get("lon");
@@ -79,17 +103,15 @@ export async function routeNearby(
     lat = latRaw === null || latRaw === "" ? NaN : Number(latRaw);
     lon = lonRaw === null || lonRaw === "" ? NaN : Number(lonRaw);
     if (!validCoords(lat, lon)) {
-      return noStoreJson({ error: "lat and lon required" }, 400);
+      return withCookie(noStoreJson({ error: "lat and lon required" }, 400), refresh);
     }
-  } else if (request.method === "POST") {
+  } else {
     const parsed = await readWifiScanBody(request);
     if (parsed instanceof Response) return parsed;
     // Same seam, same credential, same resolution as /v1/locate — a device must
     // never get a phone position from one endpoint and a WiFi one from the
     // other in the same minute, with this endpoint's distance sort and walk
     // heuristic running on the worse of the two.
-    const credential = await resolveCredential(request, env);
-    refresh = refreshCookie(request, credential);
     const located = await resolveLocation({
       bssids: parsed.wifiAccessPoints,
       env,
@@ -109,8 +131,6 @@ export async function routeNearby(
         quality: located.quality,
       };
     }
-  } else {
-    return noStoreJson({ error: "not found" }, 404);
   }
 
   const modes = parseModes(url.searchParams.get("modes"));

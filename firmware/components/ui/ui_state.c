@@ -11,19 +11,14 @@
 
 #include <string.h>
 
+#include "gc_str.h"
+
 void ui_state_init(ui_state_t *state) {
   memset(state, 0, sizeof(*state));
   state->battery_pct = -1;
   for (int i = 0; i < UI_SYS_COUNT; i++) state->age_s[i] = -1;
 }
 
-/* Bounded copy; src is a NUL-terminated model field (already under cap). */
-static void id_copy(char *dst, size_t cap, const char *src) {
-  size_t n = strlen(src);
-  if (n >= cap) n = cap - 1;
-  memcpy(dst, src, n);
-  dst[n] = '\0';
-}
 
 static int find_stop(const model_rail_system_t *rail, const char *id) {
   for (int i = 0; i < rail->stop_count; i++) {
@@ -51,14 +46,22 @@ static int find_trunk(const model_stop_t *stop, const char *key) {
 static void snap_to_first(ui_state_t *st, ui_sys_t s, const char *first_id) {
   st->stop_idx[s] = 0;
   st->stop_id[s][0] = '\0';
-  if (first_id != NULL) id_copy(st->stop_id[s], UI_STOP_ID_LEN, first_id);
+  if (first_id != NULL) gc_copy_bounded(st->stop_id[s], UI_STOP_ID_LEN, first_id);
   if (s == UI_SYS_RAIL) {
-    /* any open detail belonged to the vanished stop */
+    /* any open detail belonged to the vanished stop — including one hidden
+     * behind an active pairing view (review) */
     st->trunk_key[0] = '\0';
     st->trunk_idx = 0;
     if (st->view == UI_VIEW_DETAIL) st->view = UI_VIEW_BOARD;
+    if (st->view == UI_VIEW_PAIRING && st->pair_prior_view == UI_VIEW_DETAIL) {
+      st->pair_prior_view = UI_VIEW_BOARD;
+    }
   }
   if (s == UI_SYS_BIKE && st->view == UI_VIEW_BIKE_NEARBY) st->view = UI_VIEW_BOARD;
+  if (s == UI_SYS_BIKE && st->view == UI_VIEW_PAIRING &&
+      st->pair_prior_view == UI_VIEW_BIKE_NEARBY) {
+    st->pair_prior_view = UI_VIEW_BOARD;
+  }
 }
 
 void ui_reconcile(ui_state_t *st, const model_nearby_t *model) {
@@ -69,20 +72,27 @@ void ui_reconcile(ui_state_t *st, const model_nearby_t *model) {
       if (st->stop_id[UI_SYS_RAIL][0] == '\0') {
         /* never navigated: adopt stop 0, no view change */
         st->stop_idx[UI_SYS_RAIL] = 0;
-        id_copy(st->stop_id[UI_SYS_RAIL], UI_STOP_ID_LEN, model->rail.stops[0].id);
+        gc_copy_bounded(st->stop_id[UI_SYS_RAIL], UI_STOP_ID_LEN, model->rail.stops[0].id);
       } else {
         int idx = find_stop(&model->rail, st->stop_id[UI_SYS_RAIL]);
         if (idx >= 0) st->stop_idx[UI_SYS_RAIL] = (uint8_t)idx;
         else snap_to_first(st, UI_SYS_RAIL, model->rail.stops[0].id);
       }
-      /* open detail: re-find the trunk by key on the reconciled stop */
-      if (st->view == UI_VIEW_DETAIL) {
+      /* Open detail: re-find the trunk by key on the reconciled stop. Also
+       * runs while the pairing view hides a DETAIL prior view (review):
+       * without it, a trunk that vanished mid-session would be restored
+       * blind and ui_detail's clamp would render the wrong trunk. */
+      bool detail_open = st->view == UI_VIEW_DETAIL;
+      bool detail_behind_pairing =
+          st->view == UI_VIEW_PAIRING && st->pair_prior_view == UI_VIEW_DETAIL;
+      if (detail_open || detail_behind_pairing) {
         const model_stop_t *stop = &model->rail.stops[st->stop_idx[UI_SYS_RAIL]];
         int t = st->trunk_key[0] != '\0' ? find_trunk(stop, st->trunk_key) : -1;
         if (t >= 0) {
           st->trunk_idx = (uint8_t)t;
         } else {
-          st->view = UI_VIEW_BOARD;
+          if (detail_open) st->view = UI_VIEW_BOARD;
+          else st->pair_prior_view = UI_VIEW_BOARD;
           st->trunk_key[0] = '\0';
           st->trunk_idx = 0;
         }
@@ -102,7 +112,7 @@ void ui_reconcile(ui_state_t *st, const model_nearby_t *model) {
     if (model->bike.station_count > 0) {
       if (st->stop_id[UI_SYS_BIKE][0] == '\0') {
         st->stop_idx[UI_SYS_BIKE] = 0;
-        id_copy(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, model->bike.stations[0].id);
+        gc_copy_bounded(st->stop_id[UI_SYS_BIKE], UI_STOP_ID_LEN, model->bike.stations[0].id);
       } else {
         int idx = find_station(&model->bike, st->stop_id[UI_SYS_BIKE]);
         if (idx >= 0) st->stop_idx[UI_SYS_BIKE] = (uint8_t)idx;
@@ -112,6 +122,43 @@ void ui_reconcile(ui_state_t *st, const model_nearby_t *model) {
       snap_to_first(st, UI_SYS_BIKE, NULL);
     }
   }
+}
+
+bool ui_pairing_update(ui_state_t *st, const ui_pair_snapshot_t *snap) {
+  bool changed = false;
+  pair_state_t phase = snap->phase;
+  st->unpaired = snap->unpaired;
+  st->pair_rate_limited = snap->rate_limited;
+  if (snap->code != NULL && snap->code[0] != '\0') {
+    gc_copy_bounded(st->pair_code, PAIR_USER_CODE_LEN, snap->code);
+  }
+  if (phase == PAIR_CODE_ACTIVE) st->pair_seconds = snap->seconds;
+  if (snap->epoch != st->pair_epoch) {
+    st->pair_epoch = snap->epoch;
+    st->pair_view_dismissed = false; /* `pair` re-issued: re-display the code */
+  }
+  st->pair_phase = phase;
+  bool visible = phase == PAIR_STARTING || phase == PAIR_CODE_ACTIVE ||
+                 phase == PAIR_EXPIRED || phase == PAIR_FAILED;
+  if (visible && !st->pair_view_dismissed) {
+    if (st->view != UI_VIEW_PAIRING) {
+      st->pair_prior_view = st->view;
+      st->view = UI_VIEW_PAIRING;
+      changed = true;
+    }
+  } else if (!visible && st->view == UI_VIEW_PAIRING) {
+    /* PAIRED or IDLE: the session is over — restore where the user was. */
+    st->view = st->pair_prior_view;
+    changed = true;
+  }
+  return changed;
+}
+
+bool ui_pairing_dismiss_view(ui_state_t *st) {
+  if (st->view != UI_VIEW_PAIRING) return false;
+  st->pair_view_dismissed = true;
+  st->view = st->pair_prior_view;
+  return true;
 }
 
 void ui_reconcile_deferred(ui_state_t *st, const model_nearby_t *model, int32_t defer_s) {

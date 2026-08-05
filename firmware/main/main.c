@@ -58,6 +58,7 @@ static const char *TAG = "gtfs-compass";
 #define DIM_PCT 40
 
 static QueueHandle_t g_net_queue;
+static QueueHandle_t g_pair_queue;
 static model_nearby_t *g_ui_model;     /* applied model (owns the rendered tree) */
 static model_nearby_t *g_staged_model; /* deferral stash (copy-at-receive) */
 static bool g_have_model;
@@ -68,12 +69,16 @@ static int64_t g_last_minute_ms;
 static int64_t g_last_touch_ms; /* 0 at boot: a never-touched device drifts */
 static bool g_dimmed;
 
-/* Staged net message (by value, latest-wins — R6 deferral contract). */
+/* Staged net message (by value, latest-wins — R6 deferral contract). The
+ * pairing snapshot rides on every message (full-snapshot queue contract),
+ * so a displaced message loses nothing. */
 static bool g_staged_have_model;    /* staged model copy awaits apply */
 static gc_net_status_t g_staged_status;
 static bool g_staged_have_status;   /* any message awaits apply */
 static int64_t g_staged_recv_ms;    /* when the staged model was received */
 static bool g_render_pending;       /* deferred render-only request */
+static gc_pair_msg_t g_staged_pair; /* by value, latest-wins */
+static bool g_staged_have_pair;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -104,6 +109,7 @@ static void gc_request_render(void) {
 /* Apply the staged message: swap the model in, reconcile by identity with
  * the defer time folded into the age seed, then the status treatment. */
 static void gc_apply_staged(void) {
+  bool have_status = g_staged_have_status;
   gc_net_status_t status = g_staged_status;
   if (g_staged_have_model) {
     model_nearby_t *tmp = g_ui_model;
@@ -123,7 +129,9 @@ static void gc_apply_staged(void) {
       g_dimmed = false;
     }
   }
-  switch (status) {
+  /* A pairing-only apply has no fetch outcome staged: the conn state (and
+   * its staleness accounting) is left exactly as-is. */
+  if (have_status) switch (status) {
     case GC_NET_OK:
       g_state.conn = UI_CONN_LIVE;
       /* chip evaluates per-system staleness before the flash, so a fetch
@@ -144,6 +152,19 @@ static void gc_apply_staged(void) {
       if (g_state.conn != UI_CONN_NO_LOCATION) g_state.conn = UI_CONN_OFFLINE;
       break;
   }
+  /* Pairing snapshot → UI state; an active session forces the pairing view
+   * and completion/dismissal restores the prior one (ui_state.c rules). */
+  if (g_staged_have_pair) {
+    ui_pairing_update(&g_state, &(ui_pair_snapshot_t){
+                                    .phase = g_staged_pair.phase,
+                                    .code = g_staged_pair.code,
+                                    .seconds = g_staged_pair.seconds_left,
+                                    .epoch = g_staged_pair.epoch,
+                                    .rate_limited = g_staged_pair.rate_limited,
+                                    .unpaired = g_staged_pair.unpaired,
+                                });
+    g_staged_have_pair = false;
+  }
   g_staged_have_model = false;
   g_staged_have_status = false;
   g_state.battery_pct = (int8_t)gc_battery_pct();
@@ -156,7 +177,7 @@ static void consume_cb(lv_timer_t *t) {
   (void)t;
   gc_net_msg_t msg;
   if (xQueueReceive(g_net_queue, &msg, 0) == pdTRUE) {
-    if (msg.status == GC_NET_OK) {
+    if (msg.status == GC_NET_OK && msg.model != NULL) {
       memcpy(g_staged_model, msg.model, sizeof(*g_staged_model)); /* copy before net reuses */
       g_staged_have_model = true;
       g_staged_recv_ms = now_ms();
@@ -167,6 +188,13 @@ static void consume_cb(lv_timer_t *t) {
     g_staged_status = msg.status; /* latest-wins; stash is by-value so the
                                      displaced message needs no freeing */
     g_staged_have_status = true;
+  }
+  /* Separate channel (review): a pairing snapshot can never displace a
+   * fetch outcome, and vice versa. */
+  gc_pair_msg_t pmsg;
+  if (g_pair_queue != NULL && xQueueReceive(g_pair_queue, &pmsg, 0) == pdTRUE) {
+    g_staged_pair = pmsg;
+    g_staged_have_pair = true;
   }
   /* Deferral ceiling (review): a sustained accidental press — pocket, palm,
    * object resting on the glass — would otherwise defer applies and board
@@ -180,7 +208,7 @@ static void consume_cb(lv_timer_t *t) {
   } else {
     busy_since_ms = 0;
   }
-  if (g_staged_have_status) {
+  if (g_staged_have_status || g_staged_have_pair) {
     gc_apply_staged();
   } else if (g_render_pending) {
     full_render();
@@ -241,6 +269,12 @@ static void tick_cb(lv_timer_t *t) {
     if (!ui_input_busy() && now_ms() - g_last_touch_ms > 5 * 60 * 1000) {
       ui_jitter_nudge();
     }
+  }
+
+  /* Pairing countdown: local 1 Hz decrement from the published value (the
+   * departures minutes convention) — ui_tick rewrites the label in place. */
+  if (g_state.pair_phase == PAIR_CODE_ACTIVE && g_state.pair_seconds > 0) {
+    g_state.pair_seconds--;
   }
 
   /* M1 brightness placeholder: dim after long no-data — boot time counts as
@@ -358,16 +392,32 @@ static void gc_input_press(int32_t x, int32_t y, void *user) {
   ESP_LOGD(TAG, "input: press %ld,%ld", (long)x, (long)y);
 }
 
+/* Leaving a terminal EXPIRED/FAILED pairing screen also resets the net
+ * task's FSM to IDLE (a live CODE_ACTIVE session is deliberately left
+ * running — dismissing the view never cancels the session). */
+static void pair_terminal_dismissed(ui_view_t view_before, pair_state_t phase_before) {
+  if (view_before == UI_VIEW_PAIRING && g_state.view != UI_VIEW_PAIRING &&
+      (phase_before == PAIR_EXPIRED || phase_before == PAIR_FAILED)) {
+    gc_net_pair_dismiss();
+  }
+}
+
 static void gc_input_tap(int32_t x, int32_t y, void *user) {
   (void)user;
+  ui_view_t view_before = g_state.view;
+  pair_state_t phase_before = g_state.pair_phase;
   if (ui_views_on_tap(x, y, g_have_model ? g_ui_model : NULL, &g_state)) {
+    pair_terminal_dismissed(view_before, phase_before);
     full_render();
   }
 }
 
 static void gc_input_swipe(ui_swipe_t dir, void *user) {
   (void)user;
+  ui_view_t view_before = g_state.view;
+  pair_state_t phase_before = g_state.pair_phase;
   if (ui_views_on_swipe(dir, g_have_model ? g_ui_model : NULL, &g_state)) {
+    pair_terminal_dismissed(view_before, phase_before);
     full_render();
   }
 }
@@ -412,6 +462,7 @@ void app_main(void) {
   gc_console_start();
   gc_creds_seed_from_config();
   g_net_queue = gc_net_start();
+  g_pair_queue = gc_net_pair_queue();
 
   bsp_display_lock(0);
   lv_timer_create(consume_cb, 250, NULL);

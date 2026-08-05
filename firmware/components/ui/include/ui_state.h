@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "model.h"
+#include "pair_fsm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +42,7 @@ typedef enum {
   UI_VIEW_BOARD = 0,
   UI_VIEW_DETAIL,      /* trunk detail — rail only (handoff §2) */
   UI_VIEW_BIKE_NEARBY, /* nearby-compare list (handoff §4) */
+  UI_VIEW_PAIRING,     /* RFC 8628 code display (pairing plan U5) */
 } ui_view_t;
 
 /* One cap for both identity kinds: GBFS station ids are UUIDs (36 chars),
@@ -79,7 +81,39 @@ typedef struct {
    * evaluated per system — a system with no data never renders "stale"
    * (KTD-7). */
   int32_t age_s[UI_SYS_COUNT];
+
+  /* Pairing (plan U5). pair_phase mirrors the net task's FSM snapshot; an
+   * active session forces UI_VIEW_PAIRING via ui_pairing_update. pair_view_
+   * dismissed tracks a swipe/tap away from a still-active session so the
+   * code screen stays dismissed until re-requested (console `pair`).
+   * pair_seconds decrements locally at 1 Hz from the published point-in-time
+   * value (the departures minutes convention). `unpaired` is the revoked
+   * marker: a token died since the last successful pair — rendered distinct
+   * from never-paired, and outranking offline/no-location in the chip
+   * (plan R11 precedence). */
+  pair_state_t pair_phase;
+  char pair_code[PAIR_USER_CODE_LEN];
+  int32_t pair_seconds;
+  uint8_t pair_epoch;        /* bumps on every console `pair`; a bump undoes
+                                a dismissal so the live code re-displays */
+  bool pair_rate_limited;    /* FAILED because the server said 429 — the
+                                screen says "server busy", not "retry now" */
+  bool pair_view_dismissed;
+  bool unpaired;
+  ui_view_t pair_prior_view; /* where dismissal/completion returns to */
 } ui_state_t;
+
+/* A published pairing snapshot, as ui_pairing_update consumes it. Mirrors
+ * the net task's pairing message without depending on its header (the ui
+ * component stays platform-free). */
+typedef struct {
+  pair_state_t phase;
+  const char *code; /* NUL-terminated; may be "" */
+  int32_t seconds;
+  uint8_t epoch;
+  bool rate_limited;
+  bool unpaired;
+} ui_pair_snapshot_t;
 
 /* Canonical initializer: zeroes the struct (memcmp-safe padding) and sets
  * the unknown sentinels (age_s = -1, battery_pct = -1). Plain zeroing would
@@ -104,6 +138,24 @@ void ui_reconcile(ui_state_t *state, const model_nearby_t *model);
  * defer_s — staleness is never under-reported. defer_s <= 0 is plain
  * reconcile. Pure like ui_reconcile (the caller supplies the elapsed time). */
 void ui_reconcile_deferred(ui_state_t *state, const model_nearby_t *model, int32_t defer_s);
+
+/*
+ * Fold a published pairing snapshot into the state (pairing plan U5). Pure
+ * like ui_reconcile. Rules:
+ *   - STARTING/CODE_ACTIVE/EXPIRED/FAILED force UI_VIEW_PAIRING (saving the
+ *     prior view) unless the user dismissed the session's screen;
+ *   - PAIRED and IDLE restore the prior view;
+ *   - an epoch bump (console `pair` re-issued) clears the dismissal so a
+ *     live code re-displays;
+ *   - model applies never touch the pairing view (reconcile leaves it be).
+ * Returns true when the visible view changed (caller re-renders).
+ */
+bool ui_pairing_update(ui_state_t *state, const ui_pair_snapshot_t *snap);
+
+/* A tap/swipe on the pairing screen: leave the view (session untouched —
+ * dismissing the VIEW never cancels the session; the net task owns the FSM).
+ * Returns false when the pairing view is not showing. */
+bool ui_pairing_dismiss_view(ui_state_t *state);
 
 #ifdef __cplusplus
 }

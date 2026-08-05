@@ -69,7 +69,7 @@ The single `maintenance_runs` row the Retention Purge upserts on every completed
 The ordered sequence of position providers behind one interface (`api/src/locate.ts`): the relayed phone fix first, then WiFi trilateration, then `{"known": false}`. Every provider's answer is checked against the one accuracy gate as it arrives, and a rejected answer falls through to the next provider rather than ending resolution — a fix too coarse to trust costs a WiFi lookup, not a failure. The WiFi sub-chain owns the BSSID-hash cache; nothing derived from a credential may be cached above it, because that cache is device-agnostic by construction.
 
 ### Fix Quality
-Whether a relayed phone position is still *where the user is* (`current`) or only *where they were* (`last_known`), split at a 120-second horizon. Modelled on Garmin's `Position.Quality`: a last-known fix is a distinct state rather than a position with an old timestamp, so the chain prefers anything a live provider resolves and surfaces it only as a labelled fallback carrying its capture time. The device renders the age; it never shows a stale number as current.
+Whether a relayed phone position is still *where the user is* (`current`) or only *where they were* (`last_known`), split at a 120-second horizon, with a hard 4-hour refusal ceiling (`FIX_LAST_KNOWN_MAX_AGE_S`, `api/src/relay.ts`): past 4 hours `getFix` returns nothing at all and the locate chain falls through to WiFi or `{"known": false}` — an ancient fix is worse than no fix. Modelled on Garmin's `Position.Quality`: a last-known fix is a distinct state rather than a position with an old timestamp, so the chain prefers anything a live provider resolves and surfaces it only as a labelled fallback carrying its capture time. The device renders the age; it never shows a stale number as current. The 120 s horizon and 4 h ceiling are the fixed side of the wake-cadence contract the M3 power model must agree with (see the firmware pairing plan).
 
 ## Accounts and auth
 
@@ -90,6 +90,12 @@ The bindable `WHERE user_id = ?` fragment `authorize()` hands back to every rout
 
 ### Device Scope
 A separately grantable, separately revocable permission on a paired device's Bearer token (`read:departures`, `read:config`, `read:fix`). `read:fix` is never implied by pairing alone — a freshly paired board holds no location grant until a user extends one, so a stolen or second-hand board is not a tracking device by default.
+
+### Board Pairing Session
+The firmware side of RFC 8628 (`firmware/components/model/pair_fsm.c`): a console-initiated session that displays the 8-consonant `user_code`, polls on the advertised 5-second interval, and treats the local `expires_in` deadline as a backstop rather than a verdict — the server extends collection 120 seconds after a claim (`PAIR_DELIVERY_TTL_S`), so the board polls through that grace window and a last-second browser approval still pairs. Dismissing the code *screen* never cancels the session; re-issuing `pair` re-displays a live code rather than minting a new one.
+
+### Unpaired Marker
+The board-local NVS flag set when an authenticated request answers 401: the token is erased, the board drops to anonymous operation, and the marker renders a distinct "unpaired" state (chip text on a failing transport, a red dot beside the chip while live). The wire cannot distinguish revoked from never-paired (see Unpair) — this marker is how the board itself can, and only a subsequent successful pair clears it.
 
 ### Unpair
 Revoking a paired board from the device list: `devices.revoked_at` is stamped, its scope list is emptied, and its stored fix is cleared. The row itself survives, so the board's token keeps resolving to the same `401` a token that never existed gets, and the account's diagnostic attribution is not orphaned. Turning the `read:fix` scope off on its own performs the second and third of those steps — revocation is a property of the grant, not of the unpair button.

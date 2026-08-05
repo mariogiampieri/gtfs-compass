@@ -4,6 +4,9 @@
  *   wifi_set <ssid> <password>   store credentials in NVS (device restarts
  *                                the network path automatically)
  *   wifi_clear                   erase stored credentials
+ *   pair                         start RFC 8628 pairing (code on screen);
+ *                                re-issuing re-displays a live code
+ *   token_clear                  erase the device token (local unpair)
  *   gc_status                    one-line state dump
  *
  * Connect with: idf.py -p <port> monitor   (or any 115200 serial terminal)
@@ -17,6 +20,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "net_task.h"
 #include "wifi_creds.h"
 
 static int cmd_wifi_set(int argc, char **argv) {
@@ -63,8 +67,40 @@ static int cmd_status(int argc, char **argv) {
   bool have = gc_creds_get(ssid, pass);
   printf("creds: %s%s\n", have ? "stored for " : "none", have ? ssid : "");
   char lat[GC_COORD_LEN], lon[GC_COORD_LEN];
-  if (gc_loc_get(lat, lon)) printf("location override: %s, %s\n", lat, lon);
-  else printf("location: from WiFi scan (BeaconDB)\n");
+  bool override_set = gc_loc_get(lat, lon);
+  char token[GC_TOKEN_LEN];
+  bool paired = gc_token_get(token);
+  /* Presence only — %.10s prints exactly the constant "gtfsc_dev_" prefix;
+   * the token value never reaches the console (plan R4). */
+  if (paired) printf("device token: stored (%.10s…)\n", token);
+  else printf("device token: none%s\n", gc_revoked_get() ? " — previous token was revoked" : "");
+  if (paired) {
+    printf("location: server-side resolution (paired%s)\n",
+           override_set ? "; loc_set override ignored while paired" : "");
+  } else if (override_set) {
+    printf("location override: %s, %s\n", lat, lon);
+  } else {
+    printf("location: from WiFi scan (BeaconDB)\n");
+  }
+  return 0;
+}
+
+static int cmd_pair(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  gc_net_pair_request();
+  printf("pairing requested — the code appears on the board's screen\n"
+         "approve it in the config UI (enter the code), then grant read:fix\n"
+         "from the device list if this board should receive phone fixes\n");
+  return 0;
+}
+
+static int cmd_token_clear(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  gc_token_clear();
+  gc_net_token_dropped();
+  printf("device token cleared — board is anonymous from the next poll\n");
   return 0;
 }
 
@@ -105,6 +141,8 @@ void gc_console_start(void) {
       {.command = "wifi_clear", .help = "erase stored wifi credentials", .func = cmd_wifi_clear},
       {.command = "loc_set", .help = "loc_set <lat> <lon> — fixed location (skips BeaconDB)", .func = cmd_loc_set},
       {.command = "loc_clear", .help = "back to WiFi-scan location", .func = cmd_loc_clear},
+      {.command = "pair", .help = "start device pairing (RFC 8628 code on screen)", .func = cmd_pair},
+      {.command = "token_clear", .help = "erase the device token (local unpair)", .func = cmd_token_clear},
       {.command = "gc_status", .help = "show provisioning state", .func = cmd_status},
   };
   for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {

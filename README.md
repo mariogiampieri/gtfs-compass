@@ -510,14 +510,41 @@ or work around thin BeaconDB coverage in your area), type
 and skips WiFi scanning; `loc_clear` returns to scan-based location.
 A build-time seed via `CONFIG_GC_DEV_FIXED_LAT`/`_LON` (same
 `sdkconfig.local` mechanism) behaves identically; the console value wins
-when both exist.
+when both exist. **The override applies to unpaired boards only**: a
+stored device token always routes through server-side resolution, so
+pairing a board makes the phone relay reachable without `loc_clear`.
+
+### Pairing the board
+
+Pairing gives the board a device identity so the API can recognize it
+(and, once granted, feed it your phone's relayed position):
+
+1. In the serial console, type `pair`. The board shows an 8-character
+   code (`XXXX-XXXX`) with a five-minute countdown.
+2. In the config UI, signed in, enter the code and confirm the device.
+   The board collects its token automatically within a few seconds and
+   stores it in NVS (it survives reboots).
+3. To receive phone fixes, grant `read:fix` from the config UI's device
+   list — **a fresh pairing deliberately carries no location scope**, so
+   the relay stays dark until you take this step.
+
+Useful to know: tapping the code screen hides it (the session keeps
+running — `pair` again re-displays the live code); re-pairing an
+already-paired board leaves the previous device row active server-side
+until you revoke it from the device list; a paired board at a desk with
+no BeaconDB coverage (previously served by `loc_set`) shows "no
+location" until a phone fix lands — expected, by design. If the server
+revokes the token, the board drops back to anonymous operation and shows
+an "unpaired" indicator; `token_clear` on the console is the local
+equivalent. `gc_status` reports pairing state (never the token value).
 
 ### Host tests
 
 ```bash
 cd firmware/test/host && cmake -B build -G Ninja . && cmake --build build
 ./build/test_model                   # model parser suite (ASAN)
-./build/test_nav                     # navigation/reconciler transitions
+./build/test_nav                     # navigation/reconciler/pairing-view transitions
+./build/test_pair_fsm                # RFC 8628 pairing client state machine
 ./build/test_bike_layout             # bike hero/capacity-bar math
 ```
 
