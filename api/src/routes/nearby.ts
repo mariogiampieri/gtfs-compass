@@ -89,6 +89,14 @@ export async function routeNearby(
     // other in the same minute, with this endpoint's distance sort and walk
     // heuristic running on the worse of the two.
     const credential = await resolveCredential(request, env);
+    // A presented credential that does not resolve to a device is answered
+    // loudly (R6): a board whose token was revoked must learn that, not be
+    // silently served the anonymous composition it did not ask for. Headerless
+    // requests never enter this branch, so the anonymous contract stays
+    // byte-identical; revoked and never-existed tokens get the same answer.
+    if (credential?.kind !== "device" && request.headers.get("Authorization") !== null) {
+      return noStoreJson({ error: "invalid device token" }, 401);
+    }
     refresh = refreshCookie(request, credential);
     const located = await resolveLocation({
       bssids: parsed.wifiAccessPoints,
