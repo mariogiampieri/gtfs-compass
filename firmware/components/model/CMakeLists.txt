@@ -1,7 +1,7 @@
 # Platform-free by design: no esp-* REQUIRES — the simulator build compiles
 # these same sources and fails loudly if platform code leaks in.
 idf_component_register(
-  SRCS "model.c" "pair_fsm.c" "../../third_party/cjson/cJSON.c"
+  SRCS "model.c" "pair_fsm.c" "wifi_select.c" "../../third_party/cjson/cJSON.c"
   INCLUDE_DIRS "include" "../../third_party/cjson"
 )
 # A hostile '[[[[…' body must exhaust the nesting budget, not the 10KB net

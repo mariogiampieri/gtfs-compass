@@ -1,9 +1,11 @@
 /*
  * console.c — USB-serial provisioning (the M1 stand-in for Phase 5 pairing).
  *
- *   wifi_set <ssid> <password>   store credentials in NVS (device restarts
- *                                the network path automatically)
- *   wifi_clear                   erase stored credentials
+ *   wifi_set <ssid> <password>   add/update a network (up to 5 stored;
+ *                                device restarts to apply)
+ *   wifi_del <ssid>              remove one stored network
+ *   wifi_list                    list stored SSIDs (never passwords)
+ *   wifi_clear                   erase all stored networks
  *   pair                         start RFC 8628 pairing (code on screen);
  *                                re-issuing re-displays a live code
  *   token_clear                  erase the device token (local unpair)
@@ -38,14 +40,14 @@ static int cmd_wifi_set(int argc, char **argv) {
     printf("error: password longer than 64 bytes\n");
     return 1;
   }
-  bool ok = gc_creds_set(argv[1], argc == 3 ? argv[2] : "");
+  bool ok = gc_nets_add(argv[1], argc == 3 ? argv[2] : "");
   if (!ok) {
-    printf("NVS write failed\n");
+    printf("store failed (list full? wifi_list / wifi_del)\n");
     return 1;
   }
   /* Honest contract: the running network path holds boot-time credentials,
    * so a restart is the reliable way to apply new ones (review ADV-3). */
-  printf("stored — restarting to join %s\n", argv[1]);
+  printf("stored — restarting to join the best available network\n");
   fflush(stdout);
   vTaskDelay(pdMS_TO_TICKS(300)); /* let the message flush over USB */
   esp_restart();
@@ -55,17 +57,42 @@ static int cmd_wifi_set(int argc, char **argv) {
 static int cmd_wifi_clear(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  gc_creds_clear();
-  printf("cleared\n");
+  gc_nets_clear();
+  printf("all networks cleared\n");
+  return 0;
+}
+
+static int cmd_wifi_del(int argc, char **argv) {
+  if (argc != 2) {
+    printf("usage: wifi_del <ssid>\n");
+    return 1;
+  }
+  int r = gc_nets_del(argv[1]);
+  if (r > 0) printf("removed %s\n", argv[1]);
+  else if (r == 0) printf("no stored network named %s\n", argv[1]);
+  else printf("NVS write failed removing %s — run wifi_list to check state\n", argv[1]);
+  return r > 0 ? 0 : 1;
+}
+
+static int cmd_wifi_list(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  char ssid[GC_SSID_LEN];
+  int n = 0;
+  for (int i = 0; i < GC_MAX_NETS && gc_nets_get(i, ssid, NULL); i++, n++) {
+    printf("  %d: %s\n", i, ssid);
+  }
+  if (n == 0) printf("no stored networks — wifi_set <ssid> [password]\n");
   return 0;
 }
 
 static int cmd_status(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  char ssid[GC_SSID_LEN], pass[GC_PASS_LEN];
-  bool have = gc_creds_get(ssid, pass);
-  printf("creds: %s%s\n", have ? "stored for " : "none", have ? ssid : "");
+  int nets = gc_nets_count();
+  const char *joined = gc_net_joined_ssid();
+  printf("wifi: %d network%s stored%s%s\n", nets, nets == 1 ? "" : "s",
+         joined[0] ? ", joined " : "", joined);
   char lat[GC_COORD_LEN], lon[GC_COORD_LEN];
   bool override_set = gc_loc_get(lat, lon);
   char token[GC_TOKEN_LEN];
@@ -138,7 +165,9 @@ void gc_console_start(void) {
 
   const esp_console_cmd_t cmds[] = {
       {.command = "wifi_set", .help = "wifi_set <ssid> [password]", .func = cmd_wifi_set},
-      {.command = "wifi_clear", .help = "erase stored wifi credentials", .func = cmd_wifi_clear},
+      {.command = "wifi_del", .help = "wifi_del <ssid> — remove one stored network", .func = cmd_wifi_del},
+      {.command = "wifi_list", .help = "list stored network SSIDs", .func = cmd_wifi_list},
+      {.command = "wifi_clear", .help = "erase ALL stored networks", .func = cmd_wifi_clear},
       {.command = "loc_set", .help = "loc_set <lat> <lon> — fixed location (skips BeaconDB)", .func = cmd_loc_set},
       {.command = "loc_clear", .help = "back to WiFi-scan location", .func = cmd_loc_clear},
       {.command = "pair", .help = "start device pairing (RFC 8628 code on screen)", .func = cmd_pair},

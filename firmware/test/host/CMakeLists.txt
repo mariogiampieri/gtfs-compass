@@ -68,6 +68,18 @@ target_include_directories(test_pair_fsm PRIVATE
 )
 target_compile_definitions(test_pair_fsm PRIVATE CJSON_NESTING_LIMIT=48)
 
+# Multi-network join order (plan gc-4ae U1): pure selection over stored
+# SSIDs + a scan snapshot.
+add_executable(test_wifi_select
+  test_wifi_select.c
+  unity/unity.c
+  ${FW}/components/model/wifi_select.c
+)
+target_include_directories(test_wifi_select PRIVATE
+  unity
+  ${FW}/components/model/include
+)
+
 # Bike screen layout math (plan U5): ui_bike_layout.c is LVGL-free by
 # design — hero strings and bar proportions under the R5 degraded
 # permutations are host facts.
@@ -86,4 +98,5 @@ enable_testing()
 add_test(NAME model COMMAND test_model)
 add_test(NAME nav COMMAND test_nav)
 add_test(NAME pair_fsm COMMAND test_pair_fsm)
+add_test(NAME wifi_select COMMAND test_wifi_select)
 add_test(NAME bike_layout COMMAND test_bike_layout)
